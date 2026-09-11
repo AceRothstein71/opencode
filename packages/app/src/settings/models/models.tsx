@@ -4,7 +4,7 @@ import { Switch } from "@opencode/ui/switch"
 import { Icon } from "@opencode/ui/icon"
 import { IconButton } from "@opencode/ui/icon-button"
 import { TextInput } from "@opencode/ui/text-input"
-import { type Component, For, Show } from "solid-js"
+import { createEffect, type Component, For, Show } from "solid-js"
 import { Schema } from "effect"
 import { Persistence } from "@/runtime/persistence/schema"
 import { useLanguage } from "@/runtime/i18n/language"
@@ -25,7 +25,11 @@ export const ModelProvidersSchema = Schema.Struct({
   collapsed: Persistence.record(Persistence.fallback(Schema.Boolean, () => false)),
 })
 
-export const SettingsModels: Component = () => {
+export const SettingsModels: Component<{
+  active?: boolean
+  provider?: string
+  onReveal?: () => void
+}> = (props) => {
   const language = useLanguage()
   const models = useModels()
   const serverSdk = useServerSDK()
@@ -34,6 +38,7 @@ export const SettingsModels: Component = () => {
     ModelProvidersSchema,
     { collapsed: {} },
   )
+  const sections = new Map<string, HTMLElement>()
 
   const list = useFilteredList<ModelItem>({
     items: (_filter) => models.list(),
@@ -55,6 +60,24 @@ export const SettingsModels: Component = () => {
       const bName = b.items[0].provider.name
       return aName.localeCompare(bName)
     },
+  })
+
+  createEffect(() => {
+    if (!props.active || !props.provider) return
+    const provider = props.provider
+    if (list.filter()) {
+      list.clear()
+      return
+    }
+    if (!list.grouped.latest.some((group) => group.category === provider)) return
+    const section = sections.get(provider)
+    if (!section?.isConnected) return
+    list.grouped.latest.forEach((group) => setStore("collapsed", group.category, group.category !== provider))
+    requestAnimationFrame(() => {
+      section.scrollIntoView({ block: "start" })
+      section.querySelector<HTMLElement>(".settings-models-group-trigger")?.focus({ preventScroll: true })
+      props.onReveal?.()
+    })
   })
 
   return (
@@ -121,6 +144,7 @@ export const SettingsModels: Component = () => {
 
                 return (
                   <div
+                    ref={(element) => sections.set(group.category, element)}
                     class="settings-section"
                     data-component="settings-models-provider"
                     data-expanded={expanded() ? "" : undefined}

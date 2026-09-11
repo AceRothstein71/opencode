@@ -55,7 +55,10 @@ export const SettingsScreen: Component = () => {
   const servers = useServers()
   const tabs = useTabs()
   const global = useGlobal()
-  const [state, setState] = createStore({ worktreeFilterReset: 0 })
+  const [state, setState] = createStore({
+    worktreeFilterReset: 0,
+    modelProvider: undefined as string | undefined,
+  })
   let root: HTMLDivElement | undefined
 
   onMount(() => {
@@ -228,10 +231,21 @@ export const SettingsScreen: Component = () => {
             />
           </Tabs.Content>
           <Tabs.Content value="providers" class="settings-panel">
-            <SettingsProviders directory={directory()} onBack={showProviders} />
+            <SettingsProviders
+              directory={directory()}
+              onBack={showProviders}
+              onSelectProvider={(providerID) => {
+                setState("modelProvider", providerID)
+                surface.open("models")
+              }}
+            />
           </Tabs.Content>
           <Tabs.Content value="models" class="settings-panel">
-            <SettingsModels />
+            <SettingsModels
+              active={surface.tab() === "models"}
+              provider={state.modelProvider}
+              onReveal={() => setState("modelProvider", undefined)}
+            />
           </Tabs.Content>
           <Tabs.Content value="extensions" class="settings-panel">
             <SettingsExtensions />
