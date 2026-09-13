@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test"
+import { $ } from "bun"
 import { spawn } from "child_process"
 import fs from "fs/promises"
 import os from "os"
@@ -12,6 +13,11 @@ type WorkerMessage = {
   barrier?: string
   file?: string
   nativeIndexLock?: boolean
+  transientIndexLockMs?: number
+  twice?: boolean
+  configLockBeforeSecond?: boolean
+  preexistingToken?: boolean
+  cleanup?: boolean
   patchAfterIgnore?: boolean
 }
 
@@ -64,6 +70,7 @@ async function testEnvironment() {
     env: {
       XDG_DATA_HOME: path.join(dir, "data"),
       XDG_STATE_HOME: path.join(dir, "state"),
+      XDG_CONFIG_HOME: path.join(dir, "config"),
       // snapshot.test.ts temporarily sets GIT_CONFIG_GLOBAL for its own cases;
       // subprocess workers must not inherit that transient process-wide config.
       GIT_CONFIG_GLOBAL: os.devNull,
@@ -86,9 +93,11 @@ for arg in "$@"; do
       exit 97
     fi
     trap 'rm -f "$SNAPSHOT_TEST_GIT_ACTIVE"' 0
-    sleep 0.05
+     sleep "$SNAPSHOT_TEST_GIT_SLEEP"
   fi
-  if [ "$arg" = "$SNAPSHOT_TEST_GIT_FAILURE" ] || \\
+   if [ -n "$SNAPSHOT_TEST_GIT_LOCALE" ]; then printf '%s\n' "$LC_ALL" >> "$SNAPSHOT_TEST_GIT_LOCALE"; fi
+   if [ "$arg" = "config" ] && [ -n "$SNAPSHOT_TEST_GIT_CONFIG_COUNT" ]; then printf '1\n' >> "$SNAPSHOT_TEST_GIT_CONFIG_COUNT"; fi
+   if { [ -n "$SNAPSHOT_TEST_GIT_FAILURE" ] && [ "$arg" = "$SNAPSHOT_TEST_GIT_FAILURE" ]; } || \\
     { [ "$SNAPSHOT_TEST_GIT_FAILURE" = "write-tree-invalid" ] && [ "$arg" = "write-tree" ]; }; then
     if [ -n "$SNAPSHOT_TEST_GIT_COUNT" ]; then printf '1\\n' >> "$SNAPSHOT_TEST_GIT_COUNT"; fi
     if [ "$SNAPSHOT_TEST_GIT_FAILURE" = "write-tree-invalid" ]; then printf 'not-a-tree\\n'; exit 0; fi
@@ -112,6 +121,60 @@ done
 }
 
 describe("snapshot cross-process git lock", () => {
+  test("configures only a newly created snapshot repository and ignores a later config.lock", async () => {
+    const repo = await tmpdir({ git: true })
+    await using _repo = repo
+    const environment = await testEnvironment()
+    const wrapper = await gitWrapper(path.join(environment.data, "bin"))
+    const count = path.join(environment.data, "config-count")
+    const output = path.join(environment.data, "result.json")
+    const result = await runWorker(
+      { directory: repo.path, output, twice: true, configLockBeforeSecond: true },
+      {
+        ...environment.env,
+        PATH: `${wrapper}${path.delimiter}${process.env.PATH}`,
+        SNAPSHOT_TEST_GIT_FAILURE: "",
+        SNAPSHOT_TEST_GIT_CONFIG_COUNT: count,
+      },
+    )
+    expect(result.code, result.stderr).toBe(0)
+    expect(await Bun.file(output).json()).toMatchObject({
+      first: expect.stringMatching(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/),
+      second: expect.stringMatching(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/),
+      tokenExists: false,
+    })
+    expect((await Bun.file(count).text()).trim().split("\n")).toHaveLength(8)
+  }, 30_000)
+
+  test("uses a deterministic C locale for every snapshot git process", async () => {
+    const repo = await tmpdir({ git: true })
+    await using _repo = repo
+    const environment = await testEnvironment()
+    const wrapper = await gitWrapper(path.join(environment.data, "bin"))
+    const locale = path.join(environment.data, "locale")
+    const output = path.join(environment.data, "result.json")
+    const result = await runWorker(
+      { directory: repo.path, output, file: "tracked.txt" },
+      { ...environment.env, PATH: `${wrapper}${path.delimiter}${process.env.PATH}`, SNAPSHOT_TEST_GIT_LOCALE: locale },
+    )
+    expect(result.code, result.stderr).toBe(0)
+    expect((await Bun.file(locale).text()).trim().split("\n")).toEqual(expect.arrayContaining(["C"]))
+  }, 30_000)
+
+  test("tracks a real SHA-256 source repository with a SHA-256 snapshot index", async () => {
+    const repo = await tmpdir()
+    await using _repo = repo
+    await $`git init --object-format=sha256`.cwd(repo.path).quiet()
+    await $`git config user.email test@opencode.test`.cwd(repo.path).quiet()
+    await $`git config user.name Test`.cwd(repo.path).quiet()
+    await Bun.write(path.join(repo.path, "tracked.txt"), "sha256")
+    const environment = await testEnvironment()
+    const output = path.join(environment.data, "result.json")
+    const result = await runWorker({ directory: repo.path, output }, environment.env)
+    expect(result.code, result.stderr).toBe(0)
+    expect(await Bun.file(output).json()).toEqual({ first: expect.stringMatching(/^[0-9a-f]{64}$/) })
+  }, 30_000)
+
   test("serializes concurrent track transactions across processes", async () => {
     const repo = await tmpdir({ git: true })
     await using _repo = repo
@@ -133,6 +196,7 @@ describe("snapshot cross-process git lock", () => {
             PATH: `${wrapper}${path.delimiter}${process.env.PATH}`,
             SNAPSHOT_TEST_GIT_FAILURE: "",
             SNAPSHOT_TEST_GIT_ACTIVE: active,
+            SNAPSHOT_TEST_GIT_SLEEP: "0.05",
           },
         ),
       }
@@ -146,6 +210,65 @@ describe("snapshot cross-process git lock", () => {
     expect(trees.map((item) => item.first)).toEqual(trees.map(() => expect.stringMatching(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/)))
   }, 60_000)
 
+  test("fails safely when a split-lock harness leaves another transaction sentinel", async () => {
+    const repo = await tmpdir({ git: true })
+    await using _repo = repo
+    const environment = await testEnvironment()
+    const output = path.join(environment.data, "result.json")
+    const result = await runWorker({ directory: repo.path, output, preexistingToken: true }, environment.env)
+    expect(result.code, result.stderr).toBe(0)
+    const snapshot = await Bun.file(output).json() as { first?: string; second?: string; tokenExists?: boolean }
+    expect(snapshot).toMatchObject({
+      first: expect.stringMatching(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/),
+      tokenExists: true,
+    })
+    expect(snapshot.second).toBeUndefined()
+  }, 30_000)
+
+  test("cleanup completes while another process owns the cross-process snapshot flock", async () => {
+    const repo = await tmpdir({ git: true })
+    await using _repo = repo
+    const environment = await testEnvironment()
+    const wrapper = await gitWrapper(path.join(environment.data, "bin"))
+    const active = path.join(environment.data, "active")
+    const trackOutput = path.join(environment.data, "track.json")
+    const track = runWorker(
+      { directory: repo.path, output: trackOutput, file: "tracked.txt" },
+      {
+        ...environment.env,
+        PATH: `${wrapper}${path.delimiter}${process.env.PATH}`,
+        SNAPSHOT_TEST_GIT_ACTIVE: active,
+        SNAPSHOT_TEST_GIT_SLEEP: "1",
+      },
+    )
+    await waitFor(active)
+    const cleanupOutput = path.join(environment.data, "cleanup.json")
+    const started = Date.now()
+    const cleanup = await runWorker({ directory: repo.path, output: cleanupOutput, cleanup: true }, environment.env)
+    expect(Date.now() - started).toBeLessThan(10_000)
+    expect(cleanup).toMatchObject({ code: 0 })
+    expect(await Bun.file(cleanupOutput).json()).toEqual({ cleanup: true })
+    expect((await track).code).toBe(0)
+  }, 30_000)
+
+  test("retries a transient native index lock and preserves it only until its owner releases it", async () => {
+    const repo = await tmpdir({ git: true })
+    await using _repo = repo
+    const environment = await testEnvironment()
+    const output = path.join(environment.data, "result.json")
+    const result = await runWorker(
+      { directory: repo.path, output, transientIndexLockMs: 50 },
+      environment.env,
+    )
+    expect(result.code, result.stderr).toBe(0)
+    expect(await Bun.file(output).json()).toMatchObject({
+      first: expect.stringMatching(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/),
+      second: expect.stringMatching(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/),
+      indexLockExists: false,
+      tokenExists: false,
+    })
+  }, 30_000)
+
   test("returns undefined without deleting an ownership-unknown native index lock", async () => {
     const repo = await tmpdir({ git: true })
     await using _repo = repo
@@ -156,11 +279,12 @@ describe("snapshot cross-process git lock", () => {
       environment.env,
     )
     expect(result.code, result.stderr).toBe(0)
-    expect(result.stderr).toBe("")
+    expect(result.stderr).toContain("snapshot_index_lock_stuck")
     const snapshot = await Bun.file(output).json() as { first?: string; second?: string; indexLockExists?: boolean }
     expect(snapshot).toMatchObject({
       first: expect.stringMatching(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/),
       indexLockExists: true,
+      tokenExists: false,
     })
     expect(snapshot.second).toBeUndefined()
   }, 30_000)

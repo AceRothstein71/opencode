@@ -14,6 +14,11 @@ type Message = {
   barrier?: string
   file?: string
   nativeIndexLock?: boolean
+  transientIndexLockMs?: number
+  twice?: boolean
+  configLockBeforeSecond?: boolean
+  preexistingToken?: boolean
+  cleanup?: boolean
   patchAfterIgnore?: boolean
 }
 
@@ -52,23 +57,46 @@ const result = await Effect.runPromise(
     if (message.barrier) yield* Effect.promise(() => waitFor(message.barrier!))
 
     const snapshot = yield* Snapshot.Service
+    if (message.cleanup) {
+      yield* snapshot.cleanup()
+      return { cleanup: true }
+    }
     const first = yield* snapshot.track()
+    if (message.twice) {
+      const gitdir = yield* Effect.promise(snapshotGitdir)
+      if (message.configLockBeforeSecond) yield* Effect.promise(() => fs.writeFile(path.join(gitdir, "config.lock"), ""))
+      const second = yield* snapshot.track()
+      return {
+        first,
+        second,
+        tokenExists: yield* Effect.promise(() => Bun.file(path.join(gitdir, "snapshot-transaction-token")).exists()),
+      }
+    }
     if (message.patchAfterIgnore) {
       yield* Effect.promise(() => fs.writeFile(path.join(message.directory, "tracked.txt"), "changed"))
       yield* Effect.promise(() => fs.writeFile(path.join(message.directory, ".gitignore"), "tracked.txt\n"))
       const patch = yield* snapshot.patch(first ?? "missing")
       return { first, patch }
     }
-    if (!message.nativeIndexLock) return { first }
+    if (!message.nativeIndexLock && !message.transientIndexLockMs && !message.preexistingToken) return { first }
 
     const gitdir = yield* Effect.promise(snapshotGitdir)
     yield* Effect.promise(() => fs.writeFile(path.join(message.directory, "changed.txt"), "changed"))
-    yield* Effect.promise(() => fs.writeFile(path.join(gitdir, "index.lock"), ""))
+    if (message.nativeIndexLock || message.transientIndexLockMs) {
+      yield* Effect.promise(() => fs.writeFile(path.join(gitdir, "index.lock"), ""))
+    }
+    if (message.preexistingToken) {
+      yield* Effect.promise(() => fs.writeFile(path.join(gitdir, "snapshot-transaction-token"), "split-lock"))
+    }
+    if (message.transientIndexLockMs) {
+      setTimeout(() => void fs.rm(path.join(gitdir, "index.lock"), { force: true }), message.transientIndexLockMs)
+    }
     const second = yield* snapshot.track()
     return {
       first,
       second,
       indexLockExists: yield* Effect.promise(() => Bun.file(path.join(gitdir, "index.lock")).exists()),
+      tokenExists: yield* Effect.promise(() => Bun.file(path.join(gitdir, "snapshot-transaction-token")).exists()),
     }
   }).pipe(provideInstance(message.directory), Effect.provide(layer)),
 )
