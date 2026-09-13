@@ -77,9 +77,9 @@ async function gitWrapper(dir: string) {
     wrapper,
     `#!/bin/sh
 for arg in "$@"; do
-  if [ "$arg" = "add" ] && [ -n "$SNAPSHOT_TEST_GIT_ACTIVE" ]; then
+  if { [ "$arg" = "add" ] || [ "$arg" = "write-tree" ]; } && [ -n "$SNAPSHOT_TEST_GIT_ACTIVE" ]; then
     if ! (set -C; : > "$SNAPSHOT_TEST_GIT_ACTIVE") 2>/dev/null; then
-      printf 'snapshot add overlap\\n' >&2
+      printf 'snapshot transaction overlap\\n' >&2
       exit 97
     fi
     trap 'rm -f "$SNAPSHOT_TEST_GIT_ACTIVE"' 0
@@ -101,7 +101,7 @@ for arg in "$@"; do
     exit 128
   fi
 done
-exec '${realGit}' "$@"
+'${realGit}' "$@"
 `,
   )
   await fs.chmod(wrapper, 0o755)
@@ -138,7 +138,7 @@ describe("snapshot cross-process git lock", () => {
     await Bun.write(barrier, "go")
     const results = await Promise.all(workers.map((item) => item.run))
     expect(results.map((item) => item.code)).toEqual(Array.from({ length: count }, () => 0))
-    expect(results.flatMap((item) => [item.stdout, item.stderr]).join("\n")).not.toContain("snapshot add overlap")
+    expect(results.flatMap((item) => [item.stdout, item.stderr]).join("\n")).not.toContain("snapshot transaction overlap")
     const trees = await Promise.all(workers.map((item) => Bun.file(item.output).json() as Promise<{ first?: string }>))
     expect(trees.map((item) => item.first)).toEqual(trees.map(() => expect.stringMatching(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/)))
   }, 60_000)
