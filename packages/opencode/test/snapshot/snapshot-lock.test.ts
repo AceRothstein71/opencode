@@ -99,7 +99,9 @@ for arg in "$@"; do
    if [ "$arg" = "config" ] && [ -n "$SNAPSHOT_TEST_GIT_CONFIG_COUNT" ]; then printf '1\n' >> "$SNAPSHOT_TEST_GIT_CONFIG_COUNT"; fi
    if { [ -n "$SNAPSHOT_TEST_GIT_FAILURE" ] && [ "$arg" = "$SNAPSHOT_TEST_GIT_FAILURE" ]; } || \\
     { [ "$SNAPSHOT_TEST_GIT_FAILURE" = "write-tree-invalid" ] && [ "$arg" = "write-tree" ]; }; then
-    if [ -n "$SNAPSHOT_TEST_GIT_COUNT" ]; then printf '1\\n' >> "$SNAPSHOT_TEST_GIT_COUNT"; fi
+     # Consume stdin before an add/rm forced exit to model git's normal process cleanup and avoid a harness-only EPIPE.
+     if [ "$arg" = "add" ] || [ "$arg" = "rm" ]; then cat >/dev/null || true; fi
+     if [ -n "$SNAPSHOT_TEST_GIT_COUNT" ]; then printf '1\\n' >> "$SNAPSHOT_TEST_GIT_COUNT"; fi
     if [ "$SNAPSHOT_TEST_GIT_FAILURE" = "write-tree-invalid" ]; then printf 'not-a-tree\\n'; exit 0; fi
     if [ "$SNAPSHOT_TEST_GIT_FAILURE" = "add-index-lock" ]; then
       for option in "$@"; do
