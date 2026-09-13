@@ -64,6 +64,9 @@ async function testEnvironment() {
     env: {
       XDG_DATA_HOME: path.join(dir, "data"),
       XDG_STATE_HOME: path.join(dir, "state"),
+      // snapshot.test.ts temporarily sets GIT_CONFIG_GLOBAL for its own cases;
+      // subprocess workers must not inherit that transient process-wide config.
+      GIT_CONFIG_GLOBAL: os.devNull,
     },
   }
 }
