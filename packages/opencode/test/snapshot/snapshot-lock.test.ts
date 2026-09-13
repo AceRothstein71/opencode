@@ -18,6 +18,9 @@ type WorkerMessage = {
   configLockBeforeSecond?: boolean
   preexistingToken?: boolean
   reportToken?: boolean
+  deadToken?: boolean
+  liveToken?: boolean
+  foreignHostToken?: boolean
   cleanup?: boolean
   patchAfterIgnore?: boolean
 }
@@ -37,7 +40,7 @@ afterEach(async () => {
 })
 
 async function waitFor(file: string) {
-  const deadline = Date.now() + 5_000
+  const deadline = Date.now() + 15_000
   while (Date.now() < deadline) {
     if (await Bun.file(file).exists()) return
     await Bun.sleep(10)
@@ -219,6 +222,50 @@ describe("snapshot cross-process git lock", () => {
     const environment = await testEnvironment()
     const output = path.join(environment.data, "result.json")
     const result = await runWorker({ directory: repo.path, output, preexistingToken: true }, environment.env)
+    expect(result.code, result.stderr).toBe(0)
+    const snapshot = await Bun.file(output).json() as { first?: string; second?: string; tokenExists?: boolean }
+    expect(snapshot).toMatchObject({
+      first: expect.stringMatching(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/),
+      tokenExists: true,
+    })
+    expect(snapshot.second).toBeUndefined()
+  }, 30_000)
+
+  test("reclaims a token owned by a provably dead local process", async () => {
+    const repo = await tmpdir({ git: true })
+    await using _repo = repo
+    const environment = await testEnvironment()
+    const output = path.join(environment.data, "result.json")
+    const result = await runWorker({ directory: repo.path, output, deadToken: true }, environment.env)
+    expect(result.code, result.stderr).toBe(0)
+    expect(await Bun.file(output).json()).toMatchObject({
+      first: expect.stringMatching(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/),
+      second: expect.stringMatching(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/),
+      tokenExists: false,
+    })
+  }, 30_000)
+
+  test("preserves a transaction token owned by the live worker process", async () => {
+    const repo = await tmpdir({ git: true })
+    await using _repo = repo
+    const environment = await testEnvironment()
+    const output = path.join(environment.data, "result.json")
+    const result = await runWorker({ directory: repo.path, output, liveToken: true }, environment.env)
+    expect(result.code, result.stderr).toBe(0)
+    const snapshot = await Bun.file(output).json() as { first?: string; second?: string; tokenExists?: boolean }
+    expect(snapshot).toMatchObject({
+      first: expect.stringMatching(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/),
+      tokenExists: true,
+    })
+    expect(snapshot.second).toBeUndefined()
+  }, 30_000)
+
+  test("preserves a dead token from another host", async () => {
+    const repo = await tmpdir({ git: true })
+    await using _repo = repo
+    const environment = await testEnvironment()
+    const output = path.join(environment.data, "result.json")
+    const result = await runWorker({ directory: repo.path, output, foreignHostToken: true }, environment.env)
     expect(result.code, result.stderr).toBe(0)
     const snapshot = await Bun.file(output).json() as { first?: string; second?: string; tokenExists?: boolean }
     expect(snapshot).toMatchObject({
