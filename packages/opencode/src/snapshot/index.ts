@@ -230,6 +230,7 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
         const exists = (file: string) => fs.exists(file).pipe(Effect.orDie)
         const read = (file: string) => fs.readFileString(file).pipe(Effect.catch(() => Effect.succeed("")))
         const remove = (file: string) => fs.remove(file).pipe(Effect.catch(() => Effect.void))
+        // The key uses the XDG-data gitdir while EffectFlock owns XDG-state lock files, so roots stay intentionally independent.
         // Snapshot transactions are non-reentrant: nested acquisition could self-deadlock on the local semaphore.
         const locked = <A, E, R>(fx: Effect.Effect<A, E, R>) =>
           lock(state.gitdir).withPermits(1)(fx.pipe(flock.withLock(`snapshot:${state.gitdir}`)))
