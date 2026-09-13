@@ -1,10 +1,10 @@
 import fs from "fs/promises"
+import os from "os"
 import path from "path"
 import { Effect, Layer } from "effect"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Snapshot } from "../../src/snapshot"
-import { InstanceStore } from "../../src/project/instance-store"
 import { provideInstance, testInstanceStoreLayer } from "./fixture"
 
 type Message = {
@@ -19,6 +19,9 @@ type Message = {
   configLockBeforeSecond?: boolean
   preexistingToken?: boolean
   reportToken?: boolean
+  deadToken?: boolean
+  liveToken?: boolean
+  foreignHostToken?: boolean
   cleanup?: boolean
   patchAfterIgnore?: boolean
 }
@@ -44,6 +47,16 @@ async function snapshotGitdir() {
   const gitdir = directories.flat().at(0)
   if (!gitdir) throw new Error("snapshot git directory was not created")
   return gitdir
+}
+
+function deadPid() {
+  const candidate = process.pid + 1_000_000
+  try {
+    process.kill(candidate, 0)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ESRCH") return candidate
+  }
+  throw new Error(`Expected ${candidate} to be a dead PID`)
 }
 
 const layer = Layer.mergeAll(
@@ -79,7 +92,14 @@ const result = await Effect.runPromise(
       const patch = yield* snapshot.patch(first ?? "missing")
       return { first, patch }
     }
-    if (!message.nativeIndexLock && !message.transientIndexLockMs && !message.preexistingToken) {
+    if (
+      !message.nativeIndexLock &&
+      !message.transientIndexLockMs &&
+      !message.preexistingToken &&
+      !message.deadToken &&
+      !message.liveToken &&
+      !message.foreignHostToken
+    ) {
       if (!message.reportToken) return { first }
       const gitdir = yield* Effect.promise(snapshotGitdir)
       return {
@@ -95,6 +115,30 @@ const result = await Effect.runPromise(
     }
     if (message.preexistingToken) {
       yield* Effect.promise(() => fs.writeFile(path.join(gitdir, "snapshot-transaction-token"), "split-lock"))
+    }
+    if (message.deadToken) {
+      yield* Effect.promise(() =>
+        fs.writeFile(
+          path.join(gitdir, "snapshot-transaction-token"),
+          JSON.stringify({ pid: deadPid(), hostname: os.hostname(), createdAt: Date.now() - 1_000 }),
+        ),
+      )
+    }
+    if (message.liveToken) {
+      yield* Effect.promise(() =>
+        fs.writeFile(
+          path.join(gitdir, "snapshot-transaction-token"),
+          JSON.stringify({ pid: process.pid, hostname: os.hostname(), createdAt: Date.now() - 1_000 }),
+        ),
+      )
+    }
+    if (message.foreignHostToken) {
+      yield* Effect.promise(() =>
+        fs.writeFile(
+          path.join(gitdir, "snapshot-transaction-token"),
+          JSON.stringify({ pid: deadPid(), hostname: "foreign-host", createdAt: Date.now() - 1_000 }),
+        ),
+      )
     }
     if (message.transientIndexLockMs) {
       setTimeout(() => void fs.rm(path.join(gitdir, "index.lock"), { force: true }), message.transientIndexLockMs)

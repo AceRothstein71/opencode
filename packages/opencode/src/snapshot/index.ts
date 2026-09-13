@@ -11,7 +11,7 @@ import { EffectFlock } from "@opencode-ai/core/util/effect-flock"
 import { Config } from "@/config/config"
 import { Global } from "@opencode-ai/core/global"
 import { Info } from "@opencode-ai/schema/file-diff"
-import { randomUUID } from "crypto"
+import os from "os"
 
 export const Patch = Schema.Struct({
   hash: Schema.String,
@@ -31,6 +31,12 @@ interface GitResult {
   readonly code: ChildProcessSpawner.ExitCode
   readonly text: string
   readonly stderr: string
+}
+
+type TransactionToken = {
+  readonly pid: number
+  readonly hostname: string
+  readonly createdAt: number
 }
 
 type State = Omit<Interface, "init">
@@ -83,6 +89,7 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
 
         const indexLock = path.join(state.gitdir, "index.lock")
         const transactionToken = path.join(state.gitdir, "snapshot-transaction-token")
+        const hostname = os.hostname()
         const isIndexLockContention = (result: GitResult) =>
           result.code !== 0 && result.stderr.includes(`Unable to create '${indexLock}': File exists.`)
 
@@ -247,26 +254,78 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
               }).pipe(Effect.as(fallback)),
             ),
           )
+        const parseTransactionToken = (content: string): TransactionToken | undefined => {
+          try {
+            const parsed: unknown = JSON.parse(content)
+            if (
+              !parsed ||
+              typeof parsed !== "object" ||
+              !("pid" in parsed) ||
+              !("hostname" in parsed) ||
+              !("createdAt" in parsed) ||
+              typeof parsed.pid !== "number" ||
+              !Number.isInteger(parsed.pid) ||
+              parsed.pid <= 0 ||
+              typeof parsed.hostname !== "string" ||
+              typeof parsed.createdAt !== "number" ||
+              !Number.isFinite(parsed.createdAt)
+            ) {
+              return undefined
+            }
+            return parsed as TransactionToken
+          } catch {
+            return undefined
+          }
+        }
+        const isProvablyDeadLocalPid = (pid: number) => {
+          if (pid === process.pid) return false
+          try {
+            process.kill(pid, 0)
+            return false
+          } catch (error) {
+            return (error as NodeJS.ErrnoException).code === "ESRCH"
+          }
+        }
+        const removeTransactionToken = () =>
+          fs.remove(transactionToken).pipe(Effect.as(true), Effect.catch(() => Effect.succeed(false)))
         const withTransactionToken = <A, E, R>(fx: Effect.Effect<A, E, R>) =>
           Effect.gen(function* () {
             if (yield* exists(transactionToken)) {
-              yield* Effect.logError("snapshot_transaction_overlap", {
-                token: transactionToken,
-                remedy: "wait for the active snapshot transaction to finish",
-              })
-              return undefined
+              const owner = parseTransactionToken(yield* read(transactionToken))
+              if (owner && owner.hostname === hostname && isProvablyDeadLocalPid(owner.pid)) {
+                const removed = yield* removeTransactionToken()
+                if (removed) {
+                  yield* Effect.logInfo("snapshot_transaction_token_reclaimed", {
+                    pid: owner.pid,
+                    hostname: owner.hostname,
+                    createdAt: owner.createdAt,
+                    ageMs: Math.max(0, Date.now() - owner.createdAt),
+                  })
+                }
+              }
+              if (yield* exists(transactionToken)) {
+                yield* Effect.logError("snapshot_transaction_overlap", {
+                  token: transactionToken,
+                  owner,
+                  remedy: "inspect the token and remove it only after confirming its owner is dead",
+                })
+                return undefined
+              }
             }
             const created = yield* fs
-              .writeFileString(transactionToken, randomUUID(), { flag: "wx" })
+              .writeFileString(transactionToken, JSON.stringify({ pid: process.pid, hostname, createdAt: Date.now() }), {
+                flag: "wx",
+              })
               .pipe(Effect.as(true), Effect.catch(() => Effect.succeed(false)))
             if (!created) {
               yield* Effect.logError("snapshot_transaction_overlap", {
                 token: transactionToken,
-                remedy: "wait for the active snapshot transaction to finish",
+                owner: parseTransactionToken(yield* read(transactionToken)),
+                remedy: "inspect the token and remove it only after confirming its owner is dead",
               })
               return undefined
             }
-            return yield* fx.pipe(Effect.ensuring(remove(transactionToken)))
+            return yield* fx.pipe(Effect.ensuring(removeTransactionToken().pipe(Effect.asVoid)))
           })
 
         const enabled = Effect.fnUntraced(function* () {
