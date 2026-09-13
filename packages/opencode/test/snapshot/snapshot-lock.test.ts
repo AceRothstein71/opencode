@@ -202,7 +202,7 @@ describe("snapshot cross-process git lock", () => {
     expect(result.code, result.stderr).toBe(0)
     expect(await Bun.file(output).json()).toEqual({
       first: expect.stringMatching(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/),
-      patch: { hash: expect.stringMatching(/^[0-9a-f]{40}$/), files: [] },
+      patch: { hash: expect.stringMatching(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/), files: [] },
     })
   }, 30_000)
 
