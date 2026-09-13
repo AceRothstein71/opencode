@@ -18,6 +18,7 @@ type Message = {
   twice?: boolean
   configLockBeforeSecond?: boolean
   preexistingToken?: boolean
+  reportToken?: boolean
   cleanup?: boolean
   patchAfterIgnore?: boolean
 }
@@ -78,7 +79,14 @@ const result = await Effect.runPromise(
       const patch = yield* snapshot.patch(first ?? "missing")
       return { first, patch }
     }
-    if (!message.nativeIndexLock && !message.transientIndexLockMs && !message.preexistingToken) return { first }
+    if (!message.nativeIndexLock && !message.transientIndexLockMs && !message.preexistingToken) {
+      if (!message.reportToken) return { first }
+      const gitdir = yield* Effect.promise(snapshotGitdir)
+      return {
+        first,
+        tokenExists: yield* Effect.promise(() => Bun.file(path.join(gitdir, "snapshot-transaction-token")).exists()),
+      }
+    }
 
     const gitdir = yield* Effect.promise(snapshotGitdir)
     yield* Effect.promise(() => fs.writeFile(path.join(message.directory, "changed.txt"), "changed"))

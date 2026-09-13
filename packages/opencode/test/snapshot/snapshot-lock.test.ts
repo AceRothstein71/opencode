@@ -17,6 +17,7 @@ type WorkerMessage = {
   twice?: boolean
   configLockBeforeSecond?: boolean
   preexistingToken?: boolean
+  reportToken?: boolean
   cleanup?: boolean
   patchAfterIgnore?: boolean
 }
@@ -289,6 +290,20 @@ describe("snapshot cross-process git lock", () => {
       tokenExists: false,
     })
     expect(snapshot.second).toBeUndefined()
+  }, 30_000)
+
+  test("releases its transaction sentinel after a forced staging failure", async () => {
+    const repo = await tmpdir({ git: true })
+    await using _repo = repo
+    const environment = await testEnvironment()
+    const wrapper = await gitWrapper(path.join(environment.data, "bin"))
+    const output = path.join(environment.data, "result.json")
+    const result = await runWorker(
+      { directory: repo.path, output, file: "tracked.txt", reportToken: true },
+      { ...environment.env, PATH: `${wrapper}${path.delimiter}${process.env.PATH}`, SNAPSHOT_TEST_GIT_FAILURE: "add" },
+    )
+    expect(result.code, result.stderr).toBe(0)
+    expect(await Bun.file(output).json()).toEqual({ first: undefined, tokenExists: false })
   }, 30_000)
 
   test.each([
