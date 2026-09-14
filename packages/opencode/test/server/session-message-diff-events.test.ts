@@ -125,7 +125,9 @@ describe("session message diff events", () => {
         expect(unchangedDiffEvents).toHaveLength(1)
         expect(JSON.stringify(unchangedDiffEvents[0]?.data)).toContain("turn patch")
 
-        yield* Effect.promise(() => Bun.write(path.join(test.directory, "turn.ts"), "changed turn patch".repeat(30_000)))
+        yield* Effect.promise(() =>
+          Bun.write(path.join(test.directory, "turn.ts"), "changed turn patch".repeat(30_000)),
+        )
         const changed = yield* snapshot.track()
         if (!changed) return yield* Effect.die("expected changed snapshot")
         yield* Session.use.updatePart({
@@ -140,7 +142,8 @@ describe("session message diff events", () => {
         })
         const expectedChangedDiffs = yield* summary.computeDiff({
           messages: (yield* Session.use.messages({ sessionID: session.id })).filter(
-            (item) => item.info.id === messageID || (item.info.role === "assistant" && item.info.parentID === messageID),
+            (item) =>
+              item.info.id === messageID || (item.info.role === "assistant" && item.info.parentID === messageID),
           ),
         })
         yield* summary.summarize({ sessionID: session.id, messageID })
@@ -187,14 +190,18 @@ describe("session message diff events", () => {
         )
         expect(messageResponse.status).toBe(200)
         const messagePayload = (yield* messageResponse.json) as SessionV1.WithParts
-        expect(
-          messagePayload.info.role === "user" ? messagePayload.info.summary?.diffs : undefined,
-        ).toEqual(expectedChangedDiffs)
+        expect(messagePayload.info.role === "user" ? messagePayload.info.summary?.diffs : undefined).toEqual(
+          expectedChangedDiffs,
+        )
 
         yield* db.delete(MessageDiffTable).where(eq(MessageDiffTable.session_id, session.id)).run().pipe(Effect.orDie)
         yield* db.delete(MessageTable).where(eq(MessageTable.session_id, session.id)).run().pipe(Effect.orDie)
         yield* db.delete(EventTable).where(eq(EventTable.aggregate_id, session.id)).run().pipe(Effect.orDie)
-        yield* db.delete(EventSequenceTable).where(eq(EventSequenceTable.aggregate_id, session.id)).run().pipe(Effect.orDie)
+        yield* db
+          .delete(EventSequenceTable)
+          .where(eq(EventSequenceTable.aggregate_id, session.id))
+          .run()
+          .pipe(Effect.orDie)
         yield* db.delete(SessionTable).where(eq(SessionTable.id, session.id)).run().pipe(Effect.orDie)
 
         const event = yield* EventV2.Service
@@ -302,7 +309,9 @@ describe("session message diff events", () => {
         const snapshot = yield* Snapshot.Service
         const start = yield* snapshot.track()
         if (!start) return yield* Effect.die("expected initial snapshot")
-        yield* Effect.promise(() => Bun.write(path.join(test.directory, "imported.ts"), "imported patch".repeat(30_000)))
+        yield* Effect.promise(() =>
+          Bun.write(path.join(test.directory, "imported.ts"), "imported patch".repeat(30_000)),
+        )
         const finish = yield* snapshot.track()
         if (!finish) return yield* Effect.die("expected finished snapshot")
         yield* Session.use.updatePart({
@@ -325,7 +334,8 @@ describe("session message diff events", () => {
         const summary = yield* SessionSummary.Service
         const expected = yield* summary.computeDiff({
           messages: (yield* Session.use.messages({ sessionID: session.id })).filter(
-            (item) => item.info.id === messageID || (item.info.role === "assistant" && item.info.parentID === messageID),
+            (item) =>
+              item.info.id === messageID || (item.info.role === "assistant" && item.info.parentID === messageID),
           ),
         })
         expect(expected.length).toBeGreaterThan(0)
@@ -367,7 +377,11 @@ describe("session message diff events", () => {
         yield* db.delete(MessageDiffTable).where(eq(MessageDiffTable.session_id, session.id)).run().pipe(Effect.orDie)
         yield* db.delete(MessageTable).where(eq(MessageTable.session_id, session.id)).run().pipe(Effect.orDie)
         yield* db.delete(EventTable).where(eq(EventTable.aggregate_id, session.id)).run().pipe(Effect.orDie)
-        yield* db.delete(EventSequenceTable).where(eq(EventSequenceTable.aggregate_id, session.id)).run().pipe(Effect.orDie)
+        yield* db
+          .delete(EventSequenceTable)
+          .where(eq(EventSequenceTable.aggregate_id, session.id))
+          .run()
+          .pipe(Effect.orDie)
         yield* db.delete(SessionTable).where(eq(SessionTable.id, session.id)).run().pipe(Effect.orDie)
 
         const event = yield* EventV2.Service
@@ -434,7 +448,9 @@ describe("session message diff events", () => {
         const snapshot = yield* Snapshot.Service
         const start = yield* snapshot.track()
         if (!start) return yield* Effect.die("expected initial snapshot")
-        yield* Effect.promise(() => Bun.write(path.join(test.directory, "imported.ts"), "imported patch".repeat(30_000)))
+        yield* Effect.promise(() =>
+          Bun.write(path.join(test.directory, "imported.ts"), "imported patch".repeat(30_000)),
+        )
         const finish = yield* snapshot.track()
         if (!finish) return yield* Effect.die("expected finished snapshot")
         yield* Session.use.updatePart({
@@ -457,7 +473,8 @@ describe("session message diff events", () => {
         const summary = yield* SessionSummary.Service
         const expected = yield* summary.computeDiff({
           messages: (yield* Session.use.messages({ sessionID: session.id })).filter(
-            (item) => item.info.id === messageID || (item.info.role === "assistant" && item.info.parentID === messageID),
+            (item) =>
+              item.info.id === messageID || (item.info.role === "assistant" && item.info.parentID === messageID),
           ),
         })
         expect(expected.length).toBeGreaterThan(0)
@@ -481,7 +498,11 @@ describe("session message diff events", () => {
         yield* db.delete(MessageDiffTable).where(eq(MessageDiffTable.session_id, session.id)).run().pipe(Effect.orDie)
         yield* db.delete(MessageTable).where(eq(MessageTable.session_id, session.id)).run().pipe(Effect.orDie)
         yield* db.delete(EventTable).where(eq(EventTable.aggregate_id, session.id)).run().pipe(Effect.orDie)
-        yield* db.delete(EventSequenceTable).where(eq(EventSequenceTable.aggregate_id, session.id)).run().pipe(Effect.orDie)
+        yield* db
+          .delete(EventSequenceTable)
+          .where(eq(EventSequenceTable.aggregate_id, session.id))
+          .run()
+          .pipe(Effect.orDie)
         yield* db.delete(SessionTable).where(eq(SessionTable.id, session.id)).run().pipe(Effect.orDie)
 
         const event = yield* EventV2.Service
@@ -609,6 +630,153 @@ describe("session message diff events", () => {
           .get()
           .pipe(Effect.orDie)
         expect(cascaded).toBeUndefined()
+      }),
+    { git: true, config: { formatter: false, lsp: false } },
+  )
+
+  it.instance(
+    "summarize backfills a child outside the target page window",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const session = yield* withSession({ title: "backfill" })
+        const targetID = MessageID.ascending()
+        const childID = MessageID.ascending()
+        const base = Date.now()
+
+        yield* Session.use.updateMessage({
+          id: childID,
+          sessionID: session.id,
+          role: "assistant",
+          time: { created: base },
+          parentID: targetID,
+          agent: "build",
+          modelID: ModelV2.ID.make("model"),
+          providerID: ProviderV2.ID.make("test"),
+          mode: "build",
+          path: { cwd: test.directory, root: test.directory },
+          cost: 0,
+          tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        } satisfies SessionV1.Assistant)
+
+        // Fillers push the oldest child out of the target's page so the paging walk ends before it.
+        yield* Effect.forEach(
+          Array.from({ length: 49 }, (_, index) => index),
+          (index) =>
+            Session.use.updateMessage({
+              ...userMessage(session.id, MessageID.ascending()),
+              time: { created: base + 1 + index },
+            }),
+          { discard: true },
+        )
+        yield* Session.use.updateMessage({
+          ...userMessage(session.id, targetID),
+          time: { created: base + 50 },
+        })
+
+        const snapshot = yield* Snapshot.Service
+        const start = yield* snapshot.track()
+        if (!start) return yield* Effect.die("expected initial snapshot")
+        yield* Effect.promise(() =>
+          Bun.write(path.join(test.directory, "backfill.ts"), "backfill patch".repeat(10_000)),
+        )
+        const finish = yield* snapshot.track()
+        if (!finish) return yield* Effect.die("expected finished snapshot")
+        yield* Session.use.updatePart({
+          id: PartID.ascending(),
+          messageID: childID,
+          sessionID: session.id,
+          type: "step-start",
+          snapshot: start,
+        })
+        yield* Session.use.updatePart({
+          id: PartID.ascending(),
+          messageID: childID,
+          sessionID: session.id,
+          type: "step-finish",
+          reason: "stop",
+          snapshot: finish,
+          cost: 0,
+          tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        })
+
+        const summary = yield* SessionSummary.Service
+        yield* summary.summarize({ sessionID: session.id, messageID: targetID })
+
+        const diffs = yield* summary.diff({ sessionID: session.id, messageID: targetID })
+        expect(diffs[0]?.patch).toContain("backfill patch")
+      }),
+    { git: true, config: { formatter: false, lsp: false } },
+  )
+
+  it.instance(
+    "diff reads a stored turn patch after many newer messages exist",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const session = yield* withSession({ title: "diff-lookup" })
+        const targetID = MessageID.ascending()
+        const childID = MessageID.ascending()
+        const base = Date.now()
+
+        yield* Session.use.updateMessage({ ...userMessage(session.id, targetID), time: { created: base } })
+        yield* Session.use.updateMessage({
+          id: childID,
+          sessionID: session.id,
+          role: "assistant",
+          time: { created: base + 1 },
+          parentID: targetID,
+          agent: "build",
+          modelID: ModelV2.ID.make("model"),
+          providerID: ProviderV2.ID.make("test"),
+          mode: "build",
+          path: { cwd: test.directory, root: test.directory },
+          cost: 0,
+          tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        } satisfies SessionV1.Assistant)
+
+        const snapshot = yield* Snapshot.Service
+        const start = yield* snapshot.track()
+        if (!start) return yield* Effect.die("expected initial snapshot")
+        yield* Effect.promise(() => Bun.write(path.join(test.directory, "lookup.ts"), "lookup patch".repeat(1_000)))
+        const finish = yield* snapshot.track()
+        if (!finish) return yield* Effect.die("expected finished snapshot")
+        yield* Session.use.updatePart({
+          id: PartID.ascending(),
+          messageID: childID,
+          sessionID: session.id,
+          type: "step-start",
+          snapshot: start,
+        })
+        yield* Session.use.updatePart({
+          id: PartID.ascending(),
+          messageID: childID,
+          sessionID: session.id,
+          type: "step-finish",
+          reason: "stop",
+          snapshot: finish,
+          cost: 0,
+          tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        })
+
+        const summary = yield* SessionSummary.Service
+        yield* summary.summarize({ sessionID: session.id, messageID: targetID })
+
+        yield* Effect.forEach(
+          Array.from({ length: 60 }, (_, index) => index),
+          (index) =>
+            Session.use.updateMessage({
+              ...userMessage(session.id, MessageID.ascending()),
+              time: { created: base + 2 + index },
+            }),
+          { discard: true },
+        )
+
+        const diffs = yield* summary.diff({ sessionID: session.id, messageID: targetID })
+        expect(diffs.some((item) => item.patch?.includes("lookup patch"))).toBe(true)
+
+        const missing = yield* summary.diff({ sessionID: session.id, messageID: MessageID.ascending() })
+        expect(missing).toEqual([])
       }),
     { git: true, config: { formatter: false, lsp: false } },
   )
