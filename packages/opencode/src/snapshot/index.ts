@@ -671,6 +671,7 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
               const clash = (a: string, b: string) => a === b || a.startsWith(`${b}/`) || b.startsWith(`${a}/`)
 
               for (let i = 0; i < ops.length; ) {
+                yield* Effect.yieldNow
                 const first = ops[i]!
                 const run = [first]
                 let j = i + 1
@@ -975,6 +976,7 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
 
               for (let i = 0; i < rows.length; i += step) {
                 const run = rows.slice(i, i + step)
+                yield* Effect.yieldNow
                 const text = yield* load(run)
 
                 for (const row of run) {

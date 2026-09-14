@@ -301,16 +301,24 @@ const layer = Layer.effectDiscard(
           .get()
           .pipe(Effect.orDie)
         if (!parent) return
+        const current = yield* db
+          .select({ diffs: MessageDiffTable.diffs })
+          .from(MessageDiffTable)
+          .where(eq(MessageDiffTable.message_id, event.data.messageID))
+          .get()
+          .pipe(Effect.orDie)
+        const next = event.data.diffs.map((item) => ({ ...item }))
+        if (current && JSON.stringify(current.diffs) === JSON.stringify(next)) return
         yield* db
           .insert(MessageDiffTable)
           .values({
             message_id: event.data.messageID,
             session_id: event.data.sessionID,
-            diffs: event.data.diffs.map((item) => ({ ...item })),
+            diffs: next,
           })
           .onConflictDoUpdate({
             target: MessageDiffTable.message_id,
-            set: { diffs: event.data.diffs.map((item) => ({ ...item })) },
+            set: { diffs: next },
           })
           .run()
           .pipe(Effect.orDie)

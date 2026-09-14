@@ -113,15 +113,6 @@ const layer = Layer.effect(
       sessionID: SessionID
       messageID: MessageID
     }) {
-      yield* sessions.setSummary({
-        sessionID: input.sessionID,
-        summary: {
-          additions: 0,
-          deletions: 0,
-          files: 0,
-        },
-      })
-      yield* events.publish(Session.Event.Diff, { sessionID: input.sessionID, diff: [] })
       if ((yield* config.get()).snapshot === false) return
       const all = yield* sessions.messages({ sessionID: input.sessionID }).pipe(Effect.orDie)
       if (!all.length) return
@@ -131,6 +122,7 @@ const layer = Layer.effect(
       )
       const target = messages.find((m) => m.info.id === input.messageID)
       if (!target || target.info.role !== "user") return
+      yield* Effect.yieldNow
       const msgDiffs = yield* computeDiff({ messages })
       const dedicated = yield* database.db
         .select({ message_id: MessageDiffTable.message_id })
@@ -139,8 +131,18 @@ const layer = Layer.effect(
         .get()
         .pipe(Effect.orDie)
       if (dedicated && isDeepStrictEqual(target.info.summary?.diffs, msgDiffs)) return
+      yield* sessions.setSummary({
+        sessionID: input.sessionID,
+        summary: {
+          additions: 0,
+          deletions: 0,
+          files: 0,
+        },
+      })
+      yield* events.publish(Session.Event.Diff, { sessionID: input.sessionID, diff: [] })
       // Imported/historic rows have no durable message event, so a diff-only publish would replay
       // without its parent. Normal turns already have one, so this never adds a duplicate stream.
+      // event_aggregate_type_seq_idx scopes this to the session's message.updated rows.
       const parentKey = `${input.sessionID}:${input.messageID}`
       const durableParent =
         durableParents.has(parentKey) ||
