@@ -9,6 +9,7 @@ import { and, eq, sql } from "drizzle-orm"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Snapshot } from "@/snapshot"
 import { Session } from "./session"
+import { MessageV2 } from "./message-v2"
 import { SessionID, MessageID } from "./schema"
 import { Config } from "@/config/config"
 import { createDurableParentCache } from "./durable-parent-cache"
@@ -89,8 +90,30 @@ const layer = Layer.effect(
     // historical-event scan; the bounded cache evicts least-recently-used identities.
     const durableParents = createDurableParentCache()
 
-    const computeDiff = Effect.fn("SessionSummary.computeDiff")(function* (input: { messages: SessionV1.WithParts[] }) {
-      let from: string | undefined
+    const turnMessages = Effect.fn("SessionSummary.turnMessages")(function* (input: {
+      sessionID: SessionID
+      messageID: MessageID
+    }) {
+      const size = 50
+      const newer = [] as SessionV1.WithParts[]
+      let before: string | undefined
+      while (true) {
+        const next = yield* MessageV2.page({ sessionID: input.sessionID, limit: size, before }).pipe(
+          Effect.provideService(Database.Service, database),
+          Effect.orDie,
+        )
+        for (let i = next.items.length - 1; i >= 0; i--) {
+          const item = next.items[i]
+          if (item) newer.push(item)
+        }
+        if (newer.some((m) => m.info.id === input.messageID)) break
+        if (!next.more || !next.cursor) break
+        before = next.cursor
+      }
+      return newer.reverse()
+    })
+
+    const computeDiff = Effect.fn("SessionSummary.computeDiff")(function* (input: { messages: SessionV1.WithParts[] }) {      let from: string | undefined
       let to: string | undefined
       for (const item of input.messages) {
         if (!from) {
@@ -114,7 +137,7 @@ const layer = Layer.effect(
       messageID: MessageID
     }) {
       if ((yield* config.get()).snapshot === false) return
-      const all = yield* sessions.messages({ sessionID: input.sessionID }).pipe(Effect.orDie)
+      const all = yield* turnMessages({ sessionID: input.sessionID, messageID: input.messageID })
       if (!all.length) return
 
       const messages = all.filter(
@@ -176,7 +199,7 @@ const layer = Layer.effect(
 
     const diff = Effect.fn("SessionSummary.diff")(function* (input: { sessionID: SessionID; messageID?: MessageID }) {
       if (!input.messageID) return []
-      const message = (yield* sessions.messages({ sessionID: input.sessionID }).pipe(Effect.orDie)).find(
+      const message = (yield* turnMessages({ sessionID: input.sessionID, messageID: input.messageID })).find(
         (item) => item.info.id === input.messageID,
       )
       if (!message || message.info.role !== "user") return []
