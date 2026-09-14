@@ -158,17 +158,15 @@ describe("session message diff events", () => {
           .all()
           .pipe(Effect.orDie)
         const diffEvents = events.filter((event) => event.type === "message.diff.updated.1")
+        // The diff stream is self-compacting: the newer publish tombstones the older
+        // payload (rows stay so replay seqs stay contiguous) while replay converges.
         expect(diffEvents).toHaveLength(2)
-        expect(JSON.stringify(diffEvents[0]?.data)).toContain("turn patch")
+        expect(diffEvents[0]?.data).toMatchObject({ messageID, diffs: [] })
         expect(JSON.stringify(diffEvents[1]?.data)).toContain("changed turn patch")
-        expect(JSON.stringify(diffEvents[0]?.data).length).toBeGreaterThan(250_000)
         expect(JSON.stringify(diffEvents[1]?.data).length).toBeGreaterThan(250_000)
 
         const fullPatchEvents = events.filter((event) => JSON.stringify(event.data).includes("turn patch"))
-        expect(fullPatchEvents.map((event) => event.type)).toEqual([
-          "message.diff.updated.1",
-          "message.diff.updated.1",
-        ])
+        expect(fullPatchEvents.map((event) => event.type)).toEqual(["message.diff.updated.1"])
         expect(
           events
             .filter((event) => event.type === "message.updated.1")

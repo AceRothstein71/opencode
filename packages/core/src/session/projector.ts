@@ -3,7 +3,8 @@ export * as SessionProjector from "./projector"
 import { and, desc, eq, gt, or, sql } from "drizzle-orm"
 import { DateTime, Effect, Layer, Schema } from "effect"
 import { Database } from "../database/database"
-import { EventV2 } from "../event"
+import { EventV2, versionedType } from "../event"
+import { EventTable } from "../event/sql"
 import { makeGlobalNode } from "../effect/app-node"
 import { SessionEvent } from "./event"
 import { SessionV1 } from "../v1/session"
@@ -205,6 +206,28 @@ function insertMessage(db: DatabaseService, event: SessionEvent.Event, message: 
     .pipe(Effect.orDie)
 }
 
+function diffEventScope(sessionID: string, messageID: string) {
+  const definition = SessionV1.Event.MessageDiffUpdated
+  const type = definition.durable ? versionedType(definition.type, definition.durable.version) : definition.type
+  return and(
+    eq(EventTable.aggregate_id, sessionID),
+    eq(EventTable.type, type),
+    sql`json_extract(${EventTable.data}, '$.messageID') = ${messageID}`,
+  )
+}
+
+// Shrinks superseded diff payloads to tombstones. Rows stay so per-aggregate seqs
+// remain contiguous for sync replay; replay still converges because the latest event
+// (applied last) carries the full diffs.
+function tombstoneDiffEvents(db: DatabaseService, sessionID: string, messageID: string) {
+  return db
+    .update(EventTable)
+    .set({ data: { sessionID, messageID, diffs: [] } })
+    .where(diffEventScope(sessionID, messageID))
+    .run()
+    .pipe(Effect.orDie)
+}
+
 const layer = Layer.effectDiscard(
   Effect.gen(function* () {
     const events = yield* EventV2.Service
@@ -301,6 +324,7 @@ const layer = Layer.effectDiscard(
           .get()
           .pipe(Effect.orDie)
         if (!parent) return
+        yield* tombstoneDiffEvents(db, event.data.sessionID, event.data.messageID)
         const current = yield* db
           .select({ diffs: MessageDiffTable.diffs })
           .from(MessageDiffTable)
@@ -342,6 +366,8 @@ const layer = Layer.effectDiscard(
           .where(and(eq(MessageTable.id, event.data.messageID), eq(MessageTable.session_id, event.data.sessionID)))
           .run()
           .pipe(Effect.orDie)
+        // Orphaned diff payloads shrink to tombstones; rows stay for replay contiguity.
+        yield* tombstoneDiffEvents(db, event.data.sessionID, event.data.messageID)
       }),
     )
     yield* events.project(SessionV1.Event.PartRemoved, (event) =>

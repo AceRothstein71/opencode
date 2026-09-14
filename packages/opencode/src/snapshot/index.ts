@@ -973,6 +973,12 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
               const step = 100
               const patch = (file: string, before: string, after: string) =>
                 formatPatch(structuredPatch(file, file, before, after, "", "", { context: Number.MAX_SAFE_INTEGER }))
+              // Patch text is display-only: revert works from tree hashes, never from this text.
+              // Telemetry and log blobs would otherwise embed whole files into every diff event
+              // and row, so withhold patch text beyond a per-file and total budget.
+              const PATCH_FILE_BUDGET = 1024 * 1024
+              const PATCH_TOTAL_BUDGET = 1024 * 1024
+              let patchBudget = PATCH_TOTAL_BUDGET
 
               for (let i = 0; i < rows.length; i += step) {
                 const run = rows.slice(i, i + step)
@@ -982,12 +988,17 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
                 for (const row of run) {
                   const hit = text?.get(row.file) ?? { before: "", after: "" }
                   const [before, after] = row.binary ? ["", ""] : text ? [hit.before, hit.after] : yield* show(row)
+                  const oversize =
+                    !row.binary && (before.length + after.length > PATCH_FILE_BUDGET || patchBudget <= 0)
+                  const patchText = row.binary || oversize ? "" : patch(row.file, before, after)
+                  if (!oversize && !row.binary) patchBudget -= patchText.length
                   result.push({
                     file: row.file,
-                    patch: row.binary ? "" : patch(row.file, before, after),
+                    patch: patchText,
                     additions: row.additions,
                     deletions: row.deletions,
                     status: row.status,
+                    ...(oversize ? { truncated: true as const } : {}),
                   })
                 }
               }
