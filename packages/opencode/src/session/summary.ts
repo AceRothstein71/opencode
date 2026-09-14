@@ -8,6 +8,7 @@ import { EventTable } from "@opencode-ai/core/event/sql"
 import { and, eq, sql } from "drizzle-orm"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Snapshot } from "@/snapshot"
+import { NotFoundError } from "@/storage/storage"
 import { Session } from "./session"
 import { MessageV2 } from "./message-v2"
 import { SessionID, MessageID } from "./schema"
@@ -199,8 +200,12 @@ const layer = Layer.effect(
 
     const diff = Effect.fn("SessionSummary.diff")(function* (input: { sessionID: SessionID; messageID?: MessageID }) {
       if (!input.messageID) return []
-      const message = (yield* turnMessages({ sessionID: input.sessionID, messageID: input.messageID })).find(
-        (item) => item.info.id === input.messageID,
+      // MessageV2.get hydrates through the same diff-row merge as the page
+      // walk, so this returns identical values without scanning back every
+      // newer page when an old turn's diff is requested.
+      const message = yield* MessageV2.get({ sessionID: input.sessionID, messageID: input.messageID }).pipe(
+        Effect.provideService(Database.Service, database),
+        Effect.catchIf(NotFoundError.isInstance, () => Effect.succeed(undefined)),
       )
       if (!message || message.info.role !== "user") return []
       const diffs = message.info.summary?.diffs ?? []
