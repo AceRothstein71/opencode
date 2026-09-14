@@ -3,7 +3,7 @@ import { isDeepStrictEqual } from "node:util"
 import { Effect, Layer, Context, Schema } from "effect"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Database } from "@opencode-ai/core/database/database"
-import { MessageDiffTable } from "@opencode-ai/core/session/sql"
+import { MessageDiffTable, MessageTable } from "@opencode-ai/core/session/sql"
 import { EventTable } from "@opencode-ai/core/event/sql"
 import { and, eq, sql } from "drizzle-orm"
 import { EventV2Bridge } from "@/event-v2-bridge"
@@ -111,10 +111,38 @@ const layer = Layer.effect(
         if (!next.more || !next.cursor) break
         before = next.cursor
       }
+      // Children normally sort newer than their parent, but client-supplied or
+      // imported ids can invert that and land outside the window above. Backfill
+      // any children the walk missed so the turn is complete regardless of order.
+      if (newer.some((m) => m.info.id === input.messageID)) {
+        const known = new Set(newer.map((m) => m.info.id))
+        const orphans = yield* database.db
+          .select({ id: MessageTable.id })
+          .from(MessageTable)
+          .where(
+            and(
+              eq(MessageTable.session_id, input.sessionID),
+              sql`json_extract(${MessageTable.data}, '$.parentID') = ${input.messageID}`,
+            ),
+          )
+          .all()
+          .pipe(Effect.orDie)
+        for (const row of orphans) {
+          if (known.has(row.id)) continue
+          const child = yield* MessageV2.get({ sessionID: input.sessionID, messageID: row.id }).pipe(
+            Effect.provideService(Database.Service, database),
+            Effect.catchIf(NotFoundError.isInstance, () => Effect.succeed(undefined)),
+          )
+          if (child) newer.push(child)
+        }
+        newer.sort((a, b) => a.info.time.created - b.info.time.created || (a.info.id < b.info.id ? -1 : 1))
+        return newer
+      }
       return newer.reverse()
     })
 
-    const computeDiff = Effect.fn("SessionSummary.computeDiff")(function* (input: { messages: SessionV1.WithParts[] }) {      let from: string | undefined
+    const computeDiff = Effect.fn("SessionSummary.computeDiff")(function* (input: { messages: SessionV1.WithParts[] }) {
+      let from: string | undefined
       let to: string | undefined
       for (const item of input.messages) {
         if (!from) {
