@@ -25,6 +25,9 @@ import { BashArity } from "@/permission/arity"
 export { Parameters } from "./shell/prompt"
 
 const MAX_METADATA_LENGTH = 30_000
+
+// Bound per-chunk preview writes: every metadata call durably rewrites the full part.
+const METADATA_THROTTLE_MS = 200
 const CWD = new Set(["cd", "chdir", "popd", "pushd", "push-location", "set-location"])
 const FILES = new Set([
   ...CWD,
@@ -446,6 +449,8 @@ export const ShellTool = Tool.define(
       let cut = false
       let expired = false
       let aborted = false
+      let lastMetadataFlush = 0
+      let metadataDirty = false
 
       const closeSink = Effect.fnUntraced(function* () {
         const stream = sink
@@ -522,6 +527,13 @@ export const ShellTool = Tool.define(
                 }
               }
 
+              const now = Date.now()
+              if (now - lastMetadataFlush < METADATA_THROTTLE_MS) {
+                metadataDirty = true
+                return Effect.void
+              }
+              lastMetadataFlush = now
+              metadataDirty = false
               return ctx.metadata({
                 metadata: {
                   output: last,
@@ -557,6 +569,15 @@ export const ShellTool = Tool.define(
           return exit.kind === "exit" ? exit.code : null
         }),
       ).pipe(Effect.orDie)
+
+      if (metadataDirty) {
+        metadataDirty = false
+        yield* ctx.metadata({
+          metadata: {
+            output: last,
+          },
+        })
+      }
 
       const meta: string[] = []
       if (expired) {

@@ -33,7 +33,7 @@ function flushEvents() {
   Rpc.emit("global.event.batch", collapseEventBatch(pendingEvents.splice(0)))
 }
 
-GlobalBus.on("event", (event) => {
+GlobalBus.on("event", (event: GlobalEvent) => {
   pendingEvents.push(event)
   if (pendingEvents.length >= EVENT_BATCH_LIMIT) {
     if (flushTimer !== undefined) clearTimeout(flushTimer)
