@@ -40,9 +40,6 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
     const project = yield* Project.Service
     const bootstrap = yield* InstanceBootstrap.Service
     const scope = yield* Scope.Scope
-    // Long-lived servers visit many directories and every cached instance keeps its
-    // bootstrap resources alive, so the cache is bounded and evicts the oldest done entry.
-    const MAX_CACHED_INSTANCES = 16
     const cache = new Map<string, Entry>()
 
     const boot = (input: LoadInput & { directory: string }) =>
@@ -108,28 +105,13 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
       return true
     })
 
-    const evictStale = Effect.fnUntraced(function* () {
-      for (const [directory, entry] of [...cache.entries()]) {
-        if (cache.size < MAX_CACHED_INSTANCES) return
-        if (!(yield* Deferred.isDone(entry.deferred))) continue
-        const exit = yield* Deferred.await(entry.deferred).pipe(Effect.exit)
-        if (Exit.isFailure(exit)) yield* removeEntry(directory, entry).pipe(Effect.asVoid)
-        else yield* disposeEntry(directory, entry, exit.value).pipe(Effect.asVoid)
-      }
-    })
-
     const load = (input: LoadInput): Effect.Effect<InstanceContext> => {
       const directory = FSUtil.resolve(input.directory)
       return Effect.uninterruptibleMask((restore) =>
         Effect.gen(function* () {
           const existing = cache.get(directory)
-          if (existing) {
-            cache.delete(directory)
-            cache.set(directory, existing)
-            return yield* restore(Deferred.await(existing.deferred))
-          }
+          if (existing) return yield* restore(Deferred.await(existing.deferred))
 
-          yield* evictStale()
           const entry: Entry = { deferred: Deferred.makeUnsafe<InstanceContext>() }
           cache.set(directory, entry)
           yield* Effect.gen(function* () {
