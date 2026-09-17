@@ -930,7 +930,10 @@ const layer = Layer.effect(
         }),
       )
 
-      if (error) return { status: "failed", error: `OAuth completion failed: ${error}` } satisfies Status
+      if (error) {
+        pendingOAuthTransports.delete(mcpName)
+        return { status: "failed", error: `OAuth completion failed: ${error}` } satisfies Status
+      }
 
       yield* Effect.promise(() => pending.provider?.commit() ?? Promise.resolve())
       yield* auth.clearCodeVerifier(mcpName)

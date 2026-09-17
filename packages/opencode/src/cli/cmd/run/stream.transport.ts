@@ -899,7 +899,10 @@ function createLayer(input: StreamInput) {
 
           trackBlocker(event)
 
-          const prev = event.type === "message.part.updated" ? listSubagentTabs(state.subagent) : undefined
+          // `prev` is only consumed by `traceTabs`, which is a no-op when tracing is
+          // disabled (the default), so skip the copy+sort entirely in that case.
+          const prev =
+            input.trace && event.type === "message.part.updated" ? listSubagentTabs(state.subagent) : undefined
           const next = reduceSessionData({
             data: state.data,
             event,

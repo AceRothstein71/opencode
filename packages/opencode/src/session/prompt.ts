@@ -653,10 +653,8 @@ const layer = Layer.effect(
           ...(current.model.variant && current.model.variant !== "default" ? { variant: current.model.variant } : {}),
         }
       }
-      const match = yield* sessions
-        .findMessage(sessionID, (m) => m.info.role === "user" && !!m.info.model)
-        .pipe(Effect.orDie)
-      if (Option.isSome(match) && match.value.info.role === "user") return match.value.info.model
+      const match = yield* sessions.findMessageInfo(sessionID, (m) => m.role === "user" && !!m.model).pipe(Effect.orDie)
+      if (Option.isSome(match) && match.value.role === "user") return match.value.model
       return yield* provider.defaultModel().pipe(Effect.orDie)
     })
 
