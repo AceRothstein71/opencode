@@ -25,6 +25,7 @@ type Message = {
   cleanup?: boolean
   patchAfterIgnore?: boolean
   corruptIndexOnce?: boolean
+  truncateIndexOnce?: boolean
 }
 
 const message: Message = JSON.parse(process.argv[2] ?? "{}")
@@ -99,7 +100,8 @@ const result = await Effect.runPromise(
       !message.deadToken &&
       !message.liveToken &&
       !message.foreignHostToken &&
-      !message.corruptIndexOnce
+      !message.corruptIndexOnce &&
+      !message.truncateIndexOnce
     ) {
       if (!message.reportToken) return { first }
       const gitdir = yield* Effect.promise(snapshotGitdir)
@@ -143,6 +145,17 @@ const result = await Effect.runPromise(
     }
     if (message.corruptIndexOnce) {
       yield* Effect.promise(() => fs.writeFile(path.join(gitdir, "index"), "corrupt"))
+      const second = yield* snapshot.track()
+      return { first, second, gitdir }
+    }
+    if (message.truncateIndexOnce) {
+      yield* Effect.promise(async () => {
+        const target = path.join(gitdir, "index")
+        const bytes = await Bun.file(target).arrayBuffer()
+        await Bun.write(target, bytes.slice(0, Math.max(12, Math.floor(bytes.byteLength / 2))))
+      })
+      const second = yield* snapshot.track()
+      return { first, second, gitdir }
     }
     if (message.transientIndexLockMs) {
       setTimeout(() => void fs.rm(path.join(gitdir, "index.lock"), { force: true }), message.transientIndexLockMs)

@@ -108,13 +108,20 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
           )
           const snapshotGitEnv = (env?: Record<string, string>) => ({ ...env, LC_ALL: "C", LANG: "C" })
 
+          // A corrupt index can silently produce the git empty tree for a non-empty worktree.
+          const isSnapshotEmptyTree = (hash: string) =>
+            hash === "4b825dc642cb6eb9a060e54bf8d69288fbee4904" ||
+            hash === "6ef19b41225c5369f1c104d45d8d85efa9b057b53b14b4b9b939dd74decc5321"
+
           const git = Effect.fnUntraced(function* (
             cmd: string[],
             opts?: { cwd?: string; env?: Record<string, string>; stdin?: string },
           ) {
-            const result = Effect.suspend(() =>
+            const writesIndex = ["add", "rm", "read-tree"].some((subcommand) => cmd.includes(subcommand))
+            // Deleting a corrupt index is only safe ahead of commands that rebuild state from the worktree.
+            const healsIndex = writesIndex || ["diff-files", "ls-files"].some((subcommand) => cmd.includes(subcommand))
+            const execute = Effect.suspend(() =>
               Effect.gen(function* () {
-                const writesIndex = ["add", "rm", "read-tree"].some((subcommand) => cmd.includes(subcommand))
                 if (writesIndex && (yield* exists(indexLock))) {
                   return {
                     code: ChildProcessSpawner.ExitCode(128),
@@ -149,41 +156,52 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
               }),
             )
 
-            return yield* result.pipe(
-              Effect.flatMap((result) =>
-                isIndexLockContention(result) ? Effect.fail(result) : Effect.succeed(result),
-              ),
-              Effect.retry({ schedule: indexLockRetry, while: isIndexLockContention }),
-              Effect.catch((result) =>
-                Effect.gen(function* () {
-                  if (isIndexLockContention(result)) {
-                    const ageMs = yield* indexLockAge()
-                    yield* Effect.logError("snapshot_index_lock_stuck", {
-                      indexLock,
-                      ageMs,
-                      remedy: "remove the lock manually only after confirming no git process owns it",
-                    })
-                    yield* Effect.sync(() =>
-                      process.stderr.write(
-                        `snapshot_index_lock_stuck index_lock=${indexLock} age_ms=${ageMs ?? "unknown"} remedy=manual-confirm-and-remove\n`,
-                      ),
-                    )
-                  }
-                  return result
-                }),
-              ),
+            const settle = (effect: typeof execute) =>
+              effect.pipe(
+                Effect.flatMap((result) =>
+                  isIndexLockContention(result) ? Effect.fail(result) : Effect.succeed(result),
+                ),
+                Effect.retry({ schedule: indexLockRetry, while: isIndexLockContention }),
+                Effect.catch((result) =>
+                  Effect.gen(function* () {
+                    if (isIndexLockContention(result)) {
+                      const ageMs = yield* indexLockAge()
+                      yield* Effect.logError("snapshot_index_lock_stuck", {
+                        indexLock,
+                        ageMs,
+                        remedy: "remove the lock manually only after confirming no git process owns it",
+                      })
+                      yield* Effect.sync(() =>
+                        process.stderr.write(
+                          `snapshot_index_lock_stuck index_lock=${indexLock} age_ms=${ageMs ?? "unknown"} remedy=manual-confirm-and-remove\n`,
+                        ),
+                      )
+                    }
+                    return result
+                  }),
+                ),
+              )
+
+            return yield* settle(execute).pipe(
               Effect.flatMap((outcome) => {
                 const corrupted =
                   outcome.code !== 0 &&
-                  /index file corrupt|index file smaller than expected|bad index file sha1 signature/.test(
+                  healsIndex &&
+                  /index file corrupt|index file smaller than expected|bad index file sha1 signature|unexpected diff status|unknown file mode for .* in index/.test(
                     outcome.stderr,
                   )
                 if (!corrupted) return Effect.succeed(outcome)
                 return Effect.gen(function* () {
-                  // The snapshot gitdir is derived state; deleting a corrupt index only drops staged paths, which the retry restages.
+                  const removed = yield* fs.remove(path.join(state.gitdir, "index")).pipe(
+                    Effect.as(true),
+                    Effect.catch(() => Effect.succeed(false)),
+                  )
+                  if (!removed) {
+                    yield* Effect.logWarning("snapshot_index_corruption_detected", { gitdir: state.gitdir })
+                    return yield* settle(execute)
+                  }
                   yield* Effect.logWarning("snapshot_index_corruption_recovered", { gitdir: state.gitdir })
-                  yield* fs.remove(path.join(state.gitdir, "index")).pipe(Effect.ignore)
-                  return yield* result
+                  return yield* settle(execute)
                 })
               }),
             )
@@ -569,23 +587,49 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
                 if (!(yield* setup(existed))) return
                 return yield* withTransactionToken(
                   Effect.gen(function* () {
-                    if (!(yield* add())) return
-                    const result = yield* git(args(["write-tree"]), { cwd: state.directory })
-                    if (result.code !== 0) {
-                      yield* Effect.logError("failed to write snapshot tree", {
-                        exitCode: result.code,
-                        stderr: result.stderr,
-                      })
-                      return
-                    }
-                    const hash = result.text.trim()
-                    if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(hash)) {
-                      yield* Effect.logError("snapshot git returned an invalid tree hash", {
-                        hash,
-                        stderr: result.stderr,
-                      })
-                      return
-                    }
+                    const capture = Effect.gen(function* () {
+                      if (!(yield* add())) return
+                      const result = yield* git(args(["write-tree"]), { cwd: state.directory })
+                      if (result.code !== 0) {
+                        yield* Effect.logError("failed to write snapshot tree", {
+                          exitCode: result.code,
+                          stderr: result.stderr,
+                        })
+                        return
+                      }
+                      const hash = result.text.trim()
+                      if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(hash)) {
+                        yield* Effect.logError("snapshot git returned an invalid tree hash", {
+                          hash,
+                          stderr: result.stderr,
+                        })
+                        return
+                      }
+                      return hash
+                    })
+
+                    // A corrupt index can silently produce the empty tree; rebuild it and recapture once before accepting the result.
+                    const hash = yield* capture.pipe(
+                      Effect.flatMap((captured) => {
+                        if (captured === undefined || !isSnapshotEmptyTree(captured)) return Effect.succeed(captured)
+                        return Effect.gen(function* () {
+                          yield* Effect.logWarning("snapshot_empty_tree_detected", {
+                            hash: captured,
+                            gitdir: state.gitdir,
+                          })
+                          yield* fs.remove(path.join(state.gitdir, "index")).pipe(Effect.ignore)
+                          const retry = yield* capture
+                          if (retry !== undefined && !isSnapshotEmptyTree(retry)) {
+                            yield* Effect.logWarning("snapshot_empty_tree_recovered", {
+                              hash: retry,
+                              gitdir: state.gitdir,
+                            })
+                          }
+                          return retry
+                        })
+                      }),
+                    )
+                    if (hash === undefined) return
                     yield* Effect.logInfo("tracking", { hash, cwd: state.directory, git: state.gitdir })
                     return hash
                   }),

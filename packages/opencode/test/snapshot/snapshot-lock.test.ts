@@ -24,6 +24,7 @@ type WorkerMessage = {
   cleanup?: boolean
   patchAfterIgnore?: boolean
   corruptIndexOnce?: boolean
+  truncateIndexOnce?: boolean
 }
 
 type WorkerResult = {
@@ -428,9 +429,27 @@ describe("snapshot cross-process git lock", () => {
     const output = path.join(environment.data, "result.json")
     const result = await runWorker({ directory: repo.path, output, corruptIndexOnce: true }, environment.env)
     expect(result.code, result.stderr).toBe(0)
-    expect(await Bun.file(output).json()).toMatchObject({
-      first: expect.stringMatching(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/),
-      second: expect.stringMatching(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/),
-    })
+    const json = await Bun.file(output).json()
+    expect(json.first).toMatch(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/)
+    expect(json.second).toMatch(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/)
+    expect(json.second).not.toBe(json.first)
+    expect(json.second).not.toBe("4b825dc642cb6eb9a060e54bf8d69288fbee4904")
+    const names = await $`git --git-dir=${json.gitdir} ls-tree -r --name-only ${json.second}`.quiet().text()
+    expect(names).toContain("changed.txt")
+  }, 30_000)
+
+  test("recovers from a truncated snapshot index instead of publishing an empty tree", async () => {
+    const repo = await tmpdir({ git: true })
+    await using _repo = repo
+    const environment = await testEnvironment()
+    const output = path.join(environment.data, "result.json")
+    const result = await runWorker({ directory: repo.path, output, truncateIndexOnce: true }, environment.env)
+    expect(result.code, result.stderr).toBe(0)
+    const json = await Bun.file(output).json()
+    expect(json.second).toMatch(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/)
+    expect(json.second).not.toBe("4b825dc642cb6eb9a060e54bf8d69288fbee4904")
+    expect(json.second).not.toBe("6ef19b41225c5369f1c104d45d8d85efa9b057b53b14b4b9b939dd74decc5321")
+    const names = await $`git --git-dir=${json.gitdir} ls-tree -r --name-only ${json.second}`.quiet().text()
+    expect(names).toContain("changed.txt")
   }, 30_000)
 })
