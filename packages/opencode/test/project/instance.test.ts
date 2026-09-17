@@ -50,6 +50,25 @@ describe("InstanceStore", () => {
     }),
   )
 
+  it.live("disposes instances beyond the cache bound", () =>
+    Effect.gen(function* () {
+      yield* setBootstrap(Effect.void)
+      const disposed: string[] = []
+      yield* registerDisposerScoped((directory) => {
+        disposed.push(directory)
+        return Promise.resolve()
+      })
+      const store = yield* InstanceStore.Service
+      const directories = yield* Effect.forEach(
+        Array.from({ length: 17 }, (_, index) => index),
+        () => tmpdirScoped({ git: true }),
+      )
+      yield* Effect.forEach(directories, (directory) => store.load({ directory }), { discard: true })
+
+      expect(disposed).toEqual([directories[0]])
+    }),
+  )
+
   it.live("runs bootstrap with InstanceRef provided", () =>
     Effect.gen(function* () {
       const dir = yield* tmpdirScoped({ git: true })
