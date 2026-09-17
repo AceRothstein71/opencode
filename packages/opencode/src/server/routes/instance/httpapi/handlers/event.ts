@@ -28,20 +28,15 @@ function eventResponse(events: EventV2.Interface) {
     const workspaceID = yield* InstanceState.workspaceID
     // Listener registration is eager, so events published after this point cannot
     // be lost while the HTTP body fiber is starting or emitting server.connected.
-    // The buffer is bounded: when it overflows a server.desync marker is sent so
-    // clients resynchronize instead of silently diverging.
-    const queue = yield* Queue.dropping<{ id: string; type: string; properties: unknown }>(1024)
-    let dropped = false
+    // The buffer is bounded: a slow consumer drops the oldest events instead of
+    // growing memory for every event in the process.
+    const queue = yield* Queue.sliding<{ id: string; type: string; properties: unknown }>(8192)
     const unsubscribe = yield* events.listen((event) =>
       Effect.sync(() => {
         // Filter before enqueue so foreign directories and workspaces never occupy buffer space.
         if (event.location?.directory !== instance.directory) return
         if (event.location.workspaceID !== undefined && event.location.workspaceID !== workspaceID) return
-        if (dropped) {
-          if (!Queue.offerUnsafe(queue, { id: eventID(), type: "server.desync", properties: {} })) return
-          dropped = false
-        }
-        if (!Queue.offerUnsafe(queue, { id: event.id, type: event.type, properties: event.data })) dropped = true
+        Queue.offerUnsafe(queue, { id: event.id, type: event.type, properties: event.data })
       }),
     )
     yield* Effect.addFinalizer(() => unsubscribe)

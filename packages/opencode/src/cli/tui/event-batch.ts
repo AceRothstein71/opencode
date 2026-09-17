@@ -52,6 +52,8 @@ function deltaKey(event: GlobalEvent, properties: DeltaProperties): string {
 function partReplacementID(event: GlobalEvent): string | undefined {
   const payload = event.payload
   if (!payload || typeof payload !== "object") return
+  if (payload.type === "message.updated" || payload.type === "message.removed" || payload.type === "session.deleted")
+    return "*"
   if (payload.type !== "message.part.updated" && payload.type !== "message.part.removed") return
   const properties = payload.properties
   if (!properties || typeof properties !== "object") return
@@ -82,7 +84,8 @@ export function collapseEventBatch(events: GlobalEvent[]): GlobalEvent[] {
         return state
       }
       const partID = partReplacementID(event)
-      if (partID) {
+      if (partID === "*") state.keys.clear()
+      else if (partID) {
         for (const [key, index] of state.keys) {
           const pending = state.collapsed[index]
           if (pending && deltaProperties(pending)?.partID === partID) state.keys.delete(key)

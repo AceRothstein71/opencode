@@ -78,7 +78,7 @@ export interface Interface {
     messages: SessionV1.WithParts[]
     sessionID?: SessionID
     messageID?: MessageID
-  }) => Effect.Effect<Snapshot.FileDiff[]>
+  }) => Effect.Effect<Snapshot.FileDiff[] | undefined>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/SessionSummary") {}
@@ -176,16 +176,16 @@ const layer = Layer.effect(
         if (cached && cached.from === from && cached.to === to) return cached.diffs.map((item) => ({ ...item }))
       }
       const diffs = yield* snapshot.diffFull(from, to)
-      // A failed or disabled snapshot read surfaces as an empty diff; caching it
-      // would freeze that transient result as the message's real diff.
+      // A failed or disabled snapshot read returns undefined instead of an empty diff.
+      if (diffs === undefined) return undefined
       if (cacheKey && diffs.length) {
-        if (diffCache.size >= 32) {
+        if (diffCache.size >= 8) {
           const oldest = diffCache.keys().next()
           if (!oldest.done) diffCache.delete(oldest.value)
         }
         diffCache.set(cacheKey, { from, to, diffs })
       }
-      return diffs
+      return diffs.map((item) => ({ ...item }))
     })
 
     const runSummarize = Effect.fn("SessionSummary.summarize")(function* (input: {
@@ -203,6 +203,7 @@ const layer = Layer.effect(
       if (!target || target.info.role !== "user") return
       yield* Effect.yieldNow
       const msgDiffs = yield* computeDiff({ sessionID: input.sessionID, messageID: input.messageID, messages })
+      if (msgDiffs === undefined) return
       const dedicated = yield* database.db
         .select({ message_id: MessageDiffTable.message_id })
         .from(MessageDiffTable)

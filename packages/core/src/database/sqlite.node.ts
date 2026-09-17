@@ -68,7 +68,7 @@ const make = (options: Config) =>
     if (readNative !== native) {
       yield* Effect.addFinalizer(() => Effect.sync(() => readNative.close()))
       readNative.exec("PRAGMA busy_timeout = 5000;")
-      readNative.exec("PRAGMA cache_size = -64000;")
+      readNative.exec("PRAGMA cache_size = -32000;")
       readNative.exec("PRAGMA query_only = ON;")
     }
 
@@ -136,14 +136,21 @@ const make = (options: Config) =>
 
     const connection = identity<SqliteConnection>({
       execute(query, params, transformRows) {
-        const result = READS.test(query) ? run(readNative, query, params) : gated(run(native, query, params))
+        const result =
+          READS.test(query) && readNative !== native
+            ? run(readNative, query, params)
+            : gated(run(native, query, params))
         return transformRows ? Effect.map(result, transformRows) : result
       },
       executeRaw(query, params) {
-        return READS.test(query) ? run(readNative, query, params) : gated(run(native, query, params))
+        return READS.test(query) && readNative !== native
+          ? run(readNative, query, params)
+          : gated(run(native, query, params))
       },
       executeValues(query, params) {
-        return READS.test(query) ? runValues(readNative, query, params) : gated(runValues(native, query, params))
+        return READS.test(query) && readNative !== native
+          ? runValues(readNative, query, params)
+          : gated(runValues(native, query, params))
       },
       executeUnprepared(query, params, transformRows) {
         return this.execute(query, params, transformRows)

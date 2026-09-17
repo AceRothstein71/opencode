@@ -140,12 +140,13 @@ describe("session message diff events", () => {
           cost: 0,
           tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
         })
-        const expectedChangedDiffs = yield* summary.computeDiff({
-          messages: (yield* Session.use.messages({ sessionID: session.id })).filter(
-            (item) =>
-              item.info.id === messageID || (item.info.role === "assistant" && item.info.parentID === messageID),
-          ),
-        })
+        const expectedChangedDiffs =
+          (yield* summary.computeDiff({
+            messages: (yield* Session.use.messages({ sessionID: session.id })).filter(
+              (item) =>
+                item.info.id === messageID || (item.info.role === "assistant" && item.info.parentID === messageID),
+            ),
+          })) ?? []
         yield* summary.summarize({ sessionID: session.id, messageID })
         const changedDiffs = (yield* Session.use.messages({ sessionID: session.id })).find(
           (item) => item.info.id === messageID,
@@ -332,12 +333,13 @@ describe("session message diff events", () => {
           tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
         })
         const summary = yield* SessionSummary.Service
-        const expected = yield* summary.computeDiff({
-          messages: (yield* Session.use.messages({ sessionID: session.id })).filter(
-            (item) =>
-              item.info.id === messageID || (item.info.role === "assistant" && item.info.parentID === messageID),
-          ),
-        })
+        const expected =
+          (yield* summary.computeDiff({
+            messages: (yield* Session.use.messages({ sessionID: session.id })).filter(
+              (item) =>
+                item.info.id === messageID || (item.info.role === "assistant" && item.info.parentID === messageID),
+            ),
+          })) ?? []
         expect(expected.length).toBeGreaterThan(0)
         expect(JSON.stringify(expected)).toContain("imported patch")
         yield* summary.summarize({ sessionID: session.id, messageID })
@@ -471,12 +473,13 @@ describe("session message diff events", () => {
           tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
         })
         const summary = yield* SessionSummary.Service
-        const expected = yield* summary.computeDiff({
-          messages: (yield* Session.use.messages({ sessionID: session.id })).filter(
-            (item) =>
-              item.info.id === messageID || (item.info.role === "assistant" && item.info.parentID === messageID),
-          ),
-        })
+        const expected =
+          (yield* summary.computeDiff({
+            messages: (yield* Session.use.messages({ sessionID: session.id })).filter(
+              (item) =>
+                item.info.id === messageID || (item.info.role === "assistant" && item.info.parentID === messageID),
+            ),
+          })) ?? []
         expect(expected.length).toBeGreaterThan(0)
         yield* summary.summarize({ sessionID: session.id, messageID })
         const live = (yield* Session.use.messages({ sessionID: session.id })).find(

@@ -79,7 +79,7 @@ const layer = Layer.effect(
       if (rev.snapshot) rev.diff = yield* snap.diff(rev.snapshot)
       const index = all.findIndex((msg) => msg.info.id === rev.messageID)
       const range = index < 0 ? [] : all.slice(index)
-      const diffs = yield* summary.computeDiff({ messages: range })
+      const diffs = (yield* summary.computeDiff({ messages: range })) ?? []
       yield* storage.write(["session_diff", input.sessionID], diffs).pipe(Effect.ignore)
       yield* events.publish(Session.Event.Diff, { sessionID: input.sessionID, diff: diffs })
       yield* sessions.setRevert({
@@ -100,7 +100,9 @@ const layer = Layer.effect(
       const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
       if (!session.revert) return session
       if (session.revert.snapshot && !(yield* snap.restore(session.revert.snapshot))) {
-        yield* Effect.logError("session unrevert aborted because snapshot restore failed", { sessionID: input.sessionID })
+        yield* Effect.logError("session unrevert aborted because snapshot restore failed", {
+          sessionID: input.sessionID,
+        })
         return session
       }
       yield* sessions.clearRevert(input.sessionID)

@@ -49,7 +49,7 @@ export interface Interface {
   readonly restore: (snapshot: string) => Effect.Effect<boolean>
   readonly revert: (patches: Patch[]) => Effect.Effect<boolean>
   readonly diff: (hash: string) => Effect.Effect<string>
-  readonly diffFull: (from: string, to: string) => Effect.Effect<FileDiff[]>
+  readonly diffFull: (from: string, to: string) => Effect.Effect<FileDiff[] | undefined>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/Snapshot") {}
@@ -198,10 +198,12 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
                   )
                   if (!removed) {
                     yield* Effect.logWarning("snapshot_index_corruption_detected", { gitdir: state.gitdir })
-                    return yield* settle(execute)
                   }
-                  yield* Effect.logWarning("snapshot_index_corruption_recovered", { gitdir: state.gitdir })
-                  return yield* settle(execute)
+                  const result = yield* settle(execute)
+                  if (removed && result.code === 0) {
+                    yield* Effect.logWarning("snapshot_index_corruption_recovered", { gitdir: state.gitdir })
+                  }
+                  return result
                 })
               }),
             )
@@ -862,12 +864,14 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
             )
           })
 
+          // Failure and disabled state return undefined so callers never publish an
+          // empty diff over a stored one.
           const diffFull = Effect.fnUntraced(function* (from: string, to: string) {
             return yield* safeLocked(
               "diffFull",
-              [],
+              undefined,
               Effect.gen(function* () {
-                if (!(yield* enabled())) return []
+                if (!(yield* enabled())) return undefined
                 type Row = {
                   file: string
                   status: "added" | "deleted" | "modified"

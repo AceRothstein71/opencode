@@ -589,7 +589,7 @@ it.instance(
       yield* write(`${tmp.path}/b.txt`, "also modified")
       const after = yield* snapshot.track()
       expect(after).toBeTruthy()
-      const diffs = yield* snapshot.diffFull(before, after!)
+      const diffs = (yield* snapshot.diffFull(before, after!)) ?? []
       expect(diffs.some((x) => x.file === "a.txt")).toBe(false)
       expect(diffs.some((x) => x.file === ".gitignore")).toBe(true)
       expect(diffs.some((x) => x.file === "b.txt")).toBe(true)
@@ -610,7 +610,7 @@ it.instance(
       expect(patch.files).toContain(fwd(tmp.path, "normal.txt"))
       expect(patch.files).not.toContain(fwd(tmp.path, "ignored.txt"))
       const after = yield* snapshot.track()
-      const diffs = yield* snapshot.diffFull(before, after!)
+      const diffs = (yield* snapshot.diffFull(before, after!)) ?? []
       expect(diffs.some((x) => x.file === "normal.txt")).toBe(true)
       expect(diffs.some((x) => x.file === "ignored.txt")).toBe(false)
     }),
@@ -867,7 +867,7 @@ it.instance(
     yield* write(`${tmp.path}/added.txt`, "new")
     const after = yield* snapshot.track()
     expect(after).toBeTruthy()
-    const diffs = yield* snapshot.diffFull(before!, after!)
+    const diffs = (yield* snapshot.diffFull(before!, after!)) ?? []
     expect(diffs.length).toBe(4)
     expect(diffs.find((d) => d.file === "added.txt")!.status).toBe("added")
     expect(diffs.find((d) => d.file === "delete.txt")!.status).toBe("deleted")
@@ -890,7 +890,7 @@ it.instance(
       yield* write(`${tmp.path}/new.txt`, "new content")
       const after = yield* snapshot.track()
       expect(after).toBeTruthy()
-      const diffs = yield* snapshot.diffFull(before, after!)
+      const diffs = (yield* snapshot.diffFull(before, after!)) ?? []
       expect(diffs.length).toBe(1)
       expect(diffs[0].file).toBe("new.txt")
       expect(diffs[0].patch).toContain("+new content")
@@ -914,7 +914,7 @@ it.instance(
     yield* write(`${tmp.path}/small.txt`, "after\n")
     const after = yield* snapshot.track()
     expect(after).toBeTruthy()
-    const diffs = yield* snapshot.diffFull(before!, after!)
+    const diffs = (yield* snapshot.diffFull(before!, after!)) ?? []
     const big = diffs.find((diff) => diff.file === "big.txt")!
     expect(big.truncated).toBe(true)
     expect(big.patch).toBe("")
@@ -957,7 +957,7 @@ it.instance(
     )
     const after = yield* snapshot.track()
     expect(after).toBeTruthy()
-    const diffs = yield* snapshot.diffFull(before!, after!)
+    const diffs = (yield* snapshot.diffFull(before!, after!)) ?? []
     expect(diffs).toHaveLength(ids.length * 4)
     const map = new Map(diffs.map((item) => [item.file, item]))
     for (let i = 0; i < ids.length; i++) {
@@ -1004,7 +1004,7 @@ it.instance(
     )
     const after = yield* snapshot.track()
     expect(after).toBeTruthy()
-    expect((yield* snapshot.diffFull(before!, after!)).map((item) => item.file)).toEqual(
+    expect(((yield* snapshot.diffFull(before!, after!)) ?? []).map((item) => item.file)).toEqual(
       ids.map((id) => `order/${id}.txt`),
     )
   }),
@@ -1018,7 +1018,7 @@ it.instance(
       yield* write(`${tmp.path}/b.txt`, "modified content")
       const after = yield* snapshot.track()
       expect(after).toBeTruthy()
-      const diffs = yield* snapshot.diffFull(before, after!)
+      const diffs = (yield* snapshot.diffFull(before, after!)) ?? []
       expect(diffs.length).toBe(1)
       expect(diffs[0].file).toBe("b.txt")
       expect(diffs[0].patch).toContain(`-${tmp.extra.bContent}`)
@@ -1037,7 +1037,7 @@ it.instance(
       yield* rm(`${tmp.path}/a.txt`)
       const after = yield* snapshot.track()
       expect(after).toBeTruthy()
-      const diffs = yield* snapshot.diffFull(before, after!)
+      const diffs = (yield* snapshot.diffFull(before, after!)) ?? []
       expect(diffs.length).toBe(1)
       expect(diffs[0].file).toBe("a.txt")
       expect(diffs[0].patch).toContain(`-${tmp.extra.aContent}`)
@@ -1055,7 +1055,7 @@ it.instance(
       yield* write(`${tmp.path}/multi.txt`, "line1\nline2\nline3")
       const after = yield* snapshot.track()
       expect(after).toBeTruthy()
-      const diffs = yield* snapshot.diffFull(before, after!)
+      const diffs = (yield* snapshot.diffFull(before, after!)) ?? []
       expect(diffs.length).toBe(1)
       expect(diffs[0].file).toBe("multi.txt")
       expect(diffs[0].patch).toContain("+line1")
@@ -1075,7 +1075,7 @@ it.instance(
       yield* rm(`${tmp.path}/a.txt`)
       const after = yield* snapshot.track()
       expect(after).toBeTruthy()
-      const diffs = yield* snapshot.diffFull(before, after!)
+      const diffs = (yield* snapshot.diffFull(before, after!)) ?? []
       expect(diffs.length).toBe(2)
       const added = diffs.find((d) => d.file === "added.txt")!
       expect(added.patch).toContain("+added content")
@@ -1100,7 +1100,7 @@ it.instance(
       yield* rm(`${tmp.path}/b.txt`)
       const after = yield* snapshot.track()
       expect(after).toBeTruthy()
-      const diffs = yield* snapshot.diffFull(before, after!)
+      const diffs = (yield* snapshot.diffFull(before, after!)) ?? []
       expect(diffs.length).toBe(4)
       expect(diffs.find((d) => d.file === "multi1.txt")!.additions).toBe(3)
       expect(diffs.find((d) => d.file === "multi1.txt")!.deletions).toBe(0)
@@ -1121,7 +1121,7 @@ it.instance(
     Effect.gen(function* () {
       const after = yield* snapshot.track()
       expect(after).toBeTruthy()
-      expect((yield* snapshot.diffFull(before, after!)).length).toBe(0)
+      expect(((yield* snapshot.diffFull(before, after!)) ?? []).length).toBe(0)
     }),
   ),
   { git: true },
@@ -1134,7 +1134,7 @@ it.instance(
       yield* write(`${tmp.path}/binary.bin`, new Uint8Array([0x00, 0x01, 0x02, 0x03]))
       const after = yield* snapshot.track()
       expect(after).toBeTruthy()
-      const diffs = yield* snapshot.diffFull(before, after!)
+      const diffs = (yield* snapshot.diffFull(before, after!)) ?? []
       expect(diffs.length).toBe(1)
       expect(diffs[0].file).toBe("binary.bin")
       expect(diffs[0].patch).toBe("")
@@ -1154,7 +1154,7 @@ it.instance(
     yield* write(`${tmp.path}/whitespace.txt`, "line1\n\nline2\n")
     const after = yield* snapshot.track()
     expect(after).toBeTruthy()
-    const diffs = yield* snapshot.diffFull(before!, after!)
+    const diffs = (yield* snapshot.diffFull(before!, after!)) ?? []
     expect(diffs.length).toBe(1)
     expect(diffs[0].file).toBe("whitespace.txt")
     expect(diffs[0].additions).toBeGreaterThan(0)
