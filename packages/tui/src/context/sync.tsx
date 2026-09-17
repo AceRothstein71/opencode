@@ -189,6 +189,11 @@ export const {
           // Buffer only across an in-flight first page; a later fetch reads the durable diff itself.
           if (!hydratingSessions.has(event.properties.sessionID)) return
           const pending = pendingDiffs.get(event.properties.sessionID) ?? new Map<string, SnapshotFileDiff[]>()
+          // Later fetches read the durable diff, so the oldest buffered entries can be dropped.
+          if (pending.size >= 100) {
+            const oldest = pending.keys().next()
+            if (!oldest.done) pending.delete(oldest.value)
+          }
           pending.set(event.properties.messageID, event.properties.diffs)
           pendingDiffs.set(event.properties.sessionID, pending)
           return

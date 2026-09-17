@@ -72,6 +72,7 @@ interface ProcessorContext extends Input {
   needsCompaction: boolean
   currentText: SessionV1.TextPart | undefined
   reasoningMap: Record<string, SessionV1.ReasoningPart>
+  lastToolFingerprint?: string
 }
 
 type StreamEvent = LLMEvent
@@ -383,12 +384,19 @@ const layer = Layer.effect(
                 : value.providerMetadata,
             }))
 
+            const inputNeedle = JSON.stringify(input)
+            // Only a repeated identical call can form a doom loop; skip the full parts read otherwise.
+            const fingerprint = `${value.name}:${inputNeedle}`
+            if (ctx.lastToolFingerprint !== fingerprint) {
+              ctx.lastToolFingerprint = fingerprint
+              return
+            }
+
             const parts = yield* MessageV2.parts(ctx.assistantMessage.id).pipe(
               Effect.provideService(Database.Service, database),
             )
             const recentParts = parts.slice(-DOOM_LOOP_THRESHOLD)
 
-            const inputNeedle = JSON.stringify(input)
             if (
               recentParts.length !== DOOM_LOOP_THRESHOLD ||
               !recentParts.every(

@@ -115,7 +115,8 @@ const layer = Layer.effect(
     const account = yield* Account.Service
     const events = yield* EventV2Bridge.Service
     const cfg = yield* Config.Service
-    const { db } = yield* Database.Service
+    const database = yield* Database.Service
+    const { db } = database
     const http = yield* HttpClient.HttpClient
     const httpOk = HttpClient.filterStatusOk(http)
     const provider = yield* Provider.Service
@@ -131,7 +132,23 @@ const layer = Layer.effect(
         const existing = s.queue.get(sessionID)
         if (existing) {
           for (const item of data) {
-            existing.set(key(item), item)
+            const k = key(item)
+            const prev = existing.get(k)
+            // Ordering: MessageUpdated and MessageDiffUpdated listeners can run in either
+            // order for publishes from the same tick, so a plain user message must not
+            // drop diffs already queued for it by the diff event.
+            if (
+              item.type === "message" &&
+              item.data.role === "user" &&
+              !item.data.summary &&
+              prev?.type === "message" &&
+              prev.data.role === "user" &&
+              prev.data.summary
+            ) {
+              existing.set(k, { ...item, data: { ...item.data, summary: prev.data.summary } })
+              continue
+            }
+            existing.set(k, item)
           }
           return
         }
@@ -187,8 +204,18 @@ const layer = Layer.effect(
             const info = data.info
             yield* sync(info.sessionID, [{ type: "message", data: structuredClone(info) as SDK.Message }])
             if (info.role !== "user") return
-            const model = yield* provider.getModel(info.model.providerID, info.model.modelID)
-            yield* sync(info.sessionID, [{ type: "model", data: [model] }])
+            // Provider lookup can stall on cold caches, and the event publish awaits every
+            // listener, so keep it off the listener to leave event dispatch unblocked.
+            const s = yield* InstanceState.get(state)
+            yield* Effect.gen(function* () {
+              const model = yield* provider.getModel(info.model.providerID, info.model.modelID)
+              yield* sync(info.sessionID, [{ type: "model", data: [model] }])
+            }).pipe(
+              Effect.catchCause((cause) =>
+                Effect.logError("share model sync failed", { sessionID: info.sessionID, cause: cause }),
+              ),
+              Effect.forkIn(s.scope),
+            )
           }),
         )
         yield* watch(Session.Event.MessageDiffUpdated, (data) =>
@@ -197,10 +224,18 @@ const layer = Layer.effect(
             // unless this session is actually being shared.
             const share = yield* getCached(data.sessionID)
             if (!share) return
-            const info = (yield* session.messages({ sessionID: data.sessionID })).find(
-              (item) => item.info.id === data.messageID,
-            )?.info
-            if (!info) return
+            const message = yield* MessageV2.get({ sessionID: data.sessionID, messageID: data.messageID }).pipe(
+              Effect.provideService(Database.Service, database),
+              Effect.catch(() => Effect.succeed(undefined)),
+            )
+            if (!message) return
+            // The event carries the diffs this publish produced, while the projector may
+            // not have persisted them yet on this inline path, so overlay them here
+            // instead of relying on the hydrated read to include them.
+            const info =
+              message.info.role === "user" && data.diffs
+                ? { ...message.info, summary: { ...message.info.summary, diffs: data.diffs } }
+                : message.info
             yield* sync(info.sessionID, [{ type: "message", data: structuredClone(info) as SDK.Message }])
           }),
         )
@@ -262,7 +297,6 @@ const layer = Layer.effect(
       const s = yield* InstanceState.get(state)
       const queued = s.queue.get(sessionID)
       if (!queued) return
-
       s.queue.delete(sessionID)
 
       const share = yield* getCached(sessionID)
