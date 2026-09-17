@@ -90,6 +90,38 @@ const layer = Layer.effect(
     const plugin = yield* Plugin.Service
     const summary = yield* SessionSummary.Service
     const scope = yield* Scope.Scope
+    // Streaming deltas are non-durable and fire per token; accumulate them per part field and
+    // flush on a short cadence (or before a part's final update) to cut per-token pipeline work.
+    const DELTA_FLUSH_MS = 40
+    type DeltaInput = Parameters<typeof session.updatePartDelta>[0]
+    const pendingDeltas = new Map<string, DeltaInput>()
+
+    const flushDelta = (key: string) =>
+      Effect.suspend(() => {
+        const buffer = pendingDeltas.get(key)
+        if (!buffer) return Effect.void
+        pendingDeltas.delete(key)
+        return session.updatePartDelta(buffer)
+      })
+
+    const flushPart = (partID: string) =>
+      Effect.forEach(
+        [...pendingDeltas.entries()],
+        ([key, buffer]) => (buffer.partID === partID ? flushDelta(key) : Effect.void),
+        { discard: true },
+      )
+
+    const queueDelta = (input: DeltaInput) =>
+      Effect.gen(function* () {
+        const key = `${input.sessionID}:${input.messageID}:${input.partID}:${input.field}`
+        const buffer = pendingDeltas.get(key)
+        if (buffer) {
+          pendingDeltas.set(key, { ...buffer, delta: buffer.delta + input.delta })
+          return
+        }
+        pendingDeltas.set(key, { ...input })
+        yield* Effect.sleep(`${DELTA_FLUSH_MS} millis`).pipe(Effect.andThen(flushDelta(key)), Effect.forkIn(scope))
+      })
     const status = yield* SessionStatus.Service
     const image = yield* Image.Service
     const events = yield* EventV2Bridge.Service
@@ -296,7 +328,7 @@ const layer = Layer.effect(
             if (!(value.id in ctx.reasoningMap)) return
             ctx.reasoningMap[value.id].text += value.text
             if (value.providerMetadata) ctx.reasoningMap[value.id].metadata = value.providerMetadata
-            yield* session.updatePartDelta({
+            yield* queueDelta({
               sessionID: ctx.reasoningMap[value.id].sessionID,
               messageID: ctx.reasoningMap[value.id].messageID,
               partID: ctx.reasoningMap[value.id].id,
@@ -309,6 +341,7 @@ const layer = Layer.effect(
             if (value.providerMetadata && value.id in ctx.reasoningMap) {
               ctx.reasoningMap[value.id].metadata = value.providerMetadata
             }
+            if (value.id in ctx.reasoningMap) yield* flushPart(ctx.reasoningMap[value.id].id)
             yield* finishReasoning(value.id)
             return
 
@@ -526,7 +559,7 @@ const layer = Layer.effect(
             if (!ctx.currentText) return
             ctx.currentText.text += value.text
             if (value.providerMetadata) ctx.currentText.metadata = value.providerMetadata
-            yield* session.updatePartDelta({
+            yield* queueDelta({
               sessionID: ctx.currentText.sessionID,
               messageID: ctx.currentText.messageID,
               partID: ctx.currentText.id,
@@ -553,6 +586,7 @@ const layer = Layer.effect(
               ctx.currentText.time = { start: ctx.currentText.time?.start ?? end, end }
             }
             if (value.providerMetadata) ctx.currentText.metadata = value.providerMetadata
+            yield* flushPart(ctx.currentText.id)
             yield* session.updatePart(ctx.currentText)
             ctx.currentText = undefined
             return
