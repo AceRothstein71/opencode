@@ -614,6 +614,7 @@ const layer = Layer.effect(
 
         if (ctx.currentText) {
           const end = Date.now()
+          yield* flushPart(ctx.currentText.id)
           ctx.currentText.time = { start: ctx.currentText.time?.start ?? end, end }
           yield* session.updatePart(ctx.currentText)
           ctx.currentText = undefined
@@ -621,6 +622,7 @@ const layer = Layer.effect(
 
         for (const part of Object.values(ctx.reasoningMap)) {
           const end = Date.now()
+          yield* flushPart(part.id)
           yield* session.updatePart({
             ...part,
             time: { start: part.time.start ?? end, end },

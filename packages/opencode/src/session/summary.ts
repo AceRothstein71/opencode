@@ -124,17 +124,22 @@ const layer = Layer.effect(
       // any children the walk missed so the turn is complete regardless of order.
       if (newer.some((m) => m.info.id === input.messageID)) {
         const known = new Set(newer.map((m) => m.info.id))
-        const orphans = yield* database.db
-          .select({ id: MessageTable.id })
-          .from(MessageTable)
-          .where(
-            and(
-              eq(MessageTable.session_id, input.sessionID),
-              sql`json_extract(${MessageTable.data}, '$.parentID') = ${input.messageID}`,
-            ),
-          )
-          .all()
-          .pipe(Effect.orDie)
+        // A child already in the window proves the walk reached the turn; the
+        // session-wide parent scan only matters for out-of-window children.
+        const childInWindow = newer.some((m) => m.info.role === "assistant" && m.info.parentID === input.messageID)
+        const orphans = childInWindow
+          ? []
+          : yield* database.db
+              .select({ id: MessageTable.id })
+              .from(MessageTable)
+              .where(
+                and(
+                  eq(MessageTable.session_id, input.sessionID),
+                  sql`json_extract(${MessageTable.data}, '$.parentID') = ${input.messageID}`,
+                ),
+              )
+              .all()
+              .pipe(Effect.orDie)
         for (const row of orphans) {
           if (known.has(row.id)) continue
           const child = yield* MessageV2.get({ sessionID: input.sessionID, messageID: row.id }).pipe(
