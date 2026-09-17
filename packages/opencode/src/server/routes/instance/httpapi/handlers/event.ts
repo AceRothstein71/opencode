@@ -28,17 +28,24 @@ function eventResponse(events: EventV2.Interface) {
     const workspaceID = yield* InstanceState.workspaceID
     // Listener registration is eager, so events published after this point cannot
     // be lost while the HTTP body fiber is starting or emitting server.connected.
-    const queue = yield* Queue.unbounded<EventV2.Payload>()
-    const unsubscribe = yield* events.listen((event) => Effect.sync(() => Queue.offerUnsafe(queue, event)))
-    yield* Effect.addFinalizer(() => unsubscribe)
-    const stream = Stream.fromQueue(queue).pipe(
-      Stream.filter(
-        (event) =>
-          event.location?.directory === instance.directory &&
-          (event.location.workspaceID === undefined || event.location.workspaceID === workspaceID),
-      ),
-      Stream.map((event) => ({ id: event.id, type: event.type, properties: event.data })),
+    // The buffer is bounded: when it overflows a server.desync marker is sent so
+    // clients resynchronize instead of silently diverging.
+    const queue = yield* Queue.dropping<{ id: string; type: string; properties: unknown }>(1024)
+    let dropped = false
+    const unsubscribe = yield* events.listen((event) =>
+      Effect.sync(() => {
+        // Filter before enqueue so foreign directories and workspaces never occupy buffer space.
+        if (event.location?.directory !== instance.directory) return
+        if (event.location.workspaceID !== undefined && event.location.workspaceID !== workspaceID) return
+        if (dropped) {
+          if (!Queue.offerUnsafe(queue, { id: eventID(), type: "server.desync", properties: {} })) return
+          dropped = false
+        }
+        if (!Queue.offerUnsafe(queue, { id: event.id, type: event.type, properties: event.data })) dropped = true
+      }),
     )
+    yield* Effect.addFinalizer(() => unsubscribe)
+    const stream = Stream.fromQueue(queue)
     const disposed = Stream.callback<{ id: string; type: string; properties: unknown }>((queue) => {
       const listener = (event: {
         directory?: string

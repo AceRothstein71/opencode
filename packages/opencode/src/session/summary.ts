@@ -74,7 +74,11 @@ function unquoteGitPath(input: string) {
 export interface Interface {
   readonly summarize: (input: { sessionID: SessionID; messageID: MessageID }) => Effect.Effect<void>
   readonly diff: (input: { sessionID: SessionID; messageID?: MessageID }) => Effect.Effect<Snapshot.FileDiff[]>
-  readonly computeDiff: (input: { messages: SessionV1.WithParts[] }) => Effect.Effect<Snapshot.FileDiff[]>
+  readonly computeDiff: (input: {
+    messages: SessionV1.WithParts[]
+    sessionID?: SessionID
+    messageID?: MessageID
+  }) => Effect.Effect<Snapshot.FileDiff[]>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/SessionSummary") {}
@@ -90,6 +94,10 @@ const layer = Layer.effect(
     // A message with a durable baseline is remembered so later changed summarizes skip the
     // historical-event scan; the bounded cache evicts least-recently-used identities.
     const durableParents = createDurableParentCache()
+    // Bounded memo of the last computed (from, to) diff per message so repeated summarizes skip diffFull.
+    const diffCache = new Map<string, { from: string; to: string; diffs: Snapshot.FileDiff[] }>()
+    const summariesInflight = new Set<string>()
+    const summariesRerun = new Set<string>()
 
     const turnMessages = Effect.fn("SessionSummary.turnMessages")(function* (input: {
       sessionID: SessionID
@@ -141,7 +149,11 @@ const layer = Layer.effect(
       return newer.reverse()
     })
 
-    const computeDiff = Effect.fn("SessionSummary.computeDiff")(function* (input: { messages: SessionV1.WithParts[] }) {
+    const computeDiff = Effect.fn("SessionSummary.computeDiff")(function* (input: {
+      messages: SessionV1.WithParts[]
+      sessionID?: SessionID
+      messageID?: MessageID
+    }) {
       let from: string | undefined
       let to: string | undefined
       for (const item of input.messages) {
@@ -157,11 +169,26 @@ const layer = Layer.effect(
           if (part.type === "step-finish" && part.snapshot) to = part.snapshot
         }
       }
-      if (from && to) return yield* snapshot.diffFull(from, to)
-      return []
+      if (!from || !to || from === to) return []
+      const cacheKey = input.sessionID && input.messageID ? `${input.sessionID}:${input.messageID}` : undefined
+      if (cacheKey) {
+        const cached = diffCache.get(cacheKey)
+        if (cached && cached.from === from && cached.to === to) return cached.diffs.map((item) => ({ ...item }))
+      }
+      const diffs = yield* snapshot.diffFull(from, to)
+      // A failed or disabled snapshot read surfaces as an empty diff; caching it
+      // would freeze that transient result as the message's real diff.
+      if (cacheKey && diffs.length) {
+        if (diffCache.size >= 32) {
+          const oldest = diffCache.keys().next()
+          if (!oldest.done) diffCache.delete(oldest.value)
+        }
+        diffCache.set(cacheKey, { from, to, diffs })
+      }
+      return diffs
     })
 
-    const summarize = Effect.fn("SessionSummary.summarize")(function* (input: {
+    const runSummarize = Effect.fn("SessionSummary.summarize")(function* (input: {
       sessionID: SessionID
       messageID: MessageID
     }) {
@@ -175,7 +202,7 @@ const layer = Layer.effect(
       const target = messages.find((m) => m.info.id === input.messageID)
       if (!target || target.info.role !== "user") return
       yield* Effect.yieldNow
-      const msgDiffs = yield* computeDiff({ messages })
+      const msgDiffs = yield* computeDiff({ sessionID: input.sessionID, messageID: input.messageID, messages })
       const dedicated = yield* database.db
         .select({ message_id: MessageDiffTable.message_id })
         .from(MessageDiffTable)
@@ -224,6 +251,25 @@ const layer = Layer.effect(
         messageID: input.messageID,
         diffs: msgDiffs,
       })
+    })
+
+    const summarize = Effect.fnUntraced(function* (input: { sessionID: SessionID; messageID: MessageID }) {
+      const key = `${input.sessionID}:${input.messageID}`
+      if (summariesInflight.has(key)) {
+        summariesRerun.add(key)
+        return
+      }
+      yield* Effect.ensuring(
+        Effect.gen(function* () {
+          summariesInflight.add(key)
+          yield* runSummarize(input)
+          while (summariesRerun.delete(key)) yield* runSummarize(input)
+        }),
+        Effect.sync(() => {
+          summariesInflight.delete(key)
+          summariesRerun.delete(key)
+        }),
+      )
     })
 
     const diff = Effect.fn("SessionSummary.diff")(function* (input: { sessionID: SessionID; messageID?: MessageID }) {

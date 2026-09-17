@@ -71,15 +71,31 @@ describe("collapseEventBatch", () => {
     ])
   })
 
-  test("does not merge non-adjacent deltas for the same part", () => {
+  test("merges non-adjacent deltas for the same part", () => {
     const collapsed = collapseEventBatch([
       delta({ delta: "a", partID: "prt_1" }),
       delta({ delta: "b", partID: "prt_2" }),
       delta({ delta: "c", partID: "prt_1" }),
     ])
 
-    expect(collapsed).toHaveLength(3)
-    expect(collapsed.map((event) => event.payload.properties.partID)).toEqual(["prt_1", "prt_2", "prt_1"])
+    expect(collapsed).toHaveLength(2)
+    expect(collapsed.map((event) => event.payload.properties.partID)).toEqual(["prt_1", "prt_2"])
+    expect(collapsed[0]?.payload.properties.delta).toBe("ac")
+    expect(collapsed[1]?.payload.properties.delta).toBe("b")
+  })
+
+  test("merges same-part deltas across an unrelated part update", () => {
+    const otherPart = {
+      payload: { type: "message.part.updated", properties: { sessionID: "ses_1", part: { id: "prt_2" } } },
+    }
+    const collapsed = collapseEventBatch([
+      delta({ delta: "a", partID: "prt_1" }),
+      otherPart,
+      delta({ delta: "b", partID: "prt_1" }),
+    ])
+
+    expect(collapsed).toHaveLength(2)
+    expect(collapsed[0]?.payload.properties.delta).toBe("ab")
   })
 
   test("does not merge deltas from different instances", () => {

@@ -355,6 +355,7 @@ const layer = Layer.effect(
             )
             const recentParts = parts.slice(-DOOM_LOOP_THRESHOLD)
 
+            const inputNeedle = JSON.stringify(input)
             if (
               recentParts.length !== DOOM_LOOP_THRESHOLD ||
               !recentParts.every(
@@ -362,7 +363,7 @@ const layer = Layer.effect(
                   part.type === "tool" &&
                   part.tool === value.name &&
                   part.state.status !== "pending" &&
-                  JSON.stringify(part.state.input) === JSON.stringify(input),
+                  JSON.stringify(part.state.input) === inputNeedle,
               )
             ) {
               return
@@ -468,14 +469,17 @@ const layer = Layer.effect(
               cost: usage.cost,
             })
             yield* session.updateMessage(ctx.assistantMessage)
+            const stepUnchanged = ctx.snapshot !== undefined && completedSnapshot === ctx.snapshot
             if (ctx.snapshot) {
               // track() stages then write-trees, so an unchanged tree proves the
               // snapshot index already equals ctx.snapshot and patch() would diff
               // to an empty file list. Skip its redundant stage + diff subprocesses.
-              const unchanged = completedSnapshot !== undefined && completedSnapshot === ctx.snapshot
-              const patch = unchanged
+              const patch = stepUnchanged
                 ? { hash: ctx.snapshot, files: [] as string[] }
-                : yield* snapshot.patch(ctx.snapshot)
+                : yield* snapshot.patch(
+                    ctx.snapshot,
+                    completedSnapshot !== undefined ? { to: completedSnapshot } : undefined,
+                  )
               if (patch.files.length) {
                 yield* session.updatePart({
                   id: PartID.ascending(),
@@ -488,12 +492,14 @@ const layer = Layer.effect(
               }
               ctx.snapshot = undefined
             }
-            yield* summary
-              .summarize({
-                sessionID: ctx.sessionID,
-                messageID: ctx.assistantMessage.parentID,
-              })
-              .pipe(Effect.ignore, Effect.forkIn(scope))
+            if (!stepUnchanged) {
+              yield* summary
+                .summarize({
+                  sessionID: ctx.sessionID,
+                  messageID: ctx.assistantMessage.parentID,
+                })
+                .pipe(Effect.ignore, Effect.forkIn(scope))
+            }
             if (
               !ctx.assistantMessage.summary &&
               isOverflow({ cfg: yield* config.get(), tokens: usage.tokens, model: ctx.model })

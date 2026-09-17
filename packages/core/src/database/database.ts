@@ -36,7 +36,7 @@ const layer = Layer.effect(
 
     yield* db
       .run("PRAGMA wal_checkpoint(PASSIVE)")
-      .pipe(Effect.ignore, Effect.repeat(Schedule.spaced("5 minutes")), Effect.forkScoped)
+      .pipe(Effect.ignore, Effect.repeat(Schedule.spaced("5 minutes").pipe(Schedule.jittered)), Effect.forkScoped)
 
     return { db }
   }).pipe(Effect.orDie),

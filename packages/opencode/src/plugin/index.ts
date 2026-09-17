@@ -253,6 +253,8 @@ const layer = Layer.effect(
         }
 
         const unsubscribe = yield* events.listen((event) => {
+          // Streaming deltas fire per token; plugins consume completed parts, not raw stream text.
+          if (event.type === "message.part.delta") return Effect.void
           if (event.location?.directory !== ctx.directory) return Effect.void
           return Effect.sync(() => {
             for (const hook of hooks) {
