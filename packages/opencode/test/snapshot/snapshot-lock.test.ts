@@ -23,6 +23,7 @@ type WorkerMessage = {
   foreignHostToken?: boolean
   cleanup?: boolean
   patchAfterIgnore?: boolean
+  corruptIndexOnce?: boolean
 }
 
 type WorkerResult = {
@@ -211,9 +212,13 @@ describe("snapshot cross-process git lock", () => {
     await Bun.write(barrier, "go")
     const results = await Promise.all(workers.map((item) => item.run))
     expect(results.map((item) => item.code)).toEqual(Array.from({ length: count }, () => 0))
-    expect(results.flatMap((item) => [item.stdout, item.stderr]).join("\n")).not.toContain("snapshot transaction overlap")
+    expect(results.flatMap((item) => [item.stdout, item.stderr]).join("\n")).not.toContain(
+      "snapshot transaction overlap",
+    )
     const trees = await Promise.all(workers.map((item) => Bun.file(item.output).json() as Promise<{ first?: string }>))
-    expect(trees.map((item) => item.first)).toEqual(trees.map(() => expect.stringMatching(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/)))
+    expect(trees.map((item) => item.first)).toEqual(
+      trees.map(() => expect.stringMatching(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/)),
+    )
   }, 60_000)
 
   test("fails safely when a split-lock harness leaves another transaction sentinel", async () => {
@@ -223,7 +228,7 @@ describe("snapshot cross-process git lock", () => {
     const output = path.join(environment.data, "result.json")
     const result = await runWorker({ directory: repo.path, output, preexistingToken: true }, environment.env)
     expect(result.code, result.stderr).toBe(0)
-    const snapshot = await Bun.file(output).json() as { first?: string; second?: string; tokenExists?: boolean }
+    const snapshot = (await Bun.file(output).json()) as { first?: string; second?: string; tokenExists?: boolean }
     expect(snapshot).toMatchObject({
       first: expect.stringMatching(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/),
       tokenExists: true,
@@ -252,7 +257,7 @@ describe("snapshot cross-process git lock", () => {
     const output = path.join(environment.data, "result.json")
     const result = await runWorker({ directory: repo.path, output, liveToken: true }, environment.env)
     expect(result.code, result.stderr).toBe(0)
-    const snapshot = await Bun.file(output).json() as { first?: string; second?: string; tokenExists?: boolean }
+    const snapshot = (await Bun.file(output).json()) as { first?: string; second?: string; tokenExists?: boolean }
     expect(snapshot).toMatchObject({
       first: expect.stringMatching(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/),
       tokenExists: true,
@@ -267,7 +272,7 @@ describe("snapshot cross-process git lock", () => {
     const output = path.join(environment.data, "result.json")
     const result = await runWorker({ directory: repo.path, output, foreignHostToken: true }, environment.env)
     expect(result.code, result.stderr).toBe(0)
-    const snapshot = await Bun.file(output).json() as { first?: string; second?: string; tokenExists?: boolean }
+    const snapshot = (await Bun.file(output).json()) as { first?: string; second?: string; tokenExists?: boolean }
     expect(snapshot).toMatchObject({
       first: expect.stringMatching(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/),
       tokenExists: true,
@@ -306,10 +311,7 @@ describe("snapshot cross-process git lock", () => {
     await using _repo = repo
     const environment = await testEnvironment()
     const output = path.join(environment.data, "result.json")
-    const result = await runWorker(
-      { directory: repo.path, output, transientIndexLockMs: 50 },
-      environment.env,
-    )
+    const result = await runWorker({ directory: repo.path, output, transientIndexLockMs: 50 }, environment.env)
     expect(result.code, result.stderr).toBe(0)
     expect(await Bun.file(output).json()).toMatchObject({
       first: expect.stringMatching(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/),
@@ -324,13 +326,10 @@ describe("snapshot cross-process git lock", () => {
     await using _repo = repo
     const environment = await testEnvironment()
     const output = path.join(environment.data, "result.json")
-    const result = await runWorker(
-      { directory: repo.path, output, nativeIndexLock: true },
-      environment.env,
-    )
+    const result = await runWorker({ directory: repo.path, output, nativeIndexLock: true }, environment.env)
     expect(result.code, result.stderr).toBe(0)
     expect(result.stderr).toContain("snapshot_index_lock_stuck")
-    const snapshot = await Bun.file(output).json() as { first?: string; second?: string; indexLockExists?: boolean }
+    const snapshot = (await Bun.file(output).json()) as { first?: string; second?: string; indexLockExists?: boolean }
     expect(snapshot).toMatchObject({
       first: expect.stringMatching(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/),
       indexLockExists: true,
@@ -358,23 +357,27 @@ describe("snapshot cross-process git lock", () => {
     ["add", "stage"],
     ["write-tree", "write-tree"],
     ["write-tree-invalid", "tree-hash"],
-  ])("returns undefined when %s fails", async (failure) => {
-    const repo = await tmpdir({ git: true })
-    await using _repo = repo
-    const environment = await testEnvironment()
-    const wrapper = await gitWrapper(path.join(environment.data, "bin"))
-    const output = path.join(environment.data, "result.json")
-    const result = await runWorker(
-      { directory: repo.path, output, file: "tracked.txt" },
-      {
-        ...environment.env,
-        PATH: `${wrapper}${path.delimiter}${process.env.PATH}`,
-        SNAPSHOT_TEST_GIT_FAILURE: failure,
-      },
-    )
-    expect(result.code, result.stderr).toBe(0)
-    expect(await Bun.file(output).json()).toEqual({ first: undefined })
-  }, 30_000)
+  ])(
+    "returns undefined when %s fails",
+    async (failure) => {
+      const repo = await tmpdir({ git: true })
+      await using _repo = repo
+      const environment = await testEnvironment()
+      const wrapper = await gitWrapper(path.join(environment.data, "bin"))
+      const output = path.join(environment.data, "result.json")
+      const result = await runWorker(
+        { directory: repo.path, output, file: "tracked.txt" },
+        {
+          ...environment.env,
+          PATH: `${wrapper}${path.delimiter}${process.env.PATH}`,
+          SNAPSHOT_TEST_GIT_FAILURE: failure,
+        },
+      )
+      expect(result.code, result.stderr).toBe(0)
+      expect(await Bun.file(output).json()).toEqual({ first: undefined })
+    },
+    30_000,
+  )
 
   test("does not publish a patch after dropping ignored files fails", async () => {
     const repo = await tmpdir({ git: true })
@@ -416,5 +419,18 @@ describe("snapshot cross-process git lock", () => {
     expect(result.code, result.stderr).toBe(0)
     expect((await Bun.file(count).text()).trim().split("\n")).toHaveLength(1)
     expect(await Bun.file(output).json()).toEqual({ first: undefined })
+  }, 30_000)
+
+  test("recovers from a corrupt snapshot index and retries the operation", async () => {
+    const repo = await tmpdir({ git: true })
+    await using _repo = repo
+    const environment = await testEnvironment()
+    const output = path.join(environment.data, "result.json")
+    const result = await runWorker({ directory: repo.path, output, corruptIndexOnce: true }, environment.env)
+    expect(result.code, result.stderr).toBe(0)
+    expect(await Bun.file(output).json()).toMatchObject({
+      first: expect.stringMatching(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/),
+      second: expect.stringMatching(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/),
+    })
   }, 30_000)
 })

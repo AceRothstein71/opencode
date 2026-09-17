@@ -24,6 +24,7 @@ type Message = {
   foreignHostToken?: boolean
   cleanup?: boolean
   patchAfterIgnore?: boolean
+  corruptIndexOnce?: boolean
 }
 
 const message: Message = JSON.parse(process.argv[2] ?? "{}")
@@ -59,14 +60,12 @@ function deadPid() {
   throw new Error(`Expected ${candidate} to be a dead PID`)
 }
 
-const layer = Layer.mergeAll(
-  LayerNode.compile(LayerNode.group([Snapshot.node, FSUtil.node])),
-  testInstanceStoreLayer,
-)
+const layer = Layer.mergeAll(LayerNode.compile(LayerNode.group([Snapshot.node, FSUtil.node])), testInstanceStoreLayer)
 
 const result = await Effect.runPromise(
   Effect.gen(function* () {
-    if (message.file) yield* Effect.promise(() => fs.writeFile(path.join(message.directory, message.file!), process.pid.toString()))
+    if (message.file)
+      yield* Effect.promise(() => fs.writeFile(path.join(message.directory, message.file!), process.pid.toString()))
     if (message.ready) yield* Effect.promise(() => fs.writeFile(message.ready!, process.pid.toString()))
     if (message.barrier) yield* Effect.promise(() => waitFor(message.barrier!))
 
@@ -78,7 +77,8 @@ const result = await Effect.runPromise(
     const first = yield* snapshot.track()
     if (message.twice) {
       const gitdir = yield* Effect.promise(snapshotGitdir)
-      if (message.configLockBeforeSecond) yield* Effect.promise(() => fs.writeFile(path.join(gitdir, "config.lock"), ""))
+      if (message.configLockBeforeSecond)
+        yield* Effect.promise(() => fs.writeFile(path.join(gitdir, "config.lock"), ""))
       const second = yield* snapshot.track()
       return {
         first,
@@ -98,7 +98,8 @@ const result = await Effect.runPromise(
       !message.preexistingToken &&
       !message.deadToken &&
       !message.liveToken &&
-      !message.foreignHostToken
+      !message.foreignHostToken &&
+      !message.corruptIndexOnce
     ) {
       if (!message.reportToken) return { first }
       const gitdir = yield* Effect.promise(snapshotGitdir)
@@ -139,6 +140,9 @@ const result = await Effect.runPromise(
           JSON.stringify({ pid: deadPid(), hostname: "foreign-host", createdAt: Date.now() - 1_000 }),
         ),
       )
+    }
+    if (message.corruptIndexOnce) {
+      yield* Effect.promise(() => fs.writeFile(path.join(gitdir, "index"), "corrupt"))
     }
     if (message.transientIndexLockMs) {
       setTimeout(() => void fs.rm(path.join(gitdir, "index.lock"), { force: true }), message.transientIndexLockMs)
