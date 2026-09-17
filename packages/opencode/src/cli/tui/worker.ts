@@ -4,7 +4,7 @@ import { Rpc } from "@/util/rpc"
 import { upgrade } from "@/cli/upgrade"
 import { Config } from "@/config/config"
 import { GlobalBus, type GlobalEvent } from "@/bus/global"
-import { collapseEventBatch, EVENT_BATCH_INTERVAL, EVENT_BATCH_LIMIT } from "@/cli/tui/event-batch"
+import { collapseEventBatch, shouldForwardEvent, EVENT_BATCH_INTERVAL, EVENT_BATCH_LIMIT } from "@/cli/tui/event-batch"
 import { ServerAuth } from "@/server/auth"
 import { writeHeapSnapshot } from "node:v8"
 import { Heap } from "@/cli/heap"
@@ -34,6 +34,7 @@ function flushEvents() {
 }
 
 GlobalBus.on("event", (event: GlobalEvent) => {
+  if (!shouldForwardEvent(event)) return
   pendingEvents.push(event)
   if (pendingEvents.length >= EVENT_BATCH_LIMIT) {
     if (flushTimer !== undefined) clearTimeout(flushTimer)

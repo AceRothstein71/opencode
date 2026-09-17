@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import type { GlobalEvent } from "../../../src/bus/global"
-import { collapseEventBatch } from "../../../src/cli/tui/event-batch"
+import { collapseEventBatch, shouldForwardEvent } from "../../../src/cli/tui/event-batch"
 
 const delta = (input: {
   delta?: string
@@ -99,5 +99,16 @@ describe("collapseEventBatch", () => {
 
   test("returns an empty batch unchanged", () => {
     expect(collapseEventBatch([])).toEqual([])
+  })
+})
+
+describe("shouldForwardEvent", () => {
+  test("drops bridge sync mirrors", () => {
+    expect(shouldForwardEvent({ payload: { type: "sync" } })).toBe(false)
+  })
+
+  test("forwards regular events", () => {
+    expect(shouldForwardEvent(partUpdated)).toBe(true)
+    expect(shouldForwardEvent(delta({ delta: "a" }))).toBe(true)
   })
 })

@@ -49,3 +49,10 @@ export function collapseEventBatch(events: GlobalEvent[]): GlobalEvent[] {
     return collapsed
   }, [])
 }
+
+// The event bridge mirrors every durable event as a second "sync" payload for
+// the workspace sync consumers; the TUI ignores those copies on receipt, so
+// they never need to cross the RPC boundary.
+export function shouldForwardEvent(event: GlobalEvent): boolean {
+  return event.payload?.type !== "sync"
+}
