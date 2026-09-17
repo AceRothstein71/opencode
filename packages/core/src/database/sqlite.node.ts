@@ -1,4 +1,4 @@
-import { DatabaseSync, type SQLInputValue } from "node:sqlite"
+import { DatabaseSync, type SQLInputValue, type StatementSync } from "node:sqlite"
 import { drizzle } from "drizzle-orm/node-sqlite"
 import * as Context from "effect/Context"
 import * as Effect from "effect/Effect"
@@ -22,6 +22,27 @@ const READS = /^\s*(?:select|explain)\b/i
 
 const TypeId = "~@opencode-ai/core/database/SqliteNode" as const
 type TypeId = typeof TypeId
+
+// node:sqlite has no statement cache, so re-preparing on every call costs a
+// parse+plan per query. Cache per connection, evicting least-recently-used.
+const STATEMENT_CACHE_LIMIT = 256
+const statementCacheByTarget = new WeakMap<object, Map<string, StatementSync>>()
+
+function cachedStatement(target: DatabaseSync, mode: "all" | "values", query: string) {
+  const cache = statementCacheByTarget.get(target) ?? new Map<string, StatementSync>()
+  if (!statementCacheByTarget.has(target)) statementCacheByTarget.set(target, cache)
+  const key = `${mode}:${query}`
+  const cached = cache.get(key)
+  if (cached) {
+    cache.delete(key)
+    cache.set(key, cached)
+    return cached
+  }
+  const statement = target.prepare(query)
+  if (cache.size >= STATEMENT_CACHE_LIMIT) cache.delete(cache.keys().next().value!)
+  cache.set(key, statement)
+  return statement
+}
 
 interface SqliteClient extends Client.SqlClient {
   readonly [TypeId]: TypeId
@@ -74,7 +95,7 @@ const make = (options: Config) =>
 
     const run = (target: DatabaseSync, query: string, params: ReadonlyArray<unknown> = []) =>
       Effect.withFiber<Array<Record<string, unknown>>, SqlError>((fiber) => {
-        const statement = target.prepare(query)
+        const statement = cachedStatement(target, "all", query)
         statement.setReadBigInts(Context.get(fiber.context, Client.SafeIntegers))
         try {
           return Effect.succeed(statement.all(...(params as SQLInputValue[])) as Array<Record<string, unknown>>)
@@ -89,7 +110,7 @@ const make = (options: Config) =>
 
     const runValues = (target: DatabaseSync, query: string, params: ReadonlyArray<unknown> = []) =>
       Effect.withFiber<ReadonlyArray<ReadonlyArray<unknown>>, SqlError>((fiber) => {
-        const statement = target.prepare(query)
+        const statement = cachedStatement(target, "values", query)
         statement.setReadBigInts(Context.get(fiber.context, Client.SafeIntegers))
         statement.setReturnArrays(true)
         try {
@@ -204,6 +225,7 @@ const nativeLayer = (config: Config) =>
         open: true,
       })
       yield* Effect.addFinalizer(() => Effect.sync(() => native.close()))
+      if (config.readonly !== true) native.exec("PRAGMA busy_timeout = 5000;")
       if (config.disableWAL !== true && config.readonly !== true) native.exec("PRAGMA journal_mode = WAL;")
       return native
     }),

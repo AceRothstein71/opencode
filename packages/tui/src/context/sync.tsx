@@ -296,16 +296,19 @@ export const {
         }
 
         case "todo.updated":
-          setStore("todo", event.properties.sessionID, event.properties.todos)
+          setStore("todo", event.properties.sessionID, reconcile(event.properties.todos))
           break
 
         case "session.diff":
-          setStore("session_diff", event.properties.sessionID, event.properties.diff)
+          setStore("session_diff", event.properties.sessionID, reconcile(event.properties.diff))
           break
 
         case "session.deleted": {
-          pendingDiffs.delete(event.properties.info.id)
-          const result = search(store.session, event.properties.info.id, (s) => s.id)
+          const sessionID = event.properties.info.id
+          pendingDiffs.delete(sessionID)
+          fullSyncedSessions.delete(sessionID)
+          const messageIDs = (store.message[sessionID] ?? []).map((message) => message.id)
+          const result = search(store.session, sessionID, (s) => s.id)
           if (result.found) {
             setStore(
               "session",
@@ -314,6 +317,48 @@ export const {
               }),
             )
           }
+          setStore(
+            "message",
+            produce((draft) => {
+              delete draft[sessionID]
+            }),
+          )
+          setStore(
+            "todo",
+            produce((draft) => {
+              delete draft[sessionID]
+            }),
+          )
+          setStore(
+            "session_diff",
+            produce((draft) => {
+              delete draft[sessionID]
+            }),
+          )
+          setStore(
+            "session_status",
+            produce((draft) => {
+              delete draft[sessionID]
+            }),
+          )
+          setStore(
+            "permission",
+            produce((draft) => {
+              delete draft[sessionID]
+            }),
+          )
+          setStore(
+            "question",
+            produce((draft) => {
+              delete draft[sessionID]
+            }),
+          )
+          setStore(
+            "part",
+            produce((draft) => {
+              for (const messageID of messageIDs) delete draft[messageID]
+            }),
+          )
           break
         }
         case "session.updated": {
@@ -348,7 +393,7 @@ export const {
         }
 
         case "session.status": {
-          setStore("session_status", event.properties.sessionID, event.properties.status)
+          setStore("session_status", event.properties.sessionID, reconcile(event.properties.status))
           break
         }
 
@@ -486,6 +531,7 @@ export const {
 
     async function bootstrap(input: { fatal?: boolean } = {}) {
       const fatal = input.fatal ?? true
+      fullSyncedSessions.clear()
       const workspace = project.workspace.current()
       const projectPromise = project.sync()
       const sessionListPromise = projectPromise.then(() => listSessions())
@@ -647,15 +693,15 @@ export const {
                 if (!match.found) draft.session.splice(match.index, 0, session.data!)
                 draft.todo[sessionID] = todo.data ?? []
                 const currentMessages = draft.message[sessionID] ?? []
+                const currentMessageByID = new Map(currentMessages.map((message) => [message.id, message]))
                 const infos = (messages.data ?? []).flatMap((message) => {
                   if (!tracker.messages.has(message.info.id)) return [message.info]
-                  const current = currentMessages.find((item) => item.id === message.info.id)
+                  const current = currentMessageByID.get(message.info.id)
                   return current ? [current] : []
                 })
+                const infoIDs = new Set(infos.map((message) => message.id))
                 infos.push(
-                  ...currentMessages.filter(
-                    (message) => tracker.messages.has(message.id) && !infos.some((item) => item.id === message.id),
-                  ),
+                  ...currentMessages.filter((message) => tracker.messages.has(message.id) && !infoIDs.has(message.id)),
                 )
                 infos.sort(compareMessage)
                 const removed = infos.slice(0, -100)
@@ -667,8 +713,9 @@ export const {
                     continue
                   }
                   const currentParts = draft.part[message.info.id] ?? []
+                  const currentPartByID = new Map(currentParts.map((part) => [part.id, part]))
                   const parts = message.parts.flatMap((part) => {
-                    const current = currentParts.find((item) => item.id === part.id)
+                    const current = currentPartByID.get(part.id)
                     if (tracker.parts.has(part.id)) return current ? [current] : []
                     if (
                       current &&
@@ -681,11 +728,8 @@ export const {
                     }
                     return [part]
                   })
-                  parts.push(
-                    ...currentParts.filter(
-                      (part) => tracker.parts.has(part.id) && !parts.some((item) => item.id === part.id),
-                    ),
-                  )
+                  const partIDs = new Set(parts.map((part) => part.id))
+                  parts.push(...currentParts.filter((part) => tracker.parts.has(part.id) && !partIDs.has(part.id)))
                   draft.part[message.info.id] = parts
                 }
                 for (const message of removed) delete draft.part[message.id]

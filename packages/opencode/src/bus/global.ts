@@ -18,3 +18,6 @@ class GlobalBusEmitter extends EventEmitter {
 }
 
 export const GlobalBus = new GlobalBusEmitter()
+// Every SSE connection registers a listener; the default cap of 10 would warn
+// once a handful of clients are connected.
+GlobalBus.setMaxListeners(0)

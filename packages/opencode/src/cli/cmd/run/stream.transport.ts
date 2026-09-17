@@ -865,9 +865,14 @@ function createLayer(input: StreamInput) {
         })
 
         const poll = Effect.fn("RunStreamTransport.poll")(function* (next: Wait, signal: AbortSignal) {
+          // The `session.status` SSE event resolves the turn in the common case; this
+          // loop is the fallback for a missed event. Back off so a long turn does not
+          // issue a status request every 250 ms while it is still busy.
+          let delay = 250
           while (state.wait === next && !signal.aborted && !input.footer.isClosed && !closed) {
-            yield* Effect.sleep("250 millis")
+            yield* Effect.sleep(delay)
             yield* complete(next, false)
+            delay = Math.min(delay * 2, 2000)
           }
         })
 

@@ -262,13 +262,21 @@ export const ApplyPatchTool = Tool.define(
         yield* events.publish(Watcher.Event.Updated, update)
       }
 
-      // Notify LSP of file changes and collect diagnostics
+      // Notify LSP of file changes and collect diagnostics for the touched files only.
       for (const change of fileChanges) {
         if (change.type === "delete") continue
         const target = change.movePath ?? change.filePath
         yield* lsp.touchFile(target, "document")
       }
-      const diagnostics = yield* lsp.diagnostics()
+      const diagnostics = Object.fromEntries(
+        yield* Effect.forEach(
+          fileChanges.filter((change) => change.type !== "delete"),
+          (change) => {
+            const target = change.movePath ?? change.filePath
+            return Effect.map(lsp.diagnosticsFor(target), (diags) => [FSUtil.normalizePath(target), diags] as const)
+          },
+        ),
+      )
 
       // Generate output summary
       const summaryLines = fileChanges.map((change) => {

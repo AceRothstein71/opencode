@@ -144,6 +144,7 @@ const lsp = Layer.succeed(
     hasClients: () => Effect.succeed(false),
     touchFile: () => Effect.void,
     diagnostics: () => Effect.succeed({}),
+    diagnosticsFor: () => Effect.succeed([]),
     hover: () => Effect.succeed(undefined),
     definition: () => Effect.succeed([]),
     references: () => Effect.succeed([]),
@@ -1729,6 +1730,46 @@ unixNoLLMServer(
 
         const exit = yield* Fiber.await(fiber)
         expect(Exit.isSuccess(exit)).toBe(true)
+      }),
+    ),
+  { config: cfg },
+  30_000,
+)
+
+unixNoLLMServer(
+  "shell bounds running metadata while preserving full output on completion",
+  () =>
+    withSh(() =>
+      Effect.gen(function* () {
+        const { prompt, chat } = yield* boot()
+        const command =
+          'i=0; while [ "$i" -lt 400 ]; do printf "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx %05d\\n" "$i"; i=$((i + 1)); done; sleep 2'
+
+        const fiber = yield* prompt.shell({ sessionID: chat.id, agent: "build", command }).pipe(Effect.forkChild)
+
+        yield* pollWithTimeout(
+          Effect.gen(function* () {
+            const msgs = yield* MessageV2.filterCompactedEffect(chat.id)
+            const taskMsg = msgs.find((item) => item.info.role === "assistant")
+            const tool = taskMsg ? toolPart(taskMsg.parts) : undefined
+            if (tool?.state.status === "running" && tool.state.metadata?.output) return true
+          }),
+          "timed out waiting for running shell metadata",
+        )
+
+        const running = yield* MessageV2.filterCompactedEffect(chat.id)
+        const runningTool = toolPart(running.find((item) => item.info.role === "assistant")!.parts)
+        expect(runningTool?.state.status).toBe("running")
+        if (runningTool?.state.status === "running") {
+          expect(runningTool.state.metadata?.output.length ?? 0).toBeLessThanOrEqual(30_005)
+        }
+
+        const exit = yield* Fiber.await(fiber)
+        expect(Exit.isSuccess(exit)).toBe(true)
+        if (Exit.isFailure(exit)) return
+        const completed = completedTool(exit.value.parts)
+        expect(completed?.state.output.length).toBeGreaterThan(30_000)
+        expect(completed?.state.output).toContain("00399")
       }),
     ),
   { config: cfg },

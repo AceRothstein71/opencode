@@ -75,6 +75,7 @@ export const WriteTool = Tool.define(
           yield* lsp.touchFile(filepath, "document")
           const diagnostics = yield* lsp.diagnostics()
           const normalizedFilepath = FSUtil.normalizePath(filepath)
+          const currentDiagnostics = diagnostics[normalizedFilepath] ?? []
           let projectDiagnosticsCount = 0
           for (const [file, issues] of Object.entries(diagnostics)) {
             const current = file === normalizedFilepath
@@ -92,7 +93,7 @@ export const WriteTool = Tool.define(
           return {
             title: path.relative(instance.worktree, filepath),
             metadata: {
-              diagnostics,
+              diagnostics: { [normalizedFilepath]: currentDiagnostics },
               filepath,
               exists: exists,
             },

@@ -524,6 +524,17 @@ function compactIDs(detail: DetailState) {
   return new Set(recent(detail.data.ids, SUBAGENT_COMMIT_LIMIT + SUBAGENT_ERROR_LIMIT))
 }
 
+// compactDetail only trims collections that exceed their soft caps, so it is a no-op rebuild
+// on the common path; run it only once a cap is actually crossed (F-050).
+function needsCompaction(detail: DetailState) {
+  return (
+    detail.data.call.size > SUBAGENT_CALL_LIMIT ||
+    detail.data.role.size > SUBAGENT_ROLE_LIMIT ||
+    detail.data.echo.size > SUBAGENT_ECHO_LIMIT ||
+    detail.data.ids.size > SUBAGENT_COMMIT_LIMIT + SUBAGENT_ERROR_LIMIT
+  )
+}
+
 function compactDetail(detail: DetailState) {
   const next = createSessionData({
     includeUserText: true,
@@ -569,7 +580,7 @@ function applyChildEvent(input: {
     limits: input.limits,
   })
   const changed = appendCommits(input.detail, out.commits)
-  compactDetail(input.detail)
+  if (needsCompaction(input.detail)) compactDetail(input.detail)
 
   return changed || queueChanged(input.detail.data, before)
 }

@@ -221,6 +221,14 @@ export const TuiThreadCommand = cmd({
         ),
       })
       const client = Rpc.client<typeof rpc>(worker)
+      // A dead worker otherwise leaves every in-flight call pending forever.
+      // Drain them with the real cause and reject later calls instead of hanging.
+      worker.addEventListener("error", (event) => {
+        client.fail(new Error(event.message || "opencode worker failed"))
+      })
+      worker.addEventListener("close", () => {
+        client.fail(new Error("opencode worker exited"))
+      })
       const reload = () => {
         client.call("reload", undefined).catch(() => {})
       }

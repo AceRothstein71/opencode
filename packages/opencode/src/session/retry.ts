@@ -25,7 +25,7 @@ export type Retryable = {
 
 export const RETRY_INITIAL_DELAY = 2000
 export const RETRY_BACKOFF_FACTOR = 2
-export const RETRY_JITTER_FACTOR = 0.25
+export const RETRY_JITTER_FACTOR = 0.5
 export const RETRY_MAX_DELAY_NO_HEADERS = 30_000 // 30 seconds
 export const RETRY_MAX_DELAY = 2_147_483_647 // max 32-bit signed integer for setTimeout
 export const RETRY_MAX_RETRIES = 5
@@ -79,7 +79,8 @@ export function delay(attempt: number, error?: SessionV1.APIError, random = Math
 
 function exponential(attempt: number, random: number) {
   const base = RETRY_INITIAL_DELAY * Math.pow(RETRY_BACKOFF_FACTOR, attempt - 1)
-  return Math.ceil(base + base * RETRY_JITTER_FACTOR * random)
+  // Equal jitter (floor at 1 - factor of base) decorrelates parallel agents; additive-only jitter re-storms.
+  return Math.ceil(base * (1 - RETRY_JITTER_FACTOR + random * RETRY_JITTER_FACTOR))
 }
 
 export function retryable(error: Err, provider: string) {

@@ -75,7 +75,9 @@ function sessionRow(info: SessionV1.SessionInfo): typeof SessionTable.$inferInse
   }
 }
 
-function messageData(info: (typeof SessionV1.Event.MessageUpdated.Type)["data"]["info"]): typeof MessageTable.$inferInsert.data {
+function messageData(
+  info: (typeof SessionV1.Event.MessageUpdated.Type)["data"]["info"],
+): typeof MessageTable.$inferInsert.data {
   const { id: _, sessionID: __, ...rest } = info
   return rest as DeepMutable<typeof rest>
 }
@@ -85,21 +87,43 @@ function partData(part: (typeof SessionV1.Event.PartUpdated.Type)["data"]["part"
   return rest as DeepMutable<typeof rest>
 }
 
+type UsageDelta = { readonly value: Usage; readonly sign: number }
+
+function combineUsage(deltas: ReadonlyArray<UsageDelta>): Usage | undefined {
+  if (deltas.length === 0) return undefined
+  return deltas.reduce<Usage>(
+    (total, delta) => ({
+      cost: total.cost + delta.value.cost * delta.sign,
+      tokens: {
+        input: total.tokens.input + delta.value.tokens.input * delta.sign,
+        output: total.tokens.output + delta.value.tokens.output * delta.sign,
+        reasoning: total.tokens.reasoning + delta.value.tokens.reasoning * delta.sign,
+        cache: {
+          read: total.tokens.cache.read + delta.value.tokens.cache.read * delta.sign,
+          write: total.tokens.cache.write + delta.value.tokens.cache.write * delta.sign,
+        },
+      },
+    }),
+    { cost: 0, tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } } },
+  )
+}
+
 function applyUsage(
   db: DatabaseService,
   sessionID: (typeof SessionV1.Event.MessageUpdated.Type)["data"]["sessionID"],
-  value: Usage,
-  sign = 1,
+  deltas: ReadonlyArray<UsageDelta>,
 ) {
+  const value = combineUsage(deltas)
+  if (!value) return Effect.void
   return db
     .update(SessionTable)
     .set({
-      cost: sql`${SessionTable.cost} + ${value.cost * sign}`,
-      tokens_input: sql`${SessionTable.tokens_input} + ${value.tokens.input * sign}`,
-      tokens_output: sql`${SessionTable.tokens_output} + ${value.tokens.output * sign}`,
-      tokens_reasoning: sql`${SessionTable.tokens_reasoning} + ${value.tokens.reasoning * sign}`,
-      tokens_cache_read: sql`${SessionTable.tokens_cache_read} + ${value.tokens.cache.read * sign}`,
-      tokens_cache_write: sql`${SessionTable.tokens_cache_write} + ${value.tokens.cache.write * sign}`,
+      cost: sql`${SessionTable.cost} + ${value.cost}`,
+      tokens_input: sql`${SessionTable.tokens_input} + ${value.tokens.input}`,
+      tokens_output: sql`${SessionTable.tokens_output} + ${value.tokens.output}`,
+      tokens_reasoning: sql`${SessionTable.tokens_reasoning} + ${value.tokens.reasoning}`,
+      tokens_cache_read: sql`${SessionTable.tokens_cache_read} + ${value.tokens.cache.read}`,
+      tokens_cache_write: sql`${SessionTable.tokens_cache_write} + ${value.tokens.cache.write}`,
       time_updated: sql`${SessionTable.time_updated}`,
     })
     .where(eq(SessionTable.id, sessionID))
@@ -168,16 +192,24 @@ function run(db: DatabaseService, event: SessionEvent.Event) {
       },
       getCurrentShell(callID) {
         return Effect.gen(function* () {
-          const rows = yield* db
+          // Filter and limit in SQL so only the matching shell row is decoded (F-072).
+          const row = yield* db
             .select()
             .from(SessionMessageTable)
-            .where(and(eq(SessionMessageTable.session_id, event.data.sessionID), eq(SessionMessageTable.type, "shell")))
+            .where(
+              and(
+                eq(SessionMessageTable.session_id, event.data.sessionID),
+                eq(SessionMessageTable.type, "shell"),
+                sql`json_extract(${SessionMessageTable.data}, '$.callID') = ${callID}`,
+              ),
+            )
             .orderBy(desc(SessionMessageTable.seq))
-            .all()
+            .limit(1)
+            .get()
             .pipe(Effect.orDie)
-          return rows
-            .map(decodeRow)
-            .find((message): message is SessionMessage.Shell => message.type === "shell" && message.callID === callID)
+          if (!row) return
+          const message = decodeRow(row)
+          return message.type === "shell" && message.callID === callID ? message : undefined
         })
       },
       updateAssistant: updateMessage,
@@ -213,6 +245,9 @@ function diffEventScope(sessionID: string, messageID: string) {
     eq(EventTable.aggregate_id, sessionID),
     eq(EventTable.type, type),
     sql`json_extract(${EventTable.data}, '$.messageID') = ${messageID}`,
+    // Already-tombstoned rows carry an empty diffs array; skipping them keeps each
+    // superseded diff row a single rewrite instead of rescanning/rewriting it per event.
+    sql`json_array_length(json_extract(${EventTable.data}, '$.diffs')) > 0`,
   )
 }
 
@@ -295,11 +330,7 @@ const layer = Layer.effectDiscard(
         if (!diffs) {
           // A complete V1 user replacement with no diff array retires the obsolete dedicated row so
           // hydration cannot resurrect a diff the replacement removed.
-          yield* db
-            .delete(MessageDiffTable)
-            .where(eq(MessageDiffTable.message_id, id))
-            .run()
-            .pipe(Effect.orDie)
+          yield* db.delete(MessageDiffTable).where(eq(MessageDiffTable.message_id, id)).run().pipe(Effect.orDie)
           return
         }
         yield* db
@@ -356,10 +387,14 @@ const layer = Layer.effectDiscard(
           .where(and(eq(PartTable.message_id, event.data.messageID), eq(PartTable.session_id, event.data.sessionID)))
           .all()
           .pipe(Effect.orDie)
-        for (const row of rows) {
-          const previous = usage(row.data)
-          if (previous) yield* applyUsage(db, event.data.sessionID, previous, -1)
-        }
+        yield* applyUsage(
+          db,
+          event.data.sessionID,
+          rows.flatMap((row) => {
+            const previous = usage(row.data)
+            return previous ? [{ value: previous, sign: -1 }] : []
+          }),
+        )
         // message_diff is removed by the message FK cascade below.
         yield* db
           .delete(MessageTable)
@@ -379,7 +414,7 @@ const layer = Layer.effectDiscard(
           .get()
           .pipe(Effect.orDie)
         const previous = row && usage(row.data)
-        if (previous) yield* applyUsage(db, event.data.sessionID, previous, -1)
+        yield* applyUsage(db, event.data.sessionID, previous ? [{ value: previous, sign: -1 }] : [])
         yield* db
           .delete(PartTable)
           .where(and(eq(PartTable.id, event.data.partID), eq(PartTable.session_id, event.data.sessionID)))
@@ -393,17 +428,25 @@ const layer = Layer.effectDiscard(
         const messageID = event.data.part.messageID
         const sessionID = event.data.part.sessionID
         const data = partData(event.data.part)
-        const row = yield* db.select().from(PartTable).where(eq(PartTable.id, id)).get().pipe(Effect.orDie)
+        // usage() only ever returns a value for step-finish, and a part's type is immutable, so
+        // only a step-finish update can carry a previous usage to reverse (F-026).
+        const previousRow =
+          event.data.part.type === "step-finish"
+            ? yield* db.select().from(PartTable).where(eq(PartTable.id, id)).get().pipe(Effect.orDie)
+            : undefined
         yield* db
           .insert(PartTable)
           .values({ id, message_id: messageID, session_id: sessionID, time_created: event.data.time, data })
           .onConflictDoUpdate({ target: PartTable.id, set: { data } })
           .run()
           .pipe(Effect.orDie)
-        const previous = row && usage(row.data)
+        const previous = previousRow && usage(previousRow.data)
         const next = usage(event.data.part)
-        if (previous) yield* applyUsage(db, row.session_id, previous, -1)
-        if (next) yield* applyUsage(db, sessionID, next)
+        if (!previous && !next) return
+        yield* applyUsage(db, sessionID, [
+          ...(previous ? [{ value: previous, sign: -1 }] : []),
+          ...(next ? [{ value: next, sign: 1 }] : []),
+        ])
       }),
     )
     yield* events.project(SessionEvent.AgentSwitched, (event) =>

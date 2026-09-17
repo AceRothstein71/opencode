@@ -470,6 +470,11 @@ export interface Interface {
     sessionID: SessionID,
     predicate: (msg: SessionV1.WithParts) => boolean,
   ) => Effect.Effect<Option.Option<SessionV1.WithParts>, NotFound>
+  /** Like findMessage, but hydrates only `info` (no parts/diffs query). */
+  readonly findMessageInfo: (
+    sessionID: SessionID,
+    predicate: (info: SessionV1.Info) => boolean,
+  ) => Effect.Effect<Option.Option<SessionV1.Info>, NotFound>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/Session") {}
@@ -904,6 +909,12 @@ const layer: Layer.Layer<
       return Option.none<SessionV1.WithParts>()
     })
 
+    const findMessageInfo: Interface["findMessageInfo"] = Effect.fn("Session.findMessageInfo")(
+      function* (sessionID, predicate) {
+        return yield* MessageV2.findInfo(sessionID, predicate).pipe(Effect.provideService(Database.Service, database))
+      },
+    )
+
     return Service.of({
       list,
       listGlobal,
@@ -932,6 +943,7 @@ const layer: Layer.Layer<
       getPart,
       updatePartDelta,
       findMessage,
+      findMessageInfo,
     })
   }),
 )

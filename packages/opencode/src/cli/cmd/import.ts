@@ -184,46 +184,52 @@ const runImport = Effect.fn("Cli.import.body")(function* (file: string, ctx: Ins
   }) as Session.Info
   const row = Session.toRow(info)
   yield* db
-    .insert(SessionTable)
-    .values(row)
-    .onConflictDoUpdate({
-      target: SessionTable.id,
-      set: { project_id: row.project_id, directory: row.directory, path: row.path },
-    })
-    .run()
+    .transaction(() =>
+      Effect.gen(function* () {
+        yield* db
+          .insert(SessionTable)
+          .values(row)
+          .onConflictDoUpdate({
+            target: SessionTable.id,
+            set: { project_id: row.project_id, directory: row.directory, path: row.path },
+          })
+          .run()
+          .pipe(Effect.orDie)
+
+        for (const msg of exportData.messages) {
+          const msgInfo = decodeMessageInfo(msg.info) as SessionV1.Info
+          const { id, sessionID: _, ...msgData } = msgInfo
+          yield* db
+            .insert(MessageTable)
+            .values({
+              id,
+              session_id: row.id,
+              time_created: msgInfo.time?.created ?? Date.now(),
+              data: msgData as never,
+            })
+            .onConflictDoNothing()
+            .run()
+            .pipe(Effect.orDie)
+
+          for (const part of msg.parts) {
+            const partInfo = decodePart(part) as SessionV1.Part
+            const { id: partId, sessionID: _s, messageID, ...partData } = partInfo
+            yield* db
+              .insert(PartTable)
+              .values({
+                id: partId,
+                message_id: messageID,
+                session_id: row.id,
+                data: partData,
+              })
+              .onConflictDoNothing()
+              .run()
+              .pipe(Effect.orDie)
+          }
+        }
+      }),
+    )
     .pipe(Effect.orDie)
-
-  for (const msg of exportData.messages) {
-    const msgInfo = decodeMessageInfo(msg.info) as SessionV1.Info
-    const { id, sessionID: _, ...msgData } = msgInfo
-    yield* db
-      .insert(MessageTable)
-      .values({
-        id,
-        session_id: row.id,
-        time_created: msgInfo.time?.created ?? Date.now(),
-        data: msgData as never,
-      })
-      .onConflictDoNothing()
-      .run()
-      .pipe(Effect.orDie)
-
-    for (const part of msg.parts) {
-      const partInfo = decodePart(part) as SessionV1.Part
-      const { id: partId, sessionID: _s, messageID, ...partData } = partInfo
-      yield* db
-        .insert(PartTable)
-        .values({
-          id: partId,
-          message_id: messageID,
-          session_id: row.id,
-          data: partData,
-        })
-        .onConflictDoNothing()
-        .run()
-        .pipe(Effect.orDie)
-    }
-  }
 
   process.stdout.write(`Imported session: ${exportData.info.id}`)
   process.stdout.write(EOL)

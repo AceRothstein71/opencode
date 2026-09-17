@@ -1,4 +1,4 @@
-import { Effect, Stream } from "effect"
+import { Effect, Schedule, Stream } from "effect"
 import os from "os"
 import { createWriteStream } from "node:fs"
 import * as Tool from "./tool"
@@ -441,7 +441,10 @@ export const ShellTool = Tool.define(
       const limits = yield* trunc.limits()
       const keep = limits.maxBytes * 2
       let full = ""
-      let last = ""
+      let fullBytes = 0
+      const tailChunks: string[] = []
+      let tailLength = 0
+      let tailTrimmed = false
       const list: Chunk[] = []
       let used = 0
       let file = ""
@@ -451,6 +454,19 @@ export const ShellTool = Tool.define(
       let aborted = false
       let lastMetadataFlush = 0
       let metadataDirty = false
+
+      const appendTail = (chunk: string) => {
+        tailChunks.push(chunk)
+        tailLength += chunk.length
+        if (tailLength > MAX_METADATA_LENGTH) {
+          const sliced = tailChunks.join("").slice(-MAX_METADATA_LENGTH)
+          tailChunks.length = 0
+          tailChunks.push(sliced)
+          tailLength = sliced.length
+          tailTrimmed = true
+        }
+      }
+      const tailPreview = () => (tailTrimmed ? "...\n\n" : "") + tailChunks.join("")
 
       const closeSink = Effect.fnUntraced(function* () {
         const stream = sink
@@ -500,13 +516,14 @@ export const ShellTool = Tool.define(
                 cut = true
               }
 
-              last = preview(last + chunk)
+              appendTail(chunk)
 
               if (file) {
                 sink?.write(chunk)
               } else {
                 full += chunk
-                if (Buffer.byteLength(full, "utf-8") > limits.maxBytes) {
+                fullBytes += size
+                if (fullBytes > limits.maxBytes) {
                   return trunc.write(full).pipe(
                     Effect.andThen((next) =>
                       Effect.sync(() => {
@@ -514,12 +531,13 @@ export const ShellTool = Tool.define(
                         cut = true
                         sink = createWriteStream(next, { flags: "a" })
                         full = ""
+                        fullBytes = 0
                       }),
                     ),
                     Effect.andThen(
                       ctx.metadata({
                         metadata: {
-                          output: last,
+                          output: tailPreview(),
                         },
                       }),
                     ),
@@ -536,10 +554,21 @@ export const ShellTool = Tool.define(
               metadataDirty = false
               return ctx.metadata({
                 metadata: {
-                  output: last,
+                  output: tailPreview(),
                 },
               })
             }),
+          )
+
+          // Publish the latest throttled preview once output goes idle, so a command
+          // that emits everything then waits does not leave stale running metadata.
+          yield* Effect.forkScoped(
+            Effect.gen(function* () {
+              if (!metadataDirty) return
+              metadataDirty = false
+              lastMetadataFlush = Date.now()
+              yield* ctx.metadata({ metadata: { output: tailPreview() } })
+            }).pipe(Effect.repeat(Schedule.spaced(`${METADATA_THROTTLE_MS} millis`))),
           )
 
           const abort = Effect.callback<void>((resume) => {
@@ -574,7 +603,7 @@ export const ShellTool = Tool.define(
         metadataDirty = false
         yield* ctx.metadata({
           metadata: {
-            output: last,
+            output: tailPreview(),
           },
         })
       }
@@ -606,7 +635,7 @@ export const ShellTool = Tool.define(
       return {
         title: input.command,
         metadata: {
-          output: last || preview(output),
+          output: tailPreview() || preview(output),
           exit: code,
           truncated: cut,
           ...(cut && file ? { outputPath: file } : {}),

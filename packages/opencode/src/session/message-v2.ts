@@ -34,7 +34,7 @@ import { errorMessage } from "@/util/error"
 import { isMedia } from "@/util/media"
 import type { SystemError } from "bun"
 import type { Provider } from "@/provider/provider"
-import { Effect, Schema } from "effect"
+import { Effect, Option, Schema } from "effect"
 
 /** Error shape thrown by Bun's fetch() when gzip/br decompression fails mid-stream */
 interface FetchDecompressionError extends Error {
@@ -478,6 +478,48 @@ export const page = Effect.fn("MessageV2.page")(function* (input: {
   }
 })
 
+/** Same cursor walk as `page` but skips `hydrate`; for callers that read only `info` (F-114). */
+export const pageInfo = Effect.fn("MessageV2.pageInfo")(function* (input: {
+  sessionID: SessionID
+  limit: number
+  before?: string
+}) {
+  const { db } = yield* Database.Service
+  const before = input.before ? cursor.decode(input.before) : undefined
+  const where = before
+    ? and(eq(MessageTable.session_id, input.sessionID), older(before))
+    : eq(MessageTable.session_id, input.sessionID)
+  const rows = yield* db
+    .select()
+    .from(MessageTable)
+    .where(where)
+    .orderBy(desc(MessageTable.time_created), desc(MessageTable.id))
+    .limit(input.limit + 1)
+    .all()
+    .pipe(Effect.orDie)
+  if (rows.length === 0) {
+    const row = yield* db
+      .select({ id: SessionTable.id })
+      .from(SessionTable)
+      .where(eq(SessionTable.id, input.sessionID))
+      .get()
+      .pipe(Effect.orDie)
+    if (!row) return yield* new NotFoundError({ message: `Session not found: ${input.sessionID}` })
+    return { items: [] as Info[], more: false, cursor: undefined }
+  }
+
+  const more = rows.length > input.limit
+  const slice = more ? rows.slice(0, input.limit) : rows
+  const items = slice.map(info)
+  items.reverse()
+  const tail = slice.at(-1)
+  return {
+    items,
+    more,
+    cursor: more && tail ? cursor.encode({ id: tail.id, time: tail.time_created }) : undefined,
+  }
+})
+
 export function stream(sessionID: SessionID) {
   const size = 50
   return Effect.gen(function* () {
@@ -515,6 +557,21 @@ export function parts(messageID: MessageID) {
   })
 }
 
+export function partsTail(messageID: MessageID, limit: number) {
+  return Effect.gen(function* () {
+    const { db } = yield* Database.Service
+    const rows = yield* db
+      .select()
+      .from(PartTable)
+      .where(eq(PartTable.message_id, messageID))
+      .orderBy(desc(PartTable.id))
+      .limit(limit)
+      .all()
+      .pipe(Effect.orDie)
+    return rows.reverse().map(part)
+  })
+}
+
 export const get = Effect.fn("MessageV2.get")(function* (input: { sessionID: SessionID; messageID: MessageID }) {
   const { db } = yield* Database.Service
   const row = yield* db
@@ -527,29 +584,72 @@ export const get = Effect.fn("MessageV2.get")(function* (input: { sessionID: Ses
   return (yield* hydrate(db, [row]))[0]!
 })
 
-export function filterCompacted(msgs: Iterable<WithParts>) {
-  const result = [] as WithParts[]
-  const completed = new Set<string>()
-  let retain: MessageID | undefined
-  for (const msg of msgs) {
-    result.push(msg)
-    if (retain) {
-      if (msg.info.id === retain) break
-      continue
+export const getInfo = Effect.fn("MessageV2.getInfo")(function* (input: {
+  sessionID: SessionID
+  messageID: MessageID
+}) {
+  const { db } = yield* Database.Service
+  const row = yield* db
+    .select()
+    .from(MessageTable)
+    .where(and(eq(MessageTable.id, input.messageID), eq(MessageTable.session_id, input.sessionID)))
+    .get()
+    .pipe(Effect.orDie)
+  if (!row) return yield* new NotFoundError({ message: `Message not found: ${input.messageID}` })
+  return info(row)
+})
+
+export const findInfo = Effect.fn("MessageV2.findInfo")(function* (
+  sessionID: SessionID,
+  predicate: (item: Info) => boolean,
+) {
+  const size = 50
+  let before: string | undefined
+  while (true) {
+    const page = yield* pageInfo({ sessionID, limit: size, before })
+    if (page.items.length === 0) break
+    for (let i = page.items.length - 1; i >= 0; i--) {
+      const item = page.items[i]
+      if (item && predicate(item)) return Option.some(item)
     }
-    if (msg.info.role === "user" && completed.has(msg.info.id)) {
-      const part = msg.parts.find((item): item is CompactionPart => item.type === "compaction")
-      if (!part) continue
-      if (!part.tail_start_id) break
-      retain = part.tail_start_id
-      if (msg.info.id === retain) break
-      continue
-    }
-    if (msg.info.role === "user" && completed.has(msg.info.id) && msg.parts.some((part) => part.type === "compaction"))
-      break
-    if (msg.info.role === "assistant" && msg.info.summary && msg.info.finish && !msg.info.error)
-      completed.add(msg.info.parentID)
+    if (!page.more || !page.cursor) break
+    before = page.cursor
   }
+  return Option.none<Info>()
+})
+
+type CompactedState = {
+  result: WithParts[]
+  completed: Set<string>
+  retain: MessageID | undefined
+  stop: boolean
+}
+
+// One pass of the filterCompacted scan, fed messages newest-first. Shared by the
+// eager (array) and streamed (early-exit) readers so the compaction semantics
+// cannot drift between them.
+function compactedStep(state: CompactedState, msg: WithParts) {
+  state.result.push(msg)
+  if (state.retain) {
+    if (msg.info.id === state.retain) state.stop = true
+    return
+  }
+  if (msg.info.role === "user" && state.completed.has(msg.info.id)) {
+    const part = msg.parts.find((item): item is CompactionPart => item.type === "compaction")
+    if (!part) return
+    if (!part.tail_start_id) {
+      state.stop = true
+      return
+    }
+    state.retain = part.tail_start_id
+    if (msg.info.id === state.retain) state.stop = true
+    return
+  }
+  if (msg.info.role === "assistant" && msg.info.summary && msg.info.finish && !msg.info.error)
+    state.completed.add(msg.info.parentID)
+}
+
+function reorderCompacted(result: WithParts[]) {
   result.reverse()
   const compactionIndex = result.findLastIndex(
     (msg) =>
@@ -580,8 +680,38 @@ export function filterCompacted(msgs: Iterable<WithParts>) {
   return result
 }
 
+export function filterCompacted(msgs: Iterable<WithParts>) {
+  const state: CompactedState = { result: [], completed: new Set(), retain: undefined, stop: false }
+  for (const msg of msgs) {
+    compactedStep(state, msg)
+    if (state.stop) break
+  }
+  return reorderCompacted(state.result)
+}
+
+// Stops fetching pages at the break compactedStep would take on the full
+// transcript, so the result matches filterCompacted(stream(sessionID)) while
+// skipping the older pages filterCompacted discards (F-005).
 export const filterCompactedEffect = Effect.fnUntraced(function* (sessionID: SessionID) {
-  return filterCompacted(yield* stream(sessionID))
+  const size = 50
+  const state: CompactedState = { result: [], completed: new Set(), retain: undefined, stop: false }
+  let before: string | undefined
+  while (!state.stop) {
+    const next = yield* page({ sessionID, limit: size, before }).pipe(
+      Effect.catchIf(NotFoundError.isInstance, () =>
+        Effect.succeed({ items: [] as WithParts[], more: false, cursor: undefined }),
+      ),
+    )
+    if (next.items.length === 0) break
+    for (let i = next.items.length - 1; i >= 0; i--) {
+      const item = next.items[i]
+      if (item) compactedStep(state, item)
+      if (state.stop) break
+    }
+    if (!next.more || !next.cursor) break
+    before = next.cursor
+  }
+  return reorderCompacted(state.result)
 })
 
 // filterCompacted reorders messages for model consumption

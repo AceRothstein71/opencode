@@ -18,6 +18,10 @@ export type { Data, Definition, Payload } from "@opencode-ai/schema/event"
 export type Subscriber<D extends Definition = Definition> = (event: Payload<D>) => Effect.Effect<void>
 export type Unsubscribe = Effect.Effect<void>
 
+const EMPTY_SUBSCRIBERS: ReadonlyArray<Subscriber> = []
+/** Sliding live fan-out: a stalled subscriber drops its oldest events instead of retaining them unbounded. */
+const EVENT_PUBSUB_CAPACITY = 8192
+
 export const latestSequence = Effect.fn("EventV2.latestSequence")(function* (
   db: Database.Interface["db"],
   aggregateID: string,
@@ -47,17 +51,22 @@ export class InvalidDurableEventError extends Schema.TaggedErrorClass<InvalidDur
   },
 ) {}
 
-const decodeSerializedEvent = (event: SerializedEvent): Payload => {
+// The durable read path must never die on a row it cannot decode (newer/older
+// build, removed type); `replay()` keeps the strict die for authoritative streams.
+const decodeSerializedEvent = (event: SerializedEvent): Option.Option<Payload> => {
   const definition = Durable.get(event.type)
-  if (!definition?.durable) {
-    throw new InvalidDurableEventError({ type: event.type, message: `Unknown durable event type ${event.type}` })
-  }
-  return {
-    id: event.id,
-    type: definition.type,
-    durable: { aggregateID: event.aggregateID, seq: event.seq, version: definition.durable.version },
-    data: Schema.decodeUnknownSync(definition.data)(event.data),
-  }
+  const durable = definition?.durable
+  if (!definition || !durable) return Option.none()
+  return Schema.decodeUnknownOption(definition.data)(event.data).pipe(
+    Option.map(
+      (data): Payload => ({
+        id: event.id,
+        type: definition.type,
+        durable: { aggregateID: event.aggregateID, seq: event.seq, version: durable.version },
+        data,
+      }),
+    ),
+  )
 }
 
 export const readAggregate = Effect.fn("EventV2.readAggregate")(function* <A>(
@@ -172,8 +181,8 @@ export const layerWith = (options?: LayerOptions) =>
     Service,
     Effect.gen(function* () {
       const pubsub = {
-        all: yield* PubSub.unbounded<Payload>(),
-        durable: new Map<string, Set<PubSub.PubSub<void>>>(),
+        all: yield* PubSub.sliding<Payload>(EVENT_PUBSUB_CAPACITY),
+        durable: new Map<string, Set<PubSub.PubSub<Payload | null>>>(),
         typed: new Map<string, PubSub.PubSub<Payload>>(),
       }
       const projectors = new Map<string, Subscriber[]>()
@@ -185,7 +194,7 @@ export const layerWith = (options?: LayerOptions) =>
         Effect.gen(function* () {
           const existing = pubsub.typed.get(definition.type)
           if (existing) return existing
-          const created = yield* PubSub.unbounded<Payload>()
+          const created = yield* PubSub.sliding<Payload>(EVENT_PUBSUB_CAPACITY)
           pubsub.typed.set(definition.type, created)
           return created
         })
@@ -233,7 +242,7 @@ export const layerWith = (options?: LayerOptions) =>
                   }),
                 )
               }
-              const list = projectors.get(event.type) ?? []
+              const list = projectors.get(event.type) ?? EMPTY_SUBSCRIBERS
               return yield* Effect.uninterruptible(
                 Effect.gen(function* () {
                   const committed = yield* db
@@ -352,11 +361,14 @@ export const layerWith = (options?: LayerOptions) =>
                     )
                     .pipe(Effect.orDie)
                   if (committed) {
-                    yield* Effect.forEach(
-                      pubsub.durable.get(committed.aggregateID) ?? [],
-                      (wake) => PubSub.publish(wake, undefined),
-                      { discard: true },
-                    )
+                    const wakes = pubsub.durable.get(committed.aggregateID)
+                    if (wakes) {
+                      const wakePayload = {
+                        ...event,
+                        durable: { aggregateID: committed.aggregateID, seq: committed.seq, version: durable.version },
+                      } as Payload
+                      yield* Effect.forEach(wakes, (wake) => PubSub.publish(wake, wakePayload), { discard: true })
+                    }
                   }
                   return committed
                 }),
@@ -405,8 +417,9 @@ export const layerWith = (options?: LayerOptions) =>
 
       function notify(event: Payload, isolateListeners: boolean) {
         return Effect.gen(function* () {
+          // Snapshot so an unsubscribe mid-dispatch cannot shift and skip a listener.
           yield* Effect.forEach(
-            listeners,
+            listeners.slice(),
             (listener) => (isolateListeners ? observe(event, listener) : listener(event)),
             { discard: true },
           )
@@ -512,14 +525,19 @@ export const layerWith = (options?: LayerOptions) =>
       }
 
       function remove(aggregateID: string) {
-        return db
-          .transaction(() =>
-            Effect.gen(function* () {
-              yield* db.delete(EventSequenceTable).where(eq(EventSequenceTable.aggregate_id, aggregateID)).run()
-              yield* db.delete(EventTable).where(eq(EventTable.aggregate_id, aggregateID)).run()
-            }),
-          )
-          .pipe(Effect.orDie)
+        return Effect.gen(function* () {
+          yield* db
+            .transaction(() =>
+              Effect.gen(function* () {
+                yield* db.delete(EventSequenceTable).where(eq(EventSequenceTable.aggregate_id, aggregateID)).run()
+                yield* db.delete(EventTable).where(eq(EventTable.aggregate_id, aggregateID)).run()
+              }),
+            )
+            .pipe(Effect.orDie)
+          // Terminal null marker ends durable streams against a deleted log.
+          const wakes = pubsub.durable.get(aggregateID)
+          if (wakes) yield* Effect.forEach(wakes, (wake) => PubSub.publish(wake, null), { discard: true })
+        })
       }
 
       function claim(aggregateID: string, ownerID: string) {
@@ -560,11 +578,20 @@ export const layerWith = (options?: LayerOptions) =>
               }),
             ),
           ),
+          Effect.tap((decoded) =>
+            decoded.some(Option.isNone)
+              ? Effect.logWarning("EventV2.durable skipped undecodable events", {
+                  aggregateID,
+                  skipped: decoded.filter(Option.isNone).length,
+                })
+              : Effect.void,
+          ),
+          Effect.map((decoded) => decoded.flatMap((event) => (Option.isSome(event) ? [event.value] : []))),
         )
 
       const subscribeDurable = (aggregateID: string) =>
         Effect.gen(function* () {
-          const wake = yield* PubSub.sliding<void>(1)
+          const wake = yield* PubSub.sliding<Payload | null>(1)
           const subscription = yield* PubSub.subscribe(wake)
           yield* Effect.acquireRelease(
             Effect.sync(() => {
@@ -596,7 +623,18 @@ export const layerWith = (options?: LayerOptions) =>
             )
             const historical = yield* read
             const live = Stream.fromSubscription(wakes).pipe(
-              Stream.mapEffect(() => read),
+              Stream.takeWhile((signal) => signal !== null),
+              // Direct payload on seq+1; a coalesced gap falls back to an authoritative read.
+              Stream.mapEffect((signal) => {
+                if (signal === null) return Effect.succeed<Payload[]>([])
+                const seq = signal.durable?.seq
+                if (seq !== undefined && seq <= sequence) return Effect.succeed<Payload[]>([])
+                if (seq !== undefined && seq === sequence + 1) {
+                  sequence = seq
+                  return Effect.succeed([signal])
+                }
+                return read
+              }),
               Stream.flattenIterable,
             )
             return Stream.concat(Stream.fromIterable(historical), live)

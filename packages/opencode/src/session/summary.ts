@@ -14,6 +14,7 @@ import { MessageV2 } from "./message-v2"
 import { SessionID, MessageID } from "./schema"
 import { Config } from "@/config/config"
 import { createDurableParentCache } from "./durable-parent-cache"
+import { createLruCache } from "./lru-cache"
 
 function unquoteGitPath(input: string) {
   if (!input.startsWith('"')) return input
@@ -95,63 +96,49 @@ const layer = Layer.effect(
     // historical-event scan; the bounded cache evicts least-recently-used identities.
     const durableParents = createDurableParentCache()
     // Bounded memo of the last computed (from, to) diff per message so repeated summarizes skip diffFull.
-    const diffCache = new Map<string, { from: string; to: string; diffs: Snapshot.FileDiff[] }>()
+    const diffCache = createLruCache<string, { from: string; to: string; diffs: Snapshot.FileDiff[] }>()
     const summariesInflight = new Set<string>()
     const summariesRerun = new Set<string>()
 
+    // The turn is exactly the target user message plus its assistant children.
+    // Reading them directly avoids page-walking and hydrating the newer tail of
+    // the session on every changed step, and the child lookups run concurrently
+    // instead of one serial MessageV2.get per row (F-028, F-115).
     const turnMessages = Effect.fn("SessionSummary.turnMessages")(function* (input: {
       sessionID: SessionID
       messageID: MessageID
     }) {
-      const size = 50
-      const newer = [] as SessionV1.WithParts[]
-      let before: string | undefined
-      while (true) {
-        const next = yield* MessageV2.page({ sessionID: input.sessionID, limit: size, before }).pipe(
-          Effect.provideService(Database.Service, database),
-          Effect.orDie,
+      const target = yield* MessageV2.get({ sessionID: input.sessionID, messageID: input.messageID }).pipe(
+        Effect.provideService(Database.Service, database),
+        Effect.catchIf(NotFoundError.isInstance, () => Effect.succeed(undefined)),
+      )
+      if (!target || target.info.role !== "user") return []
+      const children = yield* database.db
+        .select({ id: MessageTable.id })
+        .from(MessageTable)
+        .where(
+          and(
+            eq(MessageTable.session_id, input.sessionID),
+            sql`json_extract(${MessageTable.data}, '$.parentID') = ${input.messageID}`,
+          ),
         )
-        for (let i = next.items.length - 1; i >= 0; i--) {
-          const item = next.items[i]
-          if (item) newer.push(item)
-        }
-        if (newer.some((m) => m.info.id === input.messageID)) break
-        if (!next.more || !next.cursor) break
-        before = next.cursor
-      }
-      // Children normally sort newer than their parent, but client-supplied or
-      // imported ids can invert that and land outside the window above. Backfill
-      // any children the walk missed so the turn is complete regardless of order.
-      if (newer.some((m) => m.info.id === input.messageID)) {
-        const known = new Set(newer.map((m) => m.info.id))
-        // A child already in the window proves the walk reached the turn; the
-        // session-wide parent scan only matters for out-of-window children.
-        const childInWindow = newer.some((m) => m.info.role === "assistant" && m.info.parentID === input.messageID)
-        const orphans = childInWindow
-          ? []
-          : yield* database.db
-              .select({ id: MessageTable.id })
-              .from(MessageTable)
-              .where(
-                and(
-                  eq(MessageTable.session_id, input.sessionID),
-                  sql`json_extract(${MessageTable.data}, '$.parentID') = ${input.messageID}`,
-                ),
-              )
-              .all()
-              .pipe(Effect.orDie)
-        for (const row of orphans) {
-          if (known.has(row.id)) continue
-          const child = yield* MessageV2.get({ sessionID: input.sessionID, messageID: row.id }).pipe(
+        .all()
+        .pipe(Effect.orDie)
+      const hydrated = yield* Effect.forEach(
+        children,
+        (row) =>
+          MessageV2.get({ sessionID: input.sessionID, messageID: row.id }).pipe(
             Effect.provideService(Database.Service, database),
             Effect.catchIf(NotFoundError.isInstance, () => Effect.succeed(undefined)),
-          )
-          if (child) newer.push(child)
-        }
-        newer.sort((a, b) => a.info.time.created - b.info.time.created || (a.info.id < b.info.id ? -1 : 1))
-        return newer
-      }
-      return newer.reverse()
+          ),
+        { concurrency: 8 },
+      )
+      const messages = [
+        target,
+        ...hydrated.filter((item): item is SessionV1.WithParts => item !== undefined && item.info.role === "assistant"),
+      ]
+      messages.sort((a, b) => a.info.time.created - b.info.time.created || (a.info.id < b.info.id ? -1 : 1))
+      return messages
     })
 
     const computeDiff = Effect.fn("SessionSummary.computeDiff")(function* (input: {
@@ -176,20 +163,16 @@ const layer = Layer.effect(
       }
       if (!from || !to || from === to) return []
       const cacheKey = input.sessionID && input.messageID ? `${input.sessionID}:${input.messageID}` : undefined
-      if (cacheKey) {
-        const cached = diffCache.get(cacheKey)
-        if (cached && cached.from === from && cached.to === to) return cached.diffs.map((item) => ({ ...item }))
-      }
-      const diffs = yield* snapshot.diffFull(from, to)
+      const cached = cacheKey ? diffCache.get(cacheKey) : undefined
+      if (cached && cached.from === from && cached.to === to) return cached.diffs.map((item) => ({ ...item }))
+      // Same turn, newer step: reuse the prior row/patch per file and diff only what
+      // the latest step touched, instead of re-diffing the whole turn every step.
+      const previous =
+        cached && cached.from === from && cached.to !== to ? { to: cached.to, diffs: cached.diffs } : undefined
+      const diffs = yield* snapshot.diffFull(from, to, previous)
       // A failed or disabled snapshot read returns undefined instead of an empty diff.
       if (diffs === undefined) return undefined
-      if (cacheKey && diffs.length) {
-        if (diffCache.size >= 8) {
-          const oldest = diffCache.keys().next()
-          if (!oldest.done) diffCache.delete(oldest.value)
-        }
-        diffCache.set(cacheKey, { from, to, diffs })
-      }
+      if (cacheKey && diffs.length) diffCache.set(cacheKey, { from, to, diffs })
       return diffs.map((item) => ({ ...item }))
     })
 

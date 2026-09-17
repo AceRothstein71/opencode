@@ -388,7 +388,7 @@ const layer = Layer.effect(
         )
 
         if (stream) {
-          attempt = 0
+          let sawEvent = false
 
           setStatus(space.id, "connected")
 
@@ -397,6 +397,7 @@ const layer = Layer.effect(
               if (!evt || typeof evt !== "object" || !("payload" in evt)) return
               const payload = evt.payload as { type?: string; syncEvent?: EventV2.SerializedEvent }
               if (payload.type === "server.heartbeat") return
+              sawEvent = true
 
               if (payload.type === "sync" && payload.syncEvent) {
                 const failed = yield* events.replay(payload.syncEvent, { publish: true, ownerID: space.id }).pipe(
@@ -429,10 +430,12 @@ const layer = Layer.effect(
           )
 
           setStatus(space.id, "disconnected")
+          if (sawEvent) attempt = 0
         }
 
         // Back off reconnect attempts up to 2 minutes while the workspace
-        // stays unavailable.
+        // stays unavailable. A stream that delivered events counts as a healthy
+        // connection and resets the backoff; an accept-then-close server keeps growing it.
         yield* Effect.sleep(`${Math.min(120_000, 1_000 * 2 ** attempt)} millis`)
         attempt += 1
       }

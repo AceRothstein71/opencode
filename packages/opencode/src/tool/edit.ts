@@ -32,16 +32,26 @@ function convertToLineEnding(text: string, ending: "\n" | "\r\n"): string {
   return text.replaceAll("\n", "\r\n")
 }
 
-const locks = new Map<string, Semaphore.Semaphore>()
+type LockEntry = { semaphore: Semaphore.Semaphore; holders: number }
 
-function lock(filePath: string) {
-  const resolvedFilePath = FSUtil.resolve(filePath)
-  const hit = locks.get(resolvedFilePath)
-  if (hit) return hit
+const locks = new Map<string, LockEntry>()
 
-  const next = Semaphore.makeUnsafe(1)
-  locks.set(resolvedFilePath, next)
-  return next
+function withLock<A, E, R>(filePath: string, effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> {
+  const key = FSUtil.resolve(filePath)
+  const entry = locks.get(key) ?? { semaphore: Semaphore.makeUnsafe(1), holders: 0 }
+  entry.holders++
+  locks.set(key, entry)
+
+  return entry.semaphore
+    .withPermits(1)(effect)
+    .pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          entry.holders--
+          if (entry.holders === 0 && locks.get(key) === entry) locks.delete(key)
+        }),
+      ),
+    )
 }
 
 export const Parameters = Schema.Struct({
@@ -85,7 +95,8 @@ export const EditTool = Tool.define(
           let diff = ""
           let contentOld = ""
           let contentNew = ""
-          yield* lock(filePath).withPermits(1)(
+          yield* withLock(
+            filePath,
             Effect.gen(function* () {
               if (params.oldString === "") {
                 const existed = yield* afs.existsSafe(filePath)
@@ -155,20 +166,20 @@ export const EditTool = Tool.define(
               yield* afs.writeWithDirs(filePath, Bom.join(contentNew, desiredBom))
               if (yield* format.file(filePath)) {
                 contentNew = yield* Bom.syncFile(afs, filePath, desiredBom)
+                diff = trimDiff(
+                  createTwoFilesPatch(
+                    filePath,
+                    filePath,
+                    normalizeLineEndings(contentOld),
+                    normalizeLineEndings(contentNew),
+                  ),
+                )
               }
               yield* events.publish(FileSystem.Event.Edited, { file: filePath })
               yield* events.publish(Watcher.Event.Updated, {
                 file: filePath,
                 event: "change",
               })
-              diff = trimDiff(
-                createTwoFilesPatch(
-                  filePath,
-                  filePath,
-                  normalizeLineEndings(contentOld),
-                  normalizeLineEndings(contentNew),
-                ),
-              )
             }).pipe(Effect.orDie),
           )
 
@@ -195,14 +206,14 @@ export const EditTool = Tool.define(
 
           let output = "Edit applied successfully."
           yield* lsp.touchFile(filePath, "document")
-          const diagnostics = yield* lsp.diagnostics()
+          const diagnostics = yield* lsp.diagnosticsFor(filePath)
           const normalizedFilePath = FSUtil.normalizePath(filePath)
-          const block = LSP.Diagnostic.report(filePath, diagnostics[normalizedFilePath] ?? [])
+          const block = LSP.Diagnostic.report(filePath, diagnostics)
           if (block) output += `\n\nLSP errors detected in this file, please fix:\n${block}`
 
           return {
             metadata: {
-              diagnostics,
+              diagnostics: { [normalizedFilePath]: diagnostics },
               diff,
               filediff,
             },

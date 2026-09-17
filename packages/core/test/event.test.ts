@@ -1097,6 +1097,42 @@ describe("EventV2", () => {
     }),
   )
 
+  it.effect("skips undecodable durable rows instead of dying", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const { db } = yield* Database.Service
+      const aggregateID = Session.ID.create()
+      yield* events.publish(DurableMessage, durableData(aggregateID, "zero"))
+      yield* db
+        .insert(EventTable)
+        .values([{ id: EventV2.ID.create(), aggregate_id: aggregateID, seq: 1, type: "unknown.event.99", data: {} }])
+        .run()
+        .pipe(Effect.orDie)
+
+      const received = Array.from(yield* events.durable({ aggregateID }).pipe(Stream.take(1), Stream.runCollect))
+
+      expect(received.map((event) => event.durable?.seq)).toEqual([0])
+    }),
+  )
+
+  it.effect("ends an open durable stream when the aggregate is removed", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const aggregateID = Session.ID.create()
+      yield* events.publish(DurableMessage, durableData(aggregateID, "zero"))
+      const first = yield* Deferred.make<void>()
+      const fiber = yield* events.durable({ aggregateID }).pipe(
+        Stream.tap(() => Deferred.succeed(first, undefined)),
+        Stream.runDrain,
+        Effect.forkScoped,
+      )
+      yield* Deferred.await(first)
+
+      yield* events.remove(aggregateID)
+      yield* Fiber.join(fiber)
+    }),
+  )
+
   it.effect("remove clears durable event sequence", () =>
     Effect.gen(function* () {
       const events = yield* EventV2.Service

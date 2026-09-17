@@ -368,9 +368,7 @@ describe("ShareNext", () => {
           yield* events.publish(Session.Event.MessageDiffUpdated, {
             sessionID: info.id,
             messageID,
-            diffs: [
-              { file: "shared.ts", additions: 1, deletions: 0, status: "modified", patch: "SHARED-DIFF-PATCH" },
-            ],
+            diffs: [{ file: "shared.ts", additions: 1, deletions: 0, status: "modified", patch: "SHARED-DIFF-PATCH" }],
           })
           yield* pollWithTimeout(
             Effect.sync(() => (seen.length >= 1 ? true : undefined)),
@@ -379,6 +377,59 @@ describe("ShareNext", () => {
           )
 
           expect(seen.join(" ")).toContain("SHARED-DIFF-PATCH")
+        }).pipe(Effect.provide(integrationLayer(client)))
+      },
+      { config: { enterprise: { url: "https://legacy-share.example.com" } } },
+    ),
+  )
+
+  it.live("ShareNext requeues a failed sync batch and retries it", () =>
+    provideTmpdirInstance(
+      () => {
+        const bodies: string[] = []
+        let status = 500
+        const client = HttpClient.make((req) => {
+          if (req.url.endsWith("/sync") && req.body._tag === "Uint8Array") {
+            bodies.push(new TextDecoder().decode(req.body.body))
+            const code = status
+            status = 200
+            return Effect.succeed(json(req, { ok: true }, code))
+          }
+          return Effect.succeed(json(req, { ok: true }))
+        })
+
+        return Effect.gen(function* () {
+          const events = yield* EventV2Bridge.Service
+          const share = yield* ShareNext.Service
+          const session = yield* Session.Service
+
+          const info = yield* session.create({ title: "retry" })
+          yield* share.init()
+          yield* Effect.sleep(50)
+          const { db } = yield* Database.Service
+          yield* db
+            .insert(SessionShareTable)
+            .values({
+              session_id: info.id,
+              id: "shr_retry",
+              url: "https://legacy-share.example.com/share/retry",
+              secret: "sec_retry",
+            })
+            .run()
+            .pipe(Effect.orDie)
+
+          yield* events.publish(Session.Event.Diff, {
+            sessionID: info.id,
+            diff: [{ file: "retry.ts", patch: "RETRY-PATCH", additions: 1, deletions: 0, status: "modified" }],
+          })
+          yield* pollWithTimeout(
+            Effect.sync(() => (bodies.length >= 2 ? true : undefined)),
+            "timed out waiting for share retry",
+            "10 seconds",
+          )
+
+          expect(bodies).toHaveLength(2)
+          expect(bodies[1]).toContain("RETRY-PATCH")
         }).pipe(Effect.provide(integrationLayer(client)))
       },
       { config: { enterprise: { url: "https://legacy-share.example.com" } } },

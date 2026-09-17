@@ -9,6 +9,12 @@ import { SessionID, MessageID, PartID } from "../../src/session/schema"
 import { Question } from "../../src/question"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
+import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { SessionProjector } from "@opencode-ai/core/session/projector"
+import { Database } from "@opencode-ai/core/database/database"
+import { Effect } from "effect"
+import { Session as SessionNs } from "@/session/session"
+import { testEffect } from "../lib/effect"
 
 const sessionID = SessionID.make("session")
 const providerID = ProviderV2.ID.make("test")
@@ -1726,4 +1732,308 @@ describe("session.message-v2.latest", () => {
     expect(state.tasks).toHaveLength(1)
     expect(state.tasks[0]).toMatchObject({ type: "subtask", prompt: "inspect" })
   })
+})
+
+// F-005 differential guard: filterCompactedEffect stops paging at the same
+// compaction break the eager `filterCompacted(stream(...))` scan takes. Both
+// must return byte-identical hydrated messages (content, order, diffs) for
+// every session shape, so each case below reads the same session through both
+// paths and deep-compares.
+const it = testEffect(LayerNode.compile(LayerNode.group([SessionNs.node, MessageV2.node, SessionProjector.node])))
+
+const withSession = <A, E, R>(
+  fn: (input: { session: SessionNs.Interface; sessionID: SessionID }) => Effect.Effect<A, E, R>,
+) =>
+  Effect.acquireUseRelease(
+    Effect.gen(function* () {
+      const session = yield* SessionNs.Service
+      const created = yield* session.create({})
+      return { session, sessionID: created.id }
+    }),
+    fn,
+    (input) => input.session.remove(input.sessionID).pipe(Effect.ignore),
+  )
+
+const addUserMessage = Effect.fn("Test.addUserMessage")(function* (sessionID: SessionID, text?: string) {
+  const session = yield* SessionNs.Service
+  const id = MessageID.ascending()
+  yield* session.updateMessage({
+    id,
+    sessionID,
+    role: "user",
+    time: { created: Date.now() },
+    agent: "test",
+    model: { providerID: "test", modelID: "test" },
+    tools: {},
+    mode: "",
+  } as unknown as SessionV1.Info)
+  if (text) yield* session.updatePart({ id: PartID.ascending(), sessionID, messageID: id, type: "text", text })
+  return id
+})
+
+const addAssistantMessage = Effect.fn("Test.addAssistantMessage")(function* (
+  sessionID: SessionID,
+  parentID: MessageID,
+  opts?: { summary?: boolean; finish?: string; error?: SessionV1.Assistant["error"]; text?: string },
+) {
+  const session = yield* SessionNs.Service
+  const id = MessageID.ascending()
+  yield* session.updateMessage({
+    id,
+    sessionID,
+    role: "assistant",
+    time: { created: Date.now() },
+    parentID,
+    modelID: ModelV2.ID.make("test"),
+    providerID: ProviderV2.ID.make("test"),
+    mode: "",
+    agent: "default",
+    path: { cwd: "/", root: "/" },
+    cost: 0,
+    tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+    summary: opts?.summary,
+    finish: opts?.finish,
+    error: opts?.error,
+  } as unknown as SessionV1.Info)
+  if (opts?.text)
+    yield* session.updatePart({ id: PartID.ascending(), sessionID, messageID: id, type: "text", text: opts.text })
+  return id
+})
+
+const addCompactionPart = Effect.fn("Test.addCompactionPart")(function* (
+  sessionID: SessionID,
+  messageID: MessageID,
+  tailStartID?: MessageID,
+) {
+  const session = yield* SessionNs.Service
+  const compaction: SessionV1.CompactionPart = {
+    id: PartID.ascending(),
+    sessionID,
+    messageID,
+    type: "compaction",
+    auto: true,
+    tail_start_id: tailStartID,
+  }
+  yield* session.updatePart(compaction)
+})
+
+const expectEquivalent = (sessionID: SessionID) =>
+  Effect.gen(function* () {
+    const eager = MessageV2.filterCompacted(yield* MessageV2.stream(sessionID))
+    const streamed = yield* MessageV2.filterCompactedEffect(sessionID)
+    expect(streamed).toEqual(eager)
+    return streamed
+  })
+
+describe("session.message-v2.filterCompactedEffect differential", () => {
+  it.instance("matches on an empty session", () =>
+    withSession(({ sessionID }) =>
+      Effect.gen(function* () {
+        const result = yield* expectEquivalent(sessionID)
+        expect(result).toEqual([])
+      }),
+    ),
+  )
+
+  it.instance("matches on a small session without compaction", () =>
+    withSession(({ sessionID }) =>
+      Effect.gen(function* () {
+        for (let i = 0; i < 5; i++) {
+          const user = yield* addUserMessage(sessionID, `q${i}`)
+          yield* addAssistantMessage(sessionID, user, { finish: "end_turn", text: `a${i}` })
+        }
+        const result = yield* expectEquivalent(sessionID)
+        expect(result).toHaveLength(10)
+      }),
+    ),
+  )
+
+  it.instance("matches across the 50-message page size without compaction", () =>
+    withSession(({ sessionID }) =>
+      Effect.gen(function* () {
+        for (let i = 0; i < 130; i++) yield* addUserMessage(sessionID, `q${i}`)
+        const result = yield* expectEquivalent(sessionID)
+        expect(result).toHaveLength(130)
+      }),
+    ),
+  )
+
+  it.instance("matches across the page size with a compaction boundary", () =>
+    withSession(({ sessionID }) =>
+      Effect.gen(function* () {
+        const ids: MessageID[] = []
+        for (let i = 0; i < 120; i++) ids.push(yield* addUserMessage(sessionID, `q${i}`))
+        const tail = ids[ids.length - 1]!
+        const compaction = yield* addUserMessage(sessionID)
+        yield* addCompactionPart(sessionID, compaction, tail)
+        yield* addAssistantMessage(sessionID, compaction, { summary: true, finish: "end_turn", text: "summary" })
+        const next = yield* addUserMessage(sessionID, "continue")
+        yield* addAssistantMessage(sessionID, next, { finish: "end_turn", text: "post" })
+
+        const result = yield* expectEquivalent(sessionID)
+        expect(result[0]?.info.id).toBe(compaction)
+      }),
+    ),
+  )
+
+  it.instance("stops reading pages at the compaction boundary", () =>
+    withSession(({ sessionID }) =>
+      Effect.gen(function* () {
+        const ids: MessageID[] = []
+        for (let i = 0; i < 120; i++) ids.push(yield* addUserMessage(sessionID, `q${i}`))
+        const tail = ids[ids.length - 1]!
+        const compaction = yield* addUserMessage(sessionID)
+        yield* addCompactionPart(sessionID, compaction, tail)
+        yield* addAssistantMessage(sessionID, compaction, { summary: true, finish: "end_turn", text: "summary" })
+        const next = yield* addUserMessage(sessionID, "continue")
+        yield* addAssistantMessage(sessionID, next, { finish: "end_turn", text: "post" })
+
+        const count = { selects: 0 }
+        const { db } = yield* Database.Service
+        const counting = {
+          db: new Proxy(db, {
+            get(target, prop) {
+              if (prop === "select") count.selects++
+              const value = Reflect.get(target, prop)
+              return typeof value === "function" ? value.bind(target) : value
+            },
+          }),
+        } as unknown as Database.Interface
+
+        const eager = MessageV2.filterCompacted(
+          yield* MessageV2.stream(sessionID).pipe(Effect.provideService(Database.Service, counting)),
+        )
+        const eagerSelects = count.selects
+        count.selects = 0
+        const streamed = yield* MessageV2.filterCompactedEffect(sessionID).pipe(
+          Effect.provideService(Database.Service, counting),
+        )
+        const streamedSelects = count.selects
+
+        expect(streamed).toEqual(eager)
+        expect(streamedSelects).toBe(3)
+        expect(eagerSelects).toBe(9)
+        expect(streamedSelects).toBeLessThan(eagerSelects)
+      }),
+    ),
+  )
+
+  it.instance("matches on a newly appended message", () =>
+    withSession(({ sessionID }) =>
+      Effect.gen(function* () {
+        const user = yield* addUserMessage(sessionID, "q")
+        yield* addAssistantMessage(sessionID, user, { finish: "end_turn", text: "a" })
+        expect(yield* expectEquivalent(sessionID)).toHaveLength(2)
+
+        const user2 = yield* addUserMessage(sessionID, "q2")
+        yield* addAssistantMessage(sessionID, user2, { finish: "end_turn", text: "a2" })
+        expect(yield* expectEquivalent(sessionID)).toHaveLength(4)
+      }),
+    ),
+  )
+
+  it.instance("matches after a part update", () =>
+    withSession(({ session, sessionID }) =>
+      Effect.gen(function* () {
+        const user = yield* addUserMessage(sessionID, "q")
+        const assistant = yield* addAssistantMessage(sessionID, user, { finish: "end_turn", text: "a" })
+        yield* expectEquivalent(sessionID)
+
+        const text = (yield* MessageV2.parts(assistant)).find((item) => item.type === "text")
+        if (!text) throw new Error("text part missing")
+        yield* session.updatePart({ ...text, text: "a-updated" })
+
+        const result = yield* expectEquivalent(sessionID)
+        const updated = result.find((item) => item.info.id === assistant)?.parts.find((item) => item.type === "text")
+        expect(updated?.type === "text" ? updated.text : undefined).toBe("a-updated")
+      }),
+    ),
+  )
+
+  it.instance("matches after a message removal", () =>
+    withSession(({ session, sessionID }) =>
+      Effect.gen(function* () {
+        const user1 = yield* addUserMessage(sessionID, "q1")
+        const assistant1 = yield* addAssistantMessage(sessionID, user1, { finish: "end_turn", text: "a1" })
+        const user2 = yield* addUserMessage(sessionID, "q2")
+        const assistant2 = yield* addAssistantMessage(sessionID, user2, { finish: "end_turn", text: "a2" })
+        yield* expectEquivalent(sessionID)
+
+        yield* session.removeMessage({ sessionID, messageID: assistant1 })
+        const result = yield* expectEquivalent(sessionID)
+        expect(result.map((item) => item.info.id)).toEqual([user1, user2, assistant2])
+      }),
+    ),
+  )
+
+  it.instance("matches with multiple compactions (newest boundary wins)", () =>
+    withSession(({ sessionID }) =>
+      Effect.gen(function* () {
+        const user0 = yield* addUserMessage(sessionID, "q0")
+        yield* addAssistantMessage(sessionID, user0, { finish: "end_turn", text: "a0" })
+        const compaction0 = yield* addUserMessage(sessionID)
+        yield* addCompactionPart(sessionID, compaction0, user0)
+        yield* addAssistantMessage(sessionID, compaction0, { summary: true, finish: "end_turn", text: "s0" })
+
+        const user1 = yield* addUserMessage(sessionID, "q1")
+        yield* addAssistantMessage(sessionID, user1, { finish: "end_turn", text: "a1" })
+        const compaction1 = yield* addUserMessage(sessionID)
+        yield* addCompactionPart(sessionID, compaction1, user1)
+        yield* addAssistantMessage(sessionID, compaction1, { summary: true, finish: "end_turn", text: "s1" })
+
+        const user2 = yield* addUserMessage(sessionID, "q2")
+        yield* addAssistantMessage(sessionID, user2, { finish: "end_turn", text: "a2" })
+
+        const result = yield* expectEquivalent(sessionID)
+        expect(result[0]?.info.id).toBe(compaction1)
+      }),
+    ),
+  )
+
+  it.instance("matches with an errored summary", () =>
+    withSession(({ sessionID }) =>
+      Effect.gen(function* () {
+        const user = yield* addUserMessage(sessionID, "q")
+        const compaction = yield* addUserMessage(sessionID)
+        yield* addCompactionPart(sessionID, compaction, user)
+        const error = new SessionV1.APIError({
+          message: "boom",
+          isRetryable: true,
+        }).toObject() as SessionV1.Assistant["error"]
+        yield* addAssistantMessage(sessionID, compaction, { summary: true, finish: "error", error, text: "s" })
+        const user2 = yield* addUserMessage(sessionID, "q2")
+        yield* addAssistantMessage(sessionID, user2, { finish: "end_turn", text: "a2" })
+        yield* expectEquivalent(sessionID)
+      }),
+    ),
+  )
+
+  it.instance("matches with a compaction part but no summary", () =>
+    withSession(({ sessionID }) =>
+      Effect.gen(function* () {
+        const user = yield* addUserMessage(sessionID, "q")
+        const compaction = yield* addUserMessage(sessionID)
+        yield* addCompactionPart(sessionID, compaction, user)
+        const user2 = yield* addUserMessage(sessionID, "q2")
+        const result = yield* expectEquivalent(sessionID)
+        expect(result.map((item) => item.info.id)).toEqual([user, compaction, user2])
+      }),
+    ),
+  )
+
+  it.instance("matches when tail_start_id points at a removed message", () =>
+    withSession(({ session, sessionID }) =>
+      Effect.gen(function* () {
+        const user = yield* addUserMessage(sessionID, "q")
+        const assistant = yield* addAssistantMessage(sessionID, user, { finish: "end_turn", text: "a" })
+        const compaction = yield* addUserMessage(sessionID)
+        yield* addCompactionPart(sessionID, compaction, assistant)
+        yield* addAssistantMessage(sessionID, compaction, { summary: true, finish: "end_turn", text: "s" })
+        yield* addUserMessage(sessionID, "q2")
+
+        yield* session.removeMessage({ sessionID, messageID: assistant })
+        yield* expectEquivalent(sessionID)
+      }),
+    ),
+  )
 })

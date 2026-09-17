@@ -1,18 +1,18 @@
 import { EventV2 } from "@opencode-ai/core/event"
 import { OpenCodeEvent } from "@opencode-ai/protocol/groups/event"
-import { Effect, Schema, Stream } from "effect"
+import { Effect, Queue, Schema, Stream } from "effect"
 import { HttpServerResponse } from "effect/unstable/http"
 import { HttpApiBuilder } from "effect/unstable/httpapi"
 import * as Sse from "effect/unstable/encoding/Sse"
 import { Api } from "../api"
 
-const subscriberCapacity = 256
+const subscriberCapacity = 8192
 
-function eventData(data: unknown): Sse.Event {
+function eventData(data: { id?: string }): Sse.Event {
   return {
     _tag: "Event",
     event: "message",
-    id: undefined,
+    id: data.id,
     data: JSON.stringify(Schema.encodeUnknownSync(OpenCodeEvent)(data)),
   }
 }
@@ -29,9 +29,14 @@ export const EventHandler = HttpApiBuilder.group(Api, "server.event", (handlers)
         }
         const output = Stream.unwrap(
           Effect.gen(function* () {
-            // Acquiring the bounded stream installs its listener before readiness is observable.
-            const live = yield* EventV2.allBounded(events, subscriberCapacity)
-            return Stream.make(connected).pipe(Stream.concat(live))
+            // Bounded but non-fatal: a slow client drops its oldest queued events
+            // instead of the stream terminating on overflow (F-015). Listener
+            // registration is eager so events cannot be lost while the body fiber
+            // is starting.
+            const queue = yield* Queue.sliding<EventV2.Payload>(subscriberCapacity)
+            const unsubscribe = yield* events.listen((event) => Effect.sync(() => Queue.offerUnsafe(queue, event)))
+            yield* Effect.addFinalizer(() => unsubscribe)
+            return Stream.make(connected).pipe(Stream.concat(Stream.fromQueue(queue)))
           }),
         ).pipe(Stream.map(eventData), Stream.pipeThroughChannel(Sse.encode()))
         const heartbeat = Stream.tick("15 seconds").pipe(Stream.map(() => ": heartbeat\n\n"))

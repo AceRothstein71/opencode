@@ -1,6 +1,7 @@
 import { afterEach, describe, expect } from "bun:test"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Effect, Layer } from "effect"
+import fs from "fs/promises"
 import path from "path"
 import { SessionPaths } from "@/server/routes/instance/httpapi/groups/session"
 import { Session } from "@/session/session"
@@ -219,6 +220,111 @@ describe("session message diff events", () => {
           (item) => item.info.id === messageID,
         )?.info
         expect(replayed?.role === "user" ? replayed.summary?.diffs : undefined).toEqual(expectedChangedDiffs)
+      }),
+    { git: true, config: { formatter: false, lsp: false } },
+    { timeout: 30_000 },
+  )
+
+  it.instance(
+    "incremental step diffs match a full recompute across adds, reverts, and repeated snapshots",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const session = yield* withSession({ title: "incremental-diff" })
+        const messageID = MessageID.ascending()
+        yield* Session.use.updateMessage(userMessage(session.id, messageID))
+        const assistant = yield* Session.use.updateMessage({
+          id: MessageID.ascending(),
+          sessionID: session.id,
+          role: "assistant",
+          time: { created: Date.now() },
+          parentID: messageID,
+          agent: "build",
+          modelID: ModelV2.ID.make("model"),
+          providerID: ProviderV2.ID.make("test"),
+          mode: "build",
+          path: { cwd: test.directory, root: test.directory },
+          cost: 0,
+          tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        } satisfies SessionV1.Assistant)
+        const snapshot = yield* Snapshot.Service
+        const summary = yield* SessionSummary.Service
+
+        const start = yield* snapshot.track()
+        if (!start) return yield* Effect.die("expected initial snapshot")
+        yield* Effect.promise(() =>
+          Promise.all([
+            Bun.write(path.join(test.directory, "a.txt"), "a0\n"),
+            Bun.write(path.join(test.directory, "b.txt"), "b0\n"),
+          ]),
+        )
+        const first = yield* snapshot.track()
+        if (!first) return yield* Effect.die("expected first snapshot")
+        yield* Session.use.updatePart({
+          id: PartID.ascending(),
+          messageID: assistant.id,
+          sessionID: session.id,
+          type: "step-start",
+          snapshot: start,
+        })
+        const step = (snapshotHash: string) =>
+          Session.use.updatePart({
+            id: PartID.ascending(),
+            messageID: assistant.id,
+            sessionID: session.id,
+            type: "step-finish",
+            reason: "stop",
+            snapshot: snapshotHash,
+            cost: 0,
+            tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+          })
+        const full = Effect.fnUntraced(function* () {
+          const messages = (yield* Session.use.messages({ sessionID: session.id })).filter(
+            (item) =>
+              item.info.id === messageID || (item.info.role === "assistant" && item.info.parentID === messageID),
+          )
+          return (yield* summary.computeDiff({ messages })) ?? []
+        })
+        const stored = Effect.fnUntraced(function* () {
+          const info = (yield* Session.use.messages({ sessionID: session.id })).find(
+            (item) => item.info.id === messageID,
+          )?.info
+          return info?.role === "user" ? info.summary?.diffs : undefined
+        })
+
+        yield* step(first)
+        yield* summary.summarize({ sessionID: session.id, messageID })
+        expect(yield* stored()).toEqual(yield* full())
+
+        yield* Effect.promise(() =>
+          Promise.all([
+            Bun.write(path.join(test.directory, "a.txt"), "a1\n"),
+            Bun.write(path.join(test.directory, "c.txt"), "c1\n"),
+          ]),
+        )
+        const second = yield* snapshot.track()
+        if (!second) return yield* Effect.die("expected second snapshot")
+        yield* step(second)
+        yield* summary.summarize({ sessionID: session.id, messageID })
+        expect(yield* stored()).toEqual(yield* full())
+
+        yield* Effect.promise(() =>
+          Promise.all([
+            Bun.write(path.join(test.directory, "a.txt"), "a0\n"),
+            Bun.write(path.join(test.directory, "b.txt"), "b1\n"),
+            fs.rm(path.join(test.directory, "c.txt")),
+          ]),
+        )
+        const third = yield* snapshot.track()
+        if (!third) return yield* Effect.die("expected third snapshot")
+        yield* step(third)
+        yield* summary.summarize({ sessionID: session.id, messageID })
+        expect(yield* stored()).toEqual(yield* full())
+
+        // A repeated snapshot must reuse the cached turn diff without drifting.
+        yield* step(third)
+        yield* summary.summarize({ sessionID: session.id, messageID })
+        expect(yield* stored()).toEqual(yield* full())
       }),
     { git: true, config: { formatter: false, lsp: false } },
     { timeout: 30_000 },

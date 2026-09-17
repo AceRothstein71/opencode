@@ -42,7 +42,7 @@ import { Truncate } from "@/tool/truncate"
 import { Image } from "@/image/image"
 import { decodeDataUrl } from "@/util/data-url"
 import { Process } from "@/util/process"
-import { Cause, Effect, Exit, Latch, Layer, Option, Scope, Context, Schema, Types } from "effect"
+import { Cause, Effect, Exit, Latch, Layer, Option, Schedule, Scope, Context, Schema, Types } from "effect"
 import { InstanceState } from "@/effect/instance-state"
 import { TaskTool, type TaskPromptOps } from "@/tool/task"
 import { SessionRunState } from "./run-state"
@@ -70,6 +70,16 @@ const SUPPORTED_MCP_RESOURCE_ATTACHMENT_MIMES = new Set([
   "image/png",
   "image/webp",
 ])
+
+// User-run session shell commands stream output into the tool part metadata,
+// and every publish deep-clones the part. Cap the preview and throttle the
+// publishes so per-chunk cost stays bounded instead of growing with the whole
+// accumulated output. The completed part still carries the full output.
+const SHELL_METADATA_THROTTLE_MS = 200
+const SHELL_METADATA_MAX_LENGTH = 30_000
+
+const shellMetadataPreview = (text: string) =>
+  text.length <= SHELL_METADATA_MAX_LENGTH ? text : "...\n\n" + text.slice(-SHELL_METADATA_MAX_LENGTH)
 
 const STRUCTURED_OUTPUT_DESCRIPTION = `Use this tool to return your final response in the requested structured format.
 
@@ -524,6 +534,8 @@ const layer = Layer.effect(
           const args = Shell.args(sh, input.command, cwd)
           let output = ""
           let aborted = false
+          let lastMetadataFlush = 0
+          let metadataDirty = false
 
           const finish = Effect.uninterruptible(
             Effect.gen(function* () {
@@ -564,11 +576,27 @@ const layer = Layer.effect(
                 forceKillAfter: "3 seconds",
               })
               const handle = yield* spawner.spawn(cmd)
+              yield* Effect.forkScoped(
+                Effect.gen(function* () {
+                  if (!metadataDirty || part.state.status !== "running") return
+                  metadataDirty = false
+                  lastMetadataFlush = Date.now()
+                  part.state.metadata = { output: shellMetadataPreview(output) }
+                  yield* sessions.updatePart(part)
+                }).pipe(Effect.repeat(Schedule.spaced(`${SHELL_METADATA_THROTTLE_MS} millis`))),
+              )
               yield* Stream.runForEach(Stream.decodeText(handle.all), (chunk) =>
                 Effect.gen(function* () {
                   output += chunk
                   if (part.state.status === "running") {
-                    part.state.metadata = { output }
+                    const now = Date.now()
+                    if (now - lastMetadataFlush < SHELL_METADATA_THROTTLE_MS) {
+                      metadataDirty = true
+                      return
+                    }
+                    lastMetadataFlush = now
+                    metadataDirty = false
+                    part.state.metadata = { output: shellMetadataPreview(output) }
                     yield* sessions.updatePart(part)
                   }
                 }),

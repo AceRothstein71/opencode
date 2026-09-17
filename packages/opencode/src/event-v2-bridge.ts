@@ -28,19 +28,22 @@ const layer = Layer.effect(
         // and two absolute paths on every event is measurable at delta rates.
         const key = `${ctx.directory}\0${workspaceID ?? ""}\0${ctx.project.id}\0${ctx.worktree}`
         let location = locationCache.get(key)
-        if (!location) {
+        if (location) {
+          // Refresh recency so a hot directory is not evicted FIFO by a cold one.
+          locationCache.delete(key)
+        } else {
           location = new Location.Info({
             directory: AbsolutePath.make(ctx.directory),
             ...(workspaceID ? { workspaceID } : {}),
             project: { id: Project.ID.make(ctx.project.id), directory: AbsolutePath.make(ctx.worktree) },
           })
+          Object.freeze(location)
           if (locationCache.size >= 64) {
             const oldest = locationCache.keys().next()
             if (!oldest.done) locationCache.delete(oldest.value)
           }
-          Object.freeze(location)
-          locationCache.set(key, location)
         }
+        locationCache.set(key, location)
         return yield* events.publish(definition, data, {
           ...options,
           location,
