@@ -4,13 +4,15 @@ import { GlobalBus } from "@/bus/global"
 import { EventV2 } from "@opencode-ai/core/event"
 import { Effect, Queue } from "effect"
 import * as Stream from "effect/Stream"
-import { HttpServerResponse } from "effect/unstable/http"
+import { HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
 import { HttpApiBuilder } from "effect/unstable/httpapi"
 import { EventApi } from "../groups/event"
 import { makeDesyncLatch } from "./event-desync"
-import { frame, isTransientEvent, join } from "./sse-frame"
+import { clearFrameCache, frame, isTransientEvent, join } from "./sse-frame"
 
 const EVENT_BUFFER = 8192
+
+type Frame = { id: string; type: string; properties: unknown }
 
 function eventID() {
   return EventV2.ID.create()
@@ -24,8 +26,18 @@ function eventResponse(events: EventV2.Interface) {
     // be lost while the HTTP body fiber is starting or emitting server.connected.
     // The buffer is bounded: a slow consumer drops the oldest events instead of
     // growing memory for every event in the process.
-    const queue = yield* Queue.sliding<{ id: string; type: string; properties: unknown }>(EVENT_BUFFER)
+    const queue = yield* Queue.sliding<Frame>(EVENT_BUFFER)
+    // The desync marker gets its own sliding(1) queue: offering it into the data queue
+    // lets a fast burst evict the very marker warning about that burst. A dedicated
+    // bounded queue guarantees the consumer receives at least the latest marker.
+    const control = yield* Queue.sliding<Frame>(1)
     const desync = makeDesyncLatch({ capacity: EVENT_BUFFER })
+    // Frames carry an `id:` for client-side dedup, but the server cannot replay from an
+    // arbitrary id, so a resume attempt gets a desync marker instead of being ignored.
+    const request = yield* HttpServerRequest.HttpServerRequest
+    if (request.headers["last-event-id"]) {
+      Queue.offerUnsafe(control, { id: eventID(), type: "server.desync", properties: {} })
+    }
     const unsubscribe = yield* events.listen((event) =>
       Effect.sync(() => {
         // Foreign directories and workspaces are rejected before enqueue. Events
@@ -37,19 +49,23 @@ function eventResponse(events: EventV2.Interface) {
         // buffer stays full so sustained overflow keeps telling the consumer it
         // is behind, and re-arm immediately once the queue drains.
         if (desync.shouldSignal(Queue.sizeUnsafe(queue))) {
-          Queue.offerUnsafe(queue, { id: eventID(), type: "server.desync", properties: {} })
+          Queue.offerUnsafe(control, { id: eventID(), type: "server.desync", properties: {} })
         }
         Queue.offerUnsafe(queue, { id: event.id, type: event.type, properties: event.data })
       }),
     )
-    yield* Effect.addFinalizer(() => unsubscribe)
-    const stream = Stream.fromQueue(queue)
+    yield* Effect.addFinalizer(() => unsubscribe.pipe(Effect.andThen(Queue.shutdown(control)), Effect.asVoid))
+    const stream = Stream.fromQueue(queue).pipe(
+      Stream.merge(Stream.fromQueue(control), { haltStrategy: "left" }),
+    )
     const disposed = Stream.callback<{ id: string; type: string; properties: unknown }>((queue) => {
       const listener = (event: {
         directory?: string
         payload: { id?: string; type?: string; properties?: unknown }
       }) => {
         if (event.directory !== instance.directory || event.payload.type !== "server.instance.disposed") return
+        // The frames retained for this instance are dead weight once it is gone.
+        clearFrameCache()
         Queue.offerUnsafe(queue, {
           id: event.payload.id ?? eventID(),
           type: "server.instance.disposed",

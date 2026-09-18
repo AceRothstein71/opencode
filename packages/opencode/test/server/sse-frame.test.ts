@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { frame, join } from "../../src/server/routes/instance/httpapi/handlers/sse-frame"
+import { clearFrameCache, frame, join } from "../../src/server/routes/instance/httpapi/handlers/sse-frame"
 
 const decode = (bytes: Uint8Array) => new TextDecoder().decode(bytes)
 
@@ -62,5 +62,12 @@ describe("SSE frame encoding", () => {
       frame(`evt_bulk_${index}`, `evt_bulk_${index}`, payload())
     }
     expect(frame("evt_bulk_first", "evt_bulk_first", payload())).not.toBe(original)
+  })
+
+  test("clears retained frames on demand", () => {
+    const payload = { id: "evt_clear_1", type: "message.part.updated", properties: {} }
+    const first = frame("evt_clear_1", "evt_clear_1", payload)
+    clearFrameCache()
+    expect(frame("evt_clear_1", "evt_clear_1", payload)).not.toBe(first)
   })
 })

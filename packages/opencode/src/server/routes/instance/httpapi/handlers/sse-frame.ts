@@ -22,6 +22,12 @@ export function isTransientEvent(type: string) {
   return TRANSIENT_EVENT_TYPES.has(type)
 }
 
+/** Drops retained frames so serialized payloads cannot outlive the instance that produced them. */
+export function clearFrameCache() {
+  frames.clear()
+  framesBytes = 0
+}
+
 export function frame(key: string, id: string | undefined, payload: unknown, cache = true): Uint8Array {
   if (cache) {
     const cached = frames.get(key)

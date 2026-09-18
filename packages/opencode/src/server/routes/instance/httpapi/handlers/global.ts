@@ -7,10 +7,11 @@ import { disposeAllInstancesAndEmitGlobalDisposed } from "@/server/global-lifecy
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
 import { Effect, Queue } from "effect"
 import * as Stream from "effect/Stream"
-import { HttpServerResponse } from "effect/unstable/http"
+import { HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
 import { HttpApiBuilder } from "effect/unstable/httpapi"
 import { RootHttpApi } from "../api"
 import { GlobalUpgradeInput } from "../groups/global"
+import { makeDesyncLatch } from "./event-desync"
 import { frame, isTransientEvent, join } from "./sse-frame"
 
 function eventResponse() {
@@ -21,16 +22,33 @@ function eventResponse() {
     // bound in handlers/event.ts. `sync` payloads are part of the declared
     // GlobalEvent contract and are replayed by remote workspace sync, so they
     // must not be filtered here.
-    const events = Stream.callback<GlobalBusEvent>(
-      (queue) => {
-        const handler = (event: GlobalBusEvent) => Queue.offerUnsafe(queue, event)
-        return Effect.acquireRelease(
-          Effect.sync(() => GlobalBus.on("event", handler)),
-          () => Effect.sync(() => GlobalBus.off("event", handler)),
-        )
-      },
-      { bufferSize: 8192, strategy: "sliding" },
+    const queue = yield* Queue.sliding<GlobalBusEvent>(8192)
+    // A dedicated bounded queue keeps the overflow marker from being evicted by the
+    // burst it warns about; the TUI needs the signal to refetch instead of diverging.
+    const control = yield* Queue.sliding<GlobalBusEvent>(1)
+    const desync = makeDesyncLatch({ capacity: 8192 })
+    const handler = (event: GlobalBusEvent) => {
+      if (desync.shouldSignal(Queue.sizeUnsafe(queue))) {
+        Queue.offerUnsafe(control, {
+          payload: { id: EventV2.ID.create(), type: "server.desync", properties: {} },
+        })
+      }
+      Queue.offerUnsafe(queue, event)
+    }
+    // The global stream cannot replay from an arbitrary id, so a resume attempt is
+    // answered with a desync marker (the TUI then refetches) instead of being ignored.
+    const request = yield* HttpServerRequest.HttpServerRequest
+    if (request.headers["last-event-id"]) {
+      Queue.offerUnsafe(control, { payload: { id: EventV2.ID.create(), type: "server.desync", properties: {} } })
+    }
+    GlobalBus.on("event", handler)
+    yield* Effect.addFinalizer(() =>
+      Effect.sync(() => GlobalBus.off("event", handler)).pipe(
+        Effect.andThen(Queue.shutdown(queue)),
+        Effect.andThen(Queue.shutdown(control)),
+      ),
     )
+    const events = Stream.fromQueue(queue).pipe(Stream.merge(Stream.fromQueue(control), { haltStrategy: "left" }))
     const heartbeat = Stream.tick("10 seconds").pipe(
       Stream.drop(1),
       Stream.map(() => ({ payload: { id: EventV2.ID.create(), type: "server.heartbeat", properties: {} } })),

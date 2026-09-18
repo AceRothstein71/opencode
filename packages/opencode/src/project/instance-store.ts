@@ -32,6 +32,8 @@ export const use = serviceUse(Service)
 
 interface Entry {
   readonly deferred: Deferred.Deferred<InstanceContext>
+  /** Outstanding `provide` leases; a leased entry is never evicted (D-P1-05). */
+  uses: number
 }
 
 const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Service> = Layer.effect(
@@ -111,6 +113,9 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
     const evictStale = Effect.fnUntraced(function* () {
       for (const [directory, entry] of [...cache.entries()]) {
         if (cache.size < MAX_CACHED_INSTANCES) return
+        // An actively-provided instance must never be torn down mid-turn; skipping it
+        // can leave the cache temporarily over the bound, which is the safe direction.
+        if (entry.uses > 0) continue
         if (!(yield* Deferred.isDone(entry.deferred))) continue
         const exit = yield* Deferred.await(entry.deferred).pipe(Effect.exit)
         if (Exit.isFailure(exit)) yield* removeEntry(directory, entry).pipe(Effect.asVoid)
@@ -130,7 +135,7 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
           }
 
           yield* evictStale()
-          const entry: Entry = { deferred: Deferred.makeUnsafe<InstanceContext>() }
+          const entry: Entry = { deferred: Deferred.makeUnsafe<InstanceContext>(), uses: 0 }
           cache.set(directory, entry)
           yield* Effect.gen(function* () {
             yield* Effect.logInfo("creating instance", { directory: directory })
@@ -146,7 +151,10 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
       return Effect.uninterruptibleMask((restore) =>
         Effect.gen(function* () {
           const previous = cache.get(directory)
-          const entry: Entry = { deferred: Deferred.makeUnsafe<InstanceContext>() }
+          // A reload for a directory not already cached adds an entry like `load`, so it
+          // must enforce the bound too; a replacement keeps the size unchanged.
+          if (!previous) yield* evictStale()
+          const entry: Entry = { deferred: Deferred.makeUnsafe<InstanceContext>(), uses: 0 }
           cache.set(directory, entry)
           yield* Effect.gen(function* () {
             yield* Effect.logInfo("reloading instance", { directory: directory })
@@ -205,7 +213,21 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
     })
 
     const provide = <A, E, R>(input: LoadInput, effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>
-      load(input).pipe(Effect.flatMap((ctx) => effect.pipe(Effect.provideService(InstanceRef, ctx))))
+      Effect.gen(function* () {
+        const ctx = yield* load(input)
+        // Hold a lease for the effect's lifetime so eviction cannot dispose resources
+        // the effect is still using; released on success, failure, or interruption.
+        const entry = cache.get(ctx.directory)
+        if (entry) entry.uses += 1
+        return yield* effect.pipe(
+          Effect.provideService(InstanceRef, ctx),
+          Effect.ensuring(
+            Effect.sync(() => {
+              if (entry) entry.uses = Math.max(0, entry.uses - 1)
+            }),
+          ),
+        )
+      })
 
     yield* Effect.addFinalizer(() => disposeAll().pipe(Effect.ignore))
 

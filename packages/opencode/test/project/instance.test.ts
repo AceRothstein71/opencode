@@ -69,6 +69,45 @@ describe("InstanceStore", () => {
     }),
   )
 
+  it.live("skips an instance held by provide when evicting", () =>
+    Effect.gen(function* () {
+      yield* setBootstrap(Effect.void)
+      const disposed: string[] = []
+      yield* registerDisposerScoped((directory) => {
+        disposed.push(directory)
+        return Promise.resolve()
+      })
+      const store = yield* InstanceStore.Service
+      const directories = yield* Effect.forEach(
+        Array.from({ length: 16 }, (_, index) => index),
+        () => tmpdirScoped({ git: true }),
+      )
+      yield* Effect.forEach(directories, (directory) => store.load({ directory }), { discard: true })
+
+      const held = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      const fiber = yield* store
+        .provide(
+          { directory: directories[0]! },
+          Effect.gen(function* () {
+            yield* Deferred.succeed(held, undefined)
+            yield* Deferred.await(release)
+          }),
+        )
+        .pipe(Effect.forkScoped)
+      yield* Deferred.await(held)
+
+      const extra = yield* tmpdirScoped({ git: true })
+      yield* store.load({ directory: extra })
+
+      // The leased directory survives; the next idle entry is evicted instead.
+      expect(disposed).toEqual([directories[1]])
+
+      yield* Deferred.succeed(release, undefined)
+      yield* Fiber.join(fiber)
+    }),
+  )
+
   it.live("runs bootstrap with InstanceRef provided", () =>
     Effect.gen(function* () {
       const dir = yield* tmpdirScoped({ git: true })

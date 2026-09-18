@@ -27,9 +27,12 @@ import { Database } from "@opencode-ai/core/database/database"
 import { Usage, type LLMEvent } from "@opencode-ai/llm"
 
 const DOOM_LOOP_THRESHOLD = 3
-// Step-start/step-finish/patch parts interleave with tool parts, so scan a wider bounded
-// tail and keep only tool parts before matching consecutive repeats (F-104).
+// Bounded tail of the newest *tool* parts to test for consecutive repeats (F-104). Counting
+// tool parts directly (not a mixed window) prevents interleaved text from evading detection.
 const DOOM_LOOP_TOOL_WINDOW = 24
+// A retry re-issues the whole request and re-dispatches tools, so only a side-effecting
+// call makes the turn non-idempotent; read-only tools are safe to run again.
+const READ_ONLY_TOOLS = new Set(["read", "glob", "grep", "list", "lsp", "webfetch", "websearch"])
 export type Result = "compact" | "stop" | "continue"
 
 export interface Handle {
@@ -466,7 +469,7 @@ const layer = Layer.effect(
             if (ctx.assistantMessage.summary) {
               throw new Error(`Tool call not allowed while generating summary: ${value.name}`)
             }
-            toolExecuted = true
+            if (!READ_ONLY_TOOLS.has(value.name)) toolExecuted = true
             yield* ensureToolCall(value)
             const input = isRecord(value.input) ? value.input : { value: value.input }
             yield* updateToolCall(value.id, (match) => ({
@@ -493,7 +496,7 @@ const layer = Layer.effect(
               return
             }
 
-            const tail = yield* MessageV2.partsTail(ctx.assistantMessage.id, DOOM_LOOP_TOOL_WINDOW).pipe(
+            const tail = yield* MessageV2.toolPartsTail(ctx.assistantMessage.id, DOOM_LOOP_TOOL_WINDOW).pipe(
               Effect.provideService(Database.Service, database),
             )
             const recentParts = tail
@@ -635,7 +638,9 @@ const layer = Layer.effect(
               }
               ctx.snapshot = undefined
             }
-            ctx.lastSnapshot = completedSnapshot
+            // Reuse the baseline only when no tool was still running at step-finish; a tool
+            // mutating the worktree after this capture would corrupt the next step's diff.
+            ctx.lastSnapshot = Object.keys(ctx.toolcalls).length === 0 ? completedSnapshot : undefined
             if (!stepUnchanged) {
               yield* summary
                 .summarize({

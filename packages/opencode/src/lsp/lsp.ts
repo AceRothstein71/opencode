@@ -110,23 +110,35 @@ const filterExperimentalServers = (servers: Record<string, LSPServer.Info>, flag
 type LocInput = { file: string; line: number; character: number }
 
 // A server that crashed once is quarantined, not disabled for the process lifetime.
+// Repeat crashes escalate the quarantine so a reliably-failing server cannot be
+// respawned on a fixed schedule (retry storm).
 const BROKEN_TTL_MS = 5 * 60_000
+const BROKEN_MAX_BACKOFF_MS = 60 * 60_000
+
+interface BrokenEntry {
+  at: number
+  failures: number
+}
 
 interface State {
   clients: LSPClient.Info[]
   servers: Record<string, LSPServer.Info>
-  broken: Map<string, number>
+  broken: Map<string, BrokenEntry>
   spawning: Map<string, Promise<LSPClient.Info | undefined>>
+  /** Clients whose exit is a deliberate shutdown and must not be marked broken. */
+  shuttingDown: WeakSet<LSPClient.Info>
 }
 
 function markBroken(state: State, key: string) {
-  state.broken.set(key, Date.now())
+  const previous = state.broken.get(key)
+  state.broken.set(key, { at: Date.now(), failures: (previous?.failures ?? 0) + 1 })
 }
 
 function isBroken(state: State, key: string) {
-  const at = state.broken.get(key)
-  if (at === undefined) return false
-  if (Date.now() - at < BROKEN_TTL_MS) return true
+  const entry = state.broken.get(key)
+  if (entry === undefined) return false
+  const backoff = Math.min(BROKEN_TTL_MS * 2 ** Math.min(entry.failures - 1, 4), BROKEN_MAX_BACKOFF_MS)
+  if (Date.now() - entry.at < backoff) return true
   state.broken.delete(key)
   return false
 }
@@ -209,10 +221,12 @@ const layer = Layer.effect(
           servers,
           broken: new Map(),
           spawning: new Map(),
+          shuttingDown: new WeakSet(),
         }
 
         yield* Effect.addFinalizer(() =>
           Effect.promise(async () => {
+            for (const client of s.clients) s.shuttingDown.add(client)
             await Promise.all(s.clients.map((client) => client.shutdown()))
           }),
         )
@@ -264,10 +278,12 @@ const layer = Layer.effect(
           }
 
           s.clients.push(client)
-          client.process.once("exit", () => {
-            markBroken(s, key)
+          client.onExit(() => {
             const index = s.clients.indexOf(client)
             if (index !== -1) s.clients.splice(index, 1)
+            // A deliberate shutdown must not quarantine the root+server for minutes.
+            if (s.shuttingDown.has(client)) return
+            markBroken(s, key)
           })
           return client
         }

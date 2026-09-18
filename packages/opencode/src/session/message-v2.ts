@@ -24,6 +24,7 @@ import { NotFoundError } from "@/storage/storage"
 import { and } from "drizzle-orm"
 import { desc } from "drizzle-orm"
 import { eq } from "drizzle-orm"
+import { sql } from "drizzle-orm"
 import { inArray } from "drizzle-orm"
 import { lt } from "drizzle-orm"
 import { or } from "drizzle-orm"
@@ -565,6 +566,23 @@ export function partsTail(messageID: MessageID, limit: number) {
       .select()
       .from(PartTable)
       .where(eq(PartTable.message_id, messageID))
+      .orderBy(desc(PartTable.id))
+      .limit(limit)
+      .all()
+      .pipe(Effect.orDie)
+    return rows.reverse().map(part)
+  })
+}
+
+// Doom-loop detection must count the last N *tool* parts: a fixed mixed window lets a
+// caller interleave enough text/reasoning parts to push tool parts out of it.
+export function toolPartsTail(messageID: MessageID, limit: number) {
+  return Effect.gen(function* () {
+    const { db } = yield* Database.Service
+    const rows = yield* db
+      .select()
+      .from(PartTable)
+      .where(and(eq(PartTable.message_id, messageID), sql`json_extract(${PartTable.data}, '$.type') = ${"tool"}`))
       .orderBy(desc(PartTable.id))
       .limit(limit)
       .all()

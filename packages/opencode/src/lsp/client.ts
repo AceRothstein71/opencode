@@ -573,8 +573,11 @@ export async function create(input: {
     get connection() {
       return connection
     },
-    get process() {
-      return input.server.process
+    // Lifecycle-accounted exit notification instead of exposing the raw child process,
+    // so callers cannot drive the process outside the client's own teardown.
+    onExit(listener: () => void) {
+      input.server.process.once("exit", listener)
+      return () => input.server.process.off("exit", listener)
     },
     notify: {
       async open(request: { path: string }) {
