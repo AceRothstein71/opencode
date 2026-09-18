@@ -86,9 +86,11 @@ const SWITCHES = new Set(["-confirm", "-debug", "-force", "-nonewline", "-recurs
 // Commands whose arguments are broadcast as text, never opened as local files.
 const DATA = new Set(["echo", "printf"])
 
-// Commands whose file arguments are resolved on a remote host or inside a container,
-// so a local path in their argument list is not a local read.
-const REMOTE = new Set(["ssh", "docker", "kubectl"])
+// Commands that run their inner command on a remote host or inside a container. Their
+// arguments are not all remote though: bind mounts, copy operands, key/config files are
+// local paths. `remotePaths` scans only those positions; the inner command and the
+// container side of a copy stay prompt-free.
+const REMOTE = new Set(["ssh", "docker", "podman", "kubectl"])
 
 // Shells that evaluate a `-c` string as a nested command. They are not option-model
 // wrappers, but the string must be re-parsed or `sh -c 'cat /etc/hostname'` runs a read
@@ -589,8 +591,13 @@ function auto(key: string, cwd: string, shell: string) {
   if (name === "PSHOME") return path.dirname(shell)
 }
 
-function expand(text: string, cwd: string, shell: string) {
-  const out = unquote(text)
+function expand(text: string, cwd: string, shell: string, vars?: Map<string, string>) {
+  const unquoted = unquote(text)
+  const substituted =
+    vars && vars.size > 0
+      ? unquoted.replace(/\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?/g, (whole, name: string) => vars.get(name) ?? whole)
+      : unquoted
+  const out = substituted
     .replace(/\$\{env:([^}]+)\}/gi, (_, key: string) => envValue(key) || "")
     .replace(/\$env:([A-Za-z_][A-Za-z0-9_]*)/gi, (_, key: string) => envValue(key) || "")
     .replace(/\$\{?(HOME|PWD|PSHOME)\}?(?=$|[\\/])/gi, (_, key: string) => auto(key, cwd, shell) || "")
@@ -641,7 +648,7 @@ const WRAPPERS: Record<string, Wrapper> = {
   command: { valueChars: "", valueLong: new Set(), positionals: 0 },
   exec: { valueChars: "a", valueLong: new Set(), positionals: 0 },
   nohup: { valueChars: "", valueLong: new Set(), positionals: 0 },
-  time: { valueChars: "", valueLong: new Set(), positionals: 0 },
+  time: { valueChars: "o", pathChars: "o", valueLong: new Set(["--output"]), pathLong: new Set(["--output"]), positionals: 0 },
   setsid: { valueChars: "", valueLong: new Set(["--wait"]), positionals: 0 },
   stdbuf: { valueChars: "ioe", valueLong: new Set(["--input", "--output", "--error"]), positionals: 0 },
   xargs: {
@@ -953,17 +960,141 @@ function globAnchor(text: string) {
   return path.dirname(text.replace(/[*?[\]]/g, "_"))
 }
 
+// A path attached to an option (`--files-from=/etc/x`, `-T/etc/x`, `tar -cf<path>`)
+// starts with `-`, so a plain dash-skip loses it before the scan. Extract the
+// path-like remainder so it can be scanned first.
+function attachedOptionValue(text: string) {
+  if (text.startsWith("--")) {
+    const equals = text.indexOf("=")
+    if (equals === -1) return
+    return text.slice(equals + 1) || undefined
+  }
+  const body = text.slice(1)
+  const marks = [body.indexOf("/"), body.indexOf("~"), body.indexOf("..")].filter((index) => index !== -1)
+  if (marks.length === 0) return
+  return body.slice(Math.min(...marks))
+}
+
+// The operands a fail-closed scan must inspect for one token: the token itself plus
+// the value of an `if=`/`of=`-style assignment, with attached option paths split out.
+function operandTargets(text: string) {
+  if (text.startsWith("-") && text !== "-") {
+    const value = attachedOptionValue(text)
+    return value === undefined ? [] : [value]
+  }
+  const operand = /^[A-Za-z_][A-Za-z0-9_]*=(.*)$/.exec(text)
+  return operand ? [text, operand[1]] : [text]
+}
+
+// Local-path option positions of a remote CLI. Everything else on those command lines
+// (the inner command, container paths, `host:/dir` operands) is resolved elsewhere.
+const REMOTE_PATH_CHARS: Record<string, string> = { ssh: "iF", kubectl: "f", docker: "fvo", podman: "fvo" }
+const REMOTE_PATH_LONG: Record<string, Set<string>> = {
+  ssh: new Set(["--identity", "--config"]),
+  kubectl: new Set(["--filename", "--kubeconfig", "--from-file", "--from-env-file"]),
+  docker: new Set(["--file", "--volume", "--mount", "--output", "--env-file", "--kubeconfig"]),
+  podman: new Set(["--file", "--volume", "--mount", "--output", "--env-file", "--kubeconfig"]),
+}
+const VOLUME_LONG = new Set(["--volume", "--mount"])
+const VOLUME_CHARS = "v"
+
+// `--from-file key=/etc/x` names the path on the right of a `key=` prefix.
+function stripKeyPrefix(value: string) {
+  const match = /^[A-Za-z_][A-Za-z0-9_.-]*=(.+)$/.exec(value)
+  return match ? match[1] : value
+}
+
+// A `-v`/`--volume` value is `local[:container[:opts]]`; a `--mount` value is a
+// comma-separated pair list where `source`/`src` is the host path.
+function mountLocal(value: string) {
+  if (/(^|,)(source|src|target|destination|type)=/i.test(value)) {
+    return value.split(",").flatMap((pair) => {
+      const match = /^(source|src)=(.+)$/i.exec(pair)
+      return match ? [match[2]] : []
+    })
+  }
+  const colon = value.indexOf(":")
+  return colon === -1 ? [] : [value.slice(0, colon)]
+}
+
+function remotePaths(name: string, command: Part[]) {
+  const args = command.slice(1)
+  const pathChars = REMOTE_PATH_CHARS[name] ?? ""
+  const pathLong = REMOTE_PATH_LONG[name] ?? new Set<string>()
+  const out: string[] = []
+  const positionals: string[] = []
+  let index = 0
+  const addValue = (volume: boolean, value: string) => {
+    out.push(...(volume ? mountLocal(value) : [stripKeyPrefix(value)]))
+  }
+  while (index < args.length) {
+    const text = args[index].text
+    if (text === "--") {
+      for (const item of args.slice(index + 1)) positionals.push(item.text)
+      break
+    }
+    if (text.startsWith("--")) {
+      const equals = text.indexOf("=")
+      if (equals !== -1) {
+        const key = text.slice(0, equals)
+        if (pathLong.has(key)) addValue(VOLUME_LONG.has(key), text.slice(equals + 1))
+        index++
+        continue
+      }
+      if (pathLong.has(text)) {
+        const value = args[index + 1]?.text
+        if (value !== undefined) addValue(VOLUME_LONG.has(text), value)
+        index += 2
+        continue
+      }
+      index++
+      continue
+    }
+    if (text.startsWith("-") && text !== "-") {
+      const body = text.slice(1)
+      let consumeNext = false
+      for (let at = 0; at < body.length; at++) {
+        const flag = body[at]
+        if (!pathChars.includes(flag)) continue
+        const attached = body.slice(at + 1)
+        if (attached) addValue(VOLUME_CHARS.includes(flag), attached)
+        else {
+          const value = args[index + 1]?.text
+          if (value !== undefined) addValue(VOLUME_CHARS.includes(flag), value)
+          consumeNext = true
+        }
+        break
+      }
+      index += consumeNext ? 2 : 1
+      continue
+    }
+    positionals.push(text)
+    index++
+  }
+  const sub = positionals[0]
+  if (sub === "cp") {
+    for (const operand of positionals.slice(1)) {
+      // A `container:/path` operand resolves inside the runtime; a bare one is local.
+      if (!/^[^/\\:]+:/.test(operand)) out.push(operand)
+    }
+  } else if ((name === "docker" || name === "podman") && sub === "build") {
+    const context = positionals[positionals.length - 1]
+    if (context !== undefined && context !== sub && context !== ".") out.push(context)
+  }
+  return out
+}
+
 function pathArgs(list: Part[], ps: boolean, cmd = false) {
   if (!ps) {
-    return list
-      .slice(1)
-      .filter(
-        (item) =>
-          !item.text.startsWith("-") &&
-          !(cmd && item.text.startsWith("/")) &&
-          !(list[0]?.text === "chmod" && item.text.startsWith("+")),
-      )
-      .map((item) => item.text)
+    return list.slice(1).flatMap((item): string[] => {
+      if (item.text.startsWith("-") && item.text !== "-") {
+        const value = attachedOptionValue(item.text)
+        return value === undefined ? [] : [value]
+      }
+      if (cmd && item.text.startsWith("/")) return []
+      if (list[0]?.text === "chmod" && item.text.startsWith("+")) return []
+      return [item.text]
+    })
   }
 
   const out: string[] = []
@@ -1142,11 +1273,17 @@ export const ShellTool = Tool.define(
       return root + (root.endsWith(path.sep) ? "" : path.sep) + text
     })
 
-    const argPath = Effect.fn("ShellTool.argPath")(function* (arg: string, cwd: string, ps: boolean, shell: string) {
+    const argPath = Effect.fn("ShellTool.argPath")(function* (
+      arg: string,
+      cwd: string,
+      ps: boolean,
+      shell: string,
+      vars?: Map<string, string>,
+    ) {
       // A word carrying an unresolvable ANSI-C escape still runs as a bash-decoded path.
       // Anchor the scan conservatively instead of letting mangled text look contained.
       if (!ps && arg.includes(UNRESOLVED)) return { external: true as const }
-      const text = expand(arg, cwd, shell)
+      const text = expand(arg, cwd, shell, vars)
       if (!text) return
       if (!ps && deviceSink(text)) return
       const file = prefix(text)
@@ -1183,6 +1320,15 @@ export const ShellTool = Tool.define(
       const shellKind = ShellID.toKind(Shell.name(shell))
       const state = { dynamic: false }
       const pending: { tokens: string[]; dynamic: boolean }[] = []
+      // A redirect target built from a variable (`O=/etc/x; cmd > $O`) resolves to empty
+      // in `expand` and would silently pass. Carry the command line's own assignments so
+      // `$NAME` resolves to the value the shell will actually use.
+      const assignments = new Map<string, string>()
+      for (const node of root.descendantsOfType("variable_assignment")) {
+        const name = node?.childForFieldName("name")?.text
+        const value = node?.childForFieldName("value")?.text
+        if (name && value !== undefined) assignments.set(name, unquote(value))
+      }
 
       const addPath = Effect.fnUntraced(function* (resolved: string | { external: true } | undefined) {
         if (!resolved) return false
@@ -1217,9 +1363,11 @@ export const ShellTool = Tool.define(
       const classify: (
         command: Part[],
         depth?: number,
+        substituted?: boolean,
       ) => Effect.Effect<{ name?: string; info: Effective; conservative?: boolean }, never, never> = Effect.fnUntraced(function* (
         command: Part[],
         depth = 0,
+        substituted = false,
       ) {
         const info = effective(command)
         const name = shellKind === "cmd" ? info.name?.toLowerCase() : info.name
@@ -1233,49 +1381,57 @@ export const ShellTool = Tool.define(
           info.command.slice(1).map((item) => item.text),
         )
         if (info.cwdTarget && dynamic(unquote(info.cwdTarget.text), ps)) state.dynamic = true
-        if (info.cwdTarget) yield* addPath(yield* argPath(info.cwdTarget.text, cwd, ps, shell))
+        if (info.cwdTarget) yield* addPath(yield* argPath(info.cwdTarget.text, cwd, ps, shell, assignments))
         if (info.extraPaths?.length) {
-          for (const item of info.extraPaths) yield* addPath(yield* argPath(item, cwd, ps, shell))
+          for (const item of info.extraPaths) yield* addPath(yield* argPath(item, cwd, ps, shell, assignments))
         }
         let conservative = info.command.some((item) => item.text.includes(UNRESOLVED))
+        let external = false
+        const scanOperands = Effect.fnUntraced(function* () {
+          for (const item of info.command.slice(1)) {
+            for (const target of operandTargets(item.text)) {
+              if (yield* addPath(yield* argPath(target, cwd, ps, shell, assignments))) external = true
+            }
+          }
+        })
         if (name && (FILES.has(name) || (shellKind === "cmd" && CMD_FILES.has(name)))) {
           for (const arg of pathArgs(info.command, ps, shellKind === "cmd")) {
-            yield* addPath(yield* argPath(arg, cwd, ps, shell))
+            yield* addPath(yield* argPath(arg, cwd, ps, shell, assignments))
           }
         } else if (info.unresolved) {
           // The wrapper could not be resolved, so the real command is somewhere in the
           // argument list. Scan every token for an external path rather than trust the
           // wrapper name.
-          for (const item of info.command.slice(1)) {
-            yield* addPath(yield* argPath(item.text, cwd, ps, shell))
-          }
-        } else if (name && DATA.has(name)) {
-          // Arguments are broadcast as text (`echo cat /etc/hostname`), never opened.
+          yield* scanOperands()
+        } else if (name && DATA.has(name) && !substituted) {
+          // Arguments are broadcast as text (`echo cat /etc/hostname`), never opened. A
+          // command synthesised from a `$(...)` in an extracted shell string is different:
+          // there `echo`'s arguments are the program that will run.
         } else if (name && REMOTE.has(name)) {
-          // The inner command runs on another host or inside a container; its file
-          // arguments are not local paths.
-        } else {
-          // Any command the classifier cannot model fails closed. Scan every argument
-          // — including the value of an `if=`/`of=` style operand — and withdraw `always`
-          // when an external path is present, so neither the offered grant nor a stored
-          // `<cmd> *` rule can absorb a future external effect. This is the class close
-          // for read-capable commands that are not in `FILES`.
-          let external = false
-          for (const item of info.command.slice(1)) {
-            if (item.text.startsWith("-") && item.text !== "-") continue
-            const operand = /^[A-Za-z_][A-Za-z0-9_]*=(.*)$/.exec(item.text)
-            for (const target of operand ? [item.text, operand[1]] : [item.text]) {
-              if (yield* addPath(yield* argPath(target, cwd, ps, shell))) external = true
-            }
+          // The inner command runs on another host or inside a container, but a bind
+          // mount, copy operand or key/config file is still a local path.
+          for (const target of remotePaths(name, info.command)) {
+            if (yield* addPath(yield* argPath(target, cwd, ps, shell, assignments))) external = true
           }
+          conservative = conservative || external
+        } else {
+          // Any command the classifier cannot model fails closed. Scan every operand —
+          // including an attached option value or an `if=`/`of=` style operand — and
+          // withdraw `always` when an external path is present, so neither the offered
+          // grant nor a stored `<cmd> *` rule can absorb a future external effect. This
+          // is the class close for read-capable commands that are not in `FILES`.
+          yield* scanOperands()
           conservative = conservative || external
         }
         if (info.evalScript && depth < 8) {
+          // A `$(...)`/backtick inside the extracted string is not data: the substitution
+          // result is what the shell executes, so its content must never hit `DATA`.
+          const nestedSubstituted = substituted || info.evalScript.includes("$(") || info.evalScript.includes("`")
           const exit = yield* parse(info.evalScript, ps).pipe(Effect.exit)
           if (Exit.isSuccess(exit)) {
             const tree = exit.value
             const nested = commands(tree.rootNode)
-            for (const node of nested) yield* classify(parts(node), depth + 1)
+            for (const node of nested) yield* classify(parts(node), depth + 1, nestedSubstituted)
             if (nested.length === 0 && tree.rootNode.hasError && info.evalScript.trim().length > 0) {
               state.dynamic = true
               scan.dirs.add(path.parse(cwd).root)
@@ -1300,7 +1456,28 @@ export const ShellTool = Tool.define(
       for (const redirect of root.descendantsOfType("file_redirect")) {
         if (!redirect) continue
         const destination = redirect.childForFieldName("destination")
-        if (destination) yield* addPath(yield* argPath(destination.text, cwd, ps, shell))
+        if (!destination) continue
+        const text = destination.text
+        const resolved = yield* argPath(text, cwd, ps, shell, assignments)
+        yield* addPath(resolved)
+        if (resolved !== undefined || ps) continue
+        if (!text.includes("$") && !text.includes("`")) continue
+        if (text.includes("$(") || text.includes("`")) {
+          // `cmd > $(...)` executes the substitution; classify its content so the
+          // target is not silently treated as text.
+          const exit = yield* parse(text, ps).pipe(Effect.exit)
+          if (Exit.isSuccess(exit)) {
+            const tree = exit.value
+            for (const node of commands(tree.rootNode)) yield* classify(parts(node), 0, true)
+            tree.delete()
+          } else {
+            scan.dirs.add(path.parse(cwd).root)
+          }
+          continue
+        }
+        // A plain variable target that never resolved to a path is still a real write:
+        // anchor at the root rather than let it pass.
+        scan.dirs.add(path.parse(cwd).root)
       }
 
       // A non-empty command the parser could not turn into a `command` node (a bare

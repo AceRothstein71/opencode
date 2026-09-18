@@ -2279,3 +2279,227 @@ describe("tool.shell wave KA classification", () => {
     90_000,
   )
 })
+
+describe("tool.shell wave LA classification", () => {
+  if (process.platform === "win32") return
+
+  const requests = (command: string, directory: string, stop: boolean) =>
+    Effect.gen(function* () {
+      const list: Array<Omit<PermissionV1.Request, "id" | "sessionID" | "tool">> = []
+      if (stop) {
+        yield* runIn(directory, fail({ command }, capture(list, new Error("stop after permission"))))
+      } else {
+        yield* runIn(directory, run({ command }, capture(list)))
+      }
+      return list
+    })
+
+  const expectExternal = (command: string, directory: string, stop = false) =>
+    Effect.gen(function* () {
+      const list = yield* requests(command, directory, stop)
+      expect({ command, external: list.some((item) => item.permission === "external_directory") }).toEqual({
+        command,
+        external: true,
+      })
+    })
+
+  const expectScanned = (command: string, directory: string) =>
+    Effect.gen(function* () {
+      const list = yield* requests(command, directory, false)
+      const bash = list.find((item) => item.permission === "bash")
+      expect({ command, external: list.some((item) => item.permission === "external_directory") }).toEqual({
+        command,
+        external: true,
+      })
+      expect({ command, always: bash?.always ?? [] }).toEqual({ command, always: [] })
+    })
+
+  const expectCleanStopped = (command: string, directory: string) =>
+    Effect.gen(function* () {
+      const list: Array<Omit<PermissionV1.Request, "id" | "sessionID" | "tool">> = []
+      yield* runIn(directory, run({ command }, capture(list, new Error("stop after permission"))).pipe(Effect.exit))
+      expect({ command, external: list.some((item) => item.permission === "external_directory") }).toEqual({
+        command,
+        external: false,
+      })
+    })
+
+  // A stored grant of the shape the tool itself offers (or a config rule) silences every
+  // request the run makes. An `external_directory` request it cannot cover keeps the
+  // local-path read visible.
+  const expectNotAbsorbed = (rule: string, command: string, directory: string) =>
+    Effect.gen(function* () {
+      const list = yield* requests(command, directory, true)
+      const approved = [{ permission: "bash", pattern: rule }]
+      const uncovered = list.filter(
+        (req) =>
+          !req.patterns.every((pattern) =>
+            approved.some(
+              (item) =>
+                Wildcard.matchStrict(req.permission, item.permission) &&
+                Wildcard.matchStrict(pattern, item.pattern),
+            ),
+          ),
+      )
+      expect({
+        rule,
+        command,
+        external: uncovered.some((item) => item.permission === "external_directory"),
+      }).toEqual({ rule, command, external: true })
+    })
+
+  it.live(
+    "scans local-path operands of remote runtimes and keeps remote operands prompt-free",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        for (const command of [
+          "docker cp /etc/hostname cid:/x",
+          "docker cp cid:/etc/passwd /tmp/la-outside/stolen",
+          "docker build -f /etc/hostname .",
+          "docker build --file /etc/hostname .",
+          "docker run -v /etc:/host alpine cat /host/passwd",
+          "docker run --volume /etc:/host alpine true",
+          "docker run --mount type=bind,source=/etc,target=/host alpine true",
+          "kubectl apply -f /etc/hostname",
+          "kubectl --kubeconfig /etc/hostname get pods",
+          "kubectl cp /etc/passwd pod:/tmp/x",
+          "ssh -i /etc/hostname host true",
+          "ssh -F /etc/hostname host true",
+          "ssh -i/etc/hostname host true",
+          "podman cp /etc/hostname cid:/x",
+          "podman run -v /etc:/host alpine true",
+          "podman build -f /etc/hostname .",
+        ]) {
+          yield* expectExternal(command, tmp, true)
+        }
+        for (const command of [
+          "ssh host cat /etc/passwd",
+          "docker run --rm alpine cat /etc/hostname",
+          "docker run -it alpine cat /etc/hostname",
+          "docker run -e FOO=/etc/x alpine true",
+          "docker run -w /app alpine true",
+          "kubectl exec pod -- cat /etc/hostname",
+          "kubectl get pods",
+          "kubectl -n kube-system get pods",
+          "docker ps -a",
+          "podman run alpine cat /etc/hostname",
+          "ssh -p 2222 host true",
+        ]) {
+          yield* expectCleanStopped(command, tmp)
+        }
+      }),
+    120_000,
+  )
+
+  it.live(
+    "scans paths attached to options before the dash-skip",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        yield* Effect.promise(() => Bun.write(path.join(tmp, "notes.txt"), "x"))
+        for (const command of [
+          "tar --files-from=/etc/hostname -cf /dev/null",
+          "tar -T/etc/hostname -cf /dev/null",
+          "file --files-from=/etc/hostname",
+          "zzz --file=/etc/hostname",
+          "zzz -f/etc/hostname",
+          "zzz --output=/etc/v15probe",
+          "zzz --file=~/x",
+          "zzz -f../x",
+          "zzz -f/",
+          "grep --file=/etc/hostname notes.txt",
+        ]) {
+          yield* expectExternal(command, tmp, true)
+        }
+        const outside = path.join(path.dirname(tmp), `la-out-${path.basename(tmp)}.tar`)
+        yield* expectScanned(`tar -cf${outside} notes.txt`, tmp)
+        yield* expectScanned(`tar --file=${outside} -c notes.txt`, tmp)
+        for (const command of [
+          "tar -cf notes.tar notes.txt",
+          "tar --file=notes.tar -c notes.txt",
+          "zzz --color=auto notes.txt",
+          "ls -la notes.txt",
+          "grep -n foo notes.txt",
+        ]) {
+          yield* expectCleanStopped(command, tmp)
+        }
+      }),
+    120_000,
+  )
+
+  it.live(
+    "does not exempt a command substitution inside an extracted shell string as data",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        for (const command of [
+          'sh -c "$(echo cat /etc/hostname)"',
+          'bash -c "$(echo cat /etc/hostname)"',
+          'bash -c "`echo cat /etc/hostname`"',
+          'eval "$(echo cat /etc/hostname)"',
+        ]) {
+          yield* expectExternal(command, tmp, true)
+        }
+        for (const command of [
+          'bash -c "echo cat /etc/hostname"',
+          'bash -c "echo hi"',
+          'echo "$(echo /etc/hostname)"',
+          "echo $(date)",
+        ]) {
+          yield* expectCleanStopped(command, tmp)
+        }
+      }),
+    120_000,
+  )
+
+  it.live(
+    "scans time output targets and variable or substitution redirect targets",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        yield* Effect.promise(() => Bun.write(path.join(tmp, "notes.txt"), "x"))
+        const parent = path.dirname(tmp)
+        const at = (name: string) => path.join(parent, `la-${path.basename(tmp)}-${name}`)
+        for (const command of [
+          `time -o ${at("t.log")} ls`,
+          `/usr/bin/time -o ${at("t2.log")} ls`,
+          `time --output=${at("t3.log")} ls`,
+          `O=${at("var")}; echo hi > $O`,
+          `echo hi > $(echo ${at("subst")})`,
+          `out=${at("app")}; echo hi >> $out`,
+          `echo hi > \`echo ${at("tick")}\``,
+        ]) {
+          yield* expectExternal(command, tmp)
+        }
+        yield* expectExternal("echo hi > $LA_PROBE_UNDEFINED", tmp, true)
+        for (const command of ["time ls", "time -p ls", "out=notes.txt; echo hi > $out", "echo hi > notes.txt"]) {
+          yield* expectCleanStopped(command, tmp)
+        }
+      }),
+    120_000,
+  )
+
+  it.live(
+    "a stored remote or self-offered grant cannot absorb a local-path request",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        yield* Effect.promise(() => Bun.write(path.join(tmp, "notes.txt"), "x"))
+        const offer = yield* requests("docker cp notes.txt cid:/x", tmp, false).pipe(
+          Effect.map((list) => list.find((item) => item.permission === "bash")?.always ?? []),
+        )
+        for (const rule of offer) {
+          yield* expectNotAbsorbed(rule, "docker cp /etc/hostname cid:/x", tmp)
+        }
+        for (const [rule, command] of [
+          ["ssh *", "ssh -i /etc/hostname host true"],
+          ["kubectl *", "kubectl -f /etc/hostname"],
+          ["docker cp *", "docker cp /etc/hostname cid:/x"],
+        ] as const) {
+          yield* expectNotAbsorbed(rule, command, tmp)
+        }
+      }),
+    120_000,
+  )
+})
