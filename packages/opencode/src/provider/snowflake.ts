@@ -3,8 +3,9 @@ const ROLE_ASSISTANT = /"role"\s*:\s*""/g
 // A `"role":""` match can straddle a chunk boundary, so a per-chunk replace misses
 // it. Hold back the longest suffix that is a prefix of `"role"\s*:\s*""` and only
 // rewrite complete matches; the held tail is prepended to the next chunk and flushed
-// on close.
-const ROLE_HOLD_MAX = 512
+// on close. The hold window is 64 KiB: a whitespace gap larger than that is flushed
+// un-rewritten rather than retaining an attacker-sized run (documented bound).
+const ROLE_HOLD_MAX = 64 * 1024
 const PARTIAL_ROLE = /^"role"\s*:?\s*"?$|^"(?:r(?:o(?:l(?:e"?)?)?)?)?$/
 
 function partialTail(text: string): number {

@@ -65,7 +65,7 @@ function eventResponse(events: EventV2.Interface) {
       }) => {
         if (event.directory !== instance.directory || event.payload.type !== "server.instance.disposed") return
         // The frames retained for this instance are dead weight once it is gone.
-        clearFrameCache()
+        clearFrameCache(instance.directory)
         Queue.offerUnsafe(queue, {
           id: event.payload.id ?? eventID(),
           type: "server.instance.disposed",
@@ -90,7 +90,7 @@ function eventResponse(events: EventV2.Interface) {
     return HttpServerResponse.stream(
       Stream.make({ id: eventID(), type: "server.connected", properties: {} }).pipe(
         Stream.concat(output.pipe(Stream.merge(heartbeat, { haltStrategy: "left" }))),
-        Stream.map((event) => frame(event.id, event.id, event, !isTransientEvent(event.type))),
+        Stream.map((event) => frame(event.id, event.id, event, !isTransientEvent(event.type), instance.directory)),
         Stream.mapArray((batch) => (batch.length <= 1 ? batch : [join(batch)])),
         Stream.ensuring(Effect.logInfo("event disconnected")),
       ),

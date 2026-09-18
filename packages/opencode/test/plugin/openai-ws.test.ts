@@ -822,6 +822,66 @@ describe("plugin.openai.ws-pool", () => {
     expect(server.httpRequests).toHaveLength(0)
     fetch.close()
   })
+
+  test("keeps a busy websocket lane alive while its response keeps streaming", async () => {
+    let connections = 0
+    await using server = await createWebSocketServer((socket) => {
+      connections += 1
+      socket.once("message", () => {
+        void (async () => {
+          for (let index = 0; index < 6; index++) {
+            socket.send(JSON.stringify({ type: "response.output_text.delta", delta: `chunk-${index}` }))
+            await new Promise((resolve) => setTimeout(resolve, 40))
+          }
+          socket.send(JSON.stringify({ type: "response.completed", response: { id: "resp_long" } }))
+        })()
+      })
+    })
+    const fetch = OpenAIWebSocketPool.createWebSocketFetch({
+      url: server.url,
+      idleTimeout: 100,
+      busyTimeout: 100,
+    })
+
+    const response = await fetch(server.url, streamRequest())
+    const text = await response.text()
+
+    expect(text).toContain("chunk-5")
+    expect(text).toContain("data: [DONE]")
+    expect(connections).toBe(1)
+    fetch.close()
+  })
+
+  test("reclaims a busy websocket lane that stops being read", async () => {
+    let connections = 0
+    await using server = await createWebSocketServer((socket) => {
+      connections += 1
+      socket.once("message", () => {
+        if (connections === 1) {
+          socket.send(JSON.stringify({ type: "response.output_text.delta", delta: "started" }))
+          return
+        }
+        socket.send(JSON.stringify({ type: "response.completed", response: { id: "resp_after_reclaim" } }))
+      })
+    })
+    const fetch = OpenAIWebSocketPool.createWebSocketFetch({
+      url: server.url,
+      idleTimeout: 60_000,
+      busyTimeout: 30,
+    })
+
+    const first = await fetch(server.url, streamRequest())
+    const reader = first.body!.getReader()
+    await reader.read()
+    // Stop reading: `busyAt` is no longer refreshed, so the next prune reclaims the lane.
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    fetch.prune()
+
+    const second = await fetch(server.url, streamRequest())
+    expect(await second.text()).toContain("data: [DONE]")
+    expect(connections).toBe(2)
+    fetch.close()
+  })
 })
 
 function streamRequest(headers?: Record<string, string>, signal?: AbortSignal): RequestInit {

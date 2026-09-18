@@ -14,6 +14,7 @@ export interface CreateWebSocketFetchOptions {
   fallbackTimeout?: number
   maxConnectionAge?: number
   streamRetries?: number
+  busyTimeout?: number
 }
 
 interface PoolEntry {
@@ -46,6 +47,7 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
   const fallbackTimeout = options?.fallbackTimeout ?? DEFAULT_FALLBACK_TIMEOUT
   const maxConnectionAge = options?.maxConnectionAge ?? DEFAULT_MAX_CONNECTION_AGE
   const streamRetries = options?.streamRetries ?? 5
+  const busyTimeout = options?.busyTimeout ?? Math.max(idleTimeout, 60_000)
   const pruneTimer = setInterval(() => prune(), Math.min(idleTimeout, 60_000))
   if (typeof pruneTimer === "object" && "unref" in pruneTimer && typeof pruneTimer.unref === "function") {
     pruneTimer.unref()
@@ -162,7 +164,7 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
       const first = await firstEvent
       if (first !== false) {
         resetBackoff(entry)
-        if (first === true || first.status < 200 || first.status > 599) return response
+        if (first === true || first.status < 200 || first.status > 599) return withActivity(entry, response)
         return new Response(first.body, {
           status: first.status,
           headers: { "content-type": "application/json", ...first.headers },
@@ -219,7 +221,6 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
 
   function prune() {
     const now = Date.now()
-    const busyTimeout = Math.max(idleTimeout, 60_000)
     for (const [key, entry] of pool) {
       // A caller that drops the response without reading or cancelling never fires
       // `onTerminal`/`onAbort`, so reclaim a slot that has been busy far longer than
@@ -252,7 +253,7 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
     }
   }
 
-  return Object.assign(websocketFetch, { close, remove })
+  return Object.assign(websocketFetch, { close, remove, prune })
 }
 
 function waitForBackoff(entry: PoolEntry, signal?: AbortSignal | null) {
@@ -334,6 +335,31 @@ function invalidate(entry: PoolEntry) {
     entry.socket = undefined
   }
   entry.connectedAt = undefined
+}
+
+// Refresh the prune clock as the consumer reads data, so prune only reclaims a lane that
+// has genuinely stalled (the caller stopped reading). Without this a legitimate stream
+// longer than `busyTimeout` is terminated mid-flight (v8 NEW-06).
+function withActivity(entry: PoolEntry, response: Response): Response {
+  if (!response.body) return response
+  const reader = response.body.getReader()
+  return new Response(
+    new ReadableStream<Uint8Array>({
+      async pull(controller) {
+        const { done, value } = await reader.read()
+        if (done) {
+          controller.close()
+          return
+        }
+        entry.busyAt = Date.now()
+        controller.enqueue(value)
+      },
+      cancel(reason) {
+        return reader.cancel(reason)
+      },
+    }),
+    { status: response.status, statusText: response.statusText, headers: response.headers },
+  )
 }
 
 export function withoutInternalHeaders<T extends { headers?: HeadersInit }>(init: T | undefined): T | undefined {

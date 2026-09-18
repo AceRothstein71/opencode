@@ -22,15 +22,30 @@ export function isTransientEvent(type: string) {
   return TRANSIENT_EVENT_TYPES.has(type)
 }
 
-/** Drops retained frames so serialized payloads cannot outlive the instance that produced them. */
-export function clearFrameCache() {
-  frames.clear()
-  framesBytes = 0
+/**
+ * Drops retained frames. With a `scope`, only that instance's frames go; without one the
+ * whole cache is cleared. Scoping keeps disposing one instance from dropping frames another
+ * live instance still serves (v8 NEW-06), while the O-P3-12 hook still clears the disposed
+ * instance's frames.
+ */
+export function clearFrameCache(scope?: string) {
+  if (scope === undefined) {
+    frames.clear()
+    framesBytes = 0
+    return
+  }
+  const prefix = `${scope}\u0000`
+  for (const key of [...frames.keys()]) {
+    if (!key.startsWith(prefix)) continue
+    framesBytes -= frames.get(key)?.byteLength ?? 0
+    frames.delete(key)
+  }
 }
 
-export function frame(key: string, id: string | undefined, payload: unknown, cache = true): Uint8Array {
+export function frame(key: string, id: string | undefined, payload: unknown, cache = true, scope?: string): Uint8Array {
+  const cacheKey = scope === undefined ? key : `${scope}\u0000${key}`
   if (cache) {
-    const cached = frames.get(key)
+    const cached = frames.get(cacheKey)
     if (cached) return cached
   }
   const bytes = encoder.encode(
@@ -43,7 +58,7 @@ export function frame(key: string, id: string | undefined, payload: unknown, cac
       framesBytes -= frames.get(oldest.value)?.byteLength ?? 0
       frames.delete(oldest.value)
     }
-    frames.set(key, bytes)
+    frames.set(cacheKey, bytes)
     framesBytes += bytes.byteLength
   }
   return bytes

@@ -57,6 +57,21 @@ function compareMessage(a: Message, b: Message) {
 
 const messageKey = (message: Message) => message.time.created + message.id
 
+// A deleted session tombstone must not grow for the process lifetime across create/delete
+// cycles, so the insertion-ordered set keeps only the most recent deletes.
+const MAX_DELETED_SESSIONS = 1024
+
+export function rememberDeleted(sessions: Set<string>, sessionID: string, max = MAX_DELETED_SESSIONS) {
+  // Re-insert so eviction order tracks the latest delete, then drop the oldest tombstones.
+  sessions.delete(sessionID)
+  sessions.add(sessionID)
+  while (sessions.size > max) {
+    const oldest = sessions.values().next()
+    if (oldest.done) break
+    sessions.delete(oldest.value)
+  }
+}
+
 export const {
   context: SyncContext,
   use: useSync,
@@ -152,7 +167,8 @@ export const {
     const hydratingSessions = new Map<string, { messages: Set<string>; parts: Set<string> }>()
     const pendingDiffs = new Map<string, Map<string, SnapshotFileDiff[]>>()
     // A deleted session must not be resurrected by an in-flight sync that resolves after
-    // the delete; the tombstone is checked before the post-await store write.
+    // the delete, nor by a late live event for the same id; `sync()` and every live
+    // handler that writes a session-keyed mirror consult the tombstone.
     const deletedSessions = new Set<string>()
     const touchMessage = (sessionID: string, messageID: string) => {
       hydratingSessions.get(sessionID)?.messages.add(messageID)
@@ -188,6 +204,7 @@ export const {
     let resyncOnDesync: (() => void) | undefined
     const unsubscribeSyncEvent = event.subscribe((event, { directory, workspace }) => {
       if (event.type === "message.diff.updated") {
+        if (deletedSessions.has(event.properties.sessionID)) return
         const messages = store.message[event.properties.sessionID]
         const index = messages?.findIndex((message) => message.id === event.properties.messageID) ?? -1
         const current = index >= 0 ? messages?.[index] : undefined
@@ -309,16 +326,18 @@ export const {
         }
 
         case "todo.updated":
+          if (deletedSessions.has(event.properties.sessionID)) break
           setStore("todo", event.properties.sessionID, reconcile(event.properties.todos))
           break
 
         case "session.diff":
+          if (deletedSessions.has(event.properties.sessionID)) break
           setStore("session_diff", event.properties.sessionID, reconcile(event.properties.diff))
           break
 
         case "session.deleted": {
           const sessionID = event.properties.info.id
-          deletedSessions.add(sessionID)
+          rememberDeleted(deletedSessions, sessionID)
           pendingDiffs.delete(sessionID)
           fullSyncedSessions.delete(sessionID)
           // Drop in-flight markers so a late resolution cannot re-add the session; the
@@ -418,11 +437,13 @@ export const {
         }
 
         case "session.status": {
+          if (deletedSessions.has(event.properties.sessionID)) break
           setStore("session_status", event.properties.sessionID, reconcile(event.properties.status))
           break
         }
 
         case "message.updated": {
+          if (deletedSessions.has(event.properties.info.sessionID)) break
           retirePendingDiff(event.properties.info.sessionID, event.properties.info.id)
           touchMessage(event.properties.info.sessionID, event.properties.info.id)
           const messages = store.message[event.properties.info.sessionID]
@@ -465,6 +486,7 @@ export const {
         }
 
         case "message.removed": {
+          if (deletedSessions.has(event.properties.sessionID)) break
           touchMessage(event.properties.sessionID, event.properties.messageID)
           const messages = store.message[event.properties.sessionID]
           const index = messages?.findIndex((message) => message.id === event.properties.messageID) ?? -1
@@ -480,6 +502,7 @@ export const {
           break
         }
         case "message.part.updated": {
+          if (deletedSessions.has(event.properties.part.sessionID)) break
           touchPart(event.properties.part.sessionID, event.properties.part.id)
           const parts = store.part[event.properties.part.messageID]
           if (!parts) {
@@ -502,6 +525,7 @@ export const {
         }
 
         case "message.part.delta": {
+          if (deletedSessions.has(event.properties.sessionID)) break
           const parts = store.part[event.properties.messageID]
           if (!parts) break
           const result = search(parts, event.properties.partID, (part) => part.id)
@@ -521,6 +545,7 @@ export const {
         }
 
         case "message.part.removed": {
+          if (deletedSessions.has(event.properties.sessionID)) break
           touchPart(event.properties.sessionID, event.properties.partID)
           const parts = store.part[event.properties.messageID]
           const result = search(parts, event.properties.partID, (part) => part.id)

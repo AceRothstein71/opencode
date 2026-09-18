@@ -66,11 +66,13 @@ export function trimQueue<T>(queue: Map<string, T>) {
 // out-of-band, and a permanent null would hide it forever (F-119).
 const NEGATIVE_CACHE_TTL = 30_000
 
-// The negative cache and the per-session queue maps are keyed by session id, so a
-// long-lived server accumulates entries for every session it ever looked up or
-// queued. Bound both.
+// The negative cache, the per-session queue maps, and the cached share records are
+// keyed by session id, so a long-lived server accumulates entries for every session it
+// ever looked up, queued, or shared. Bound all of them.
 const MAX_MISSES = 1_024
 const MAX_QUEUED_SESSIONS = 256
+const MAX_SHARED_SESSIONS = 256
+const MAX_REMOVALS = 256
 
 // A failed remote DELETE is retried by a later sync at most this often.
 const REMOVAL_RETRY_MS = 60_000
@@ -108,6 +110,34 @@ type State = {
   removalsRequestedAt: number
 }
 
+// Evict the oldest idle session entries from the queue and shared-cache maps. Entries
+// with in-flight work are skipped so a bound never tears down an active flush; when every
+// candidate is active the maps stay temporarily over the bound (the safe direction). The
+// queue is trimmed first so its freed ids become eligible for shared eviction in one pass.
+export function boundQueueMaps<T>(
+  queue: Map<SessionID, Map<string, T>>,
+  shared: Map<SessionID, Share>,
+  active: { inflight: Set<SessionID>; scheduled: Set<SessionID>; removals: Map<SessionID, Share> },
+  queuedLimit = MAX_QUEUED_SESSIONS,
+  sharedLimit = MAX_SHARED_SESSIONS,
+) {
+  let queuedDropped = 0
+  for (const id of queue.keys()) {
+    if (queue.size <= queuedLimit) break
+    if (active.inflight.has(id) || active.scheduled.has(id)) continue
+    queue.delete(id)
+    queuedDropped++
+  }
+  let sharedDropped = 0
+  for (const id of shared.keys()) {
+    if (shared.size <= sharedLimit) break
+    if (queue.has(id) || active.inflight.has(id) || active.scheduled.has(id) || active.removals.has(id)) continue
+    shared.delete(id)
+    sharedDropped++
+  }
+  return { queuedDropped, sharedDropped }
+}
+
 function sweepMaps(s: State) {
   if (s.misses.size > MAX_MISSES) {
     const now = Date.now()
@@ -118,11 +148,16 @@ function sweepMaps(s: State) {
       s.misses.delete(oldest.value)
     }
   }
-  if (s.queue.size > MAX_QUEUED_SESSIONS) {
-    for (const id of s.queue.keys()) {
-      if (s.queue.size <= MAX_QUEUED_SESSIONS) break
-      if (!s.shared.has(id)) s.queue.delete(id)
-    }
+  boundQueueMaps(s.queue, s.shared, s)
+}
+
+function rememberRemoval(s: State, sessionID: SessionID, share: Share) {
+  s.removals.delete(sessionID)
+  s.removals.set(sessionID, share)
+  while (s.removals.size > MAX_REMOVALS) {
+    const oldest = s.removals.keys().next()
+    if (oldest.done) break
+    s.removals.delete(oldest.value)
   }
 }
 
@@ -203,10 +238,20 @@ const layer = Layer.effect(
     function sync(sessionID: SessionID, data: Data[]) {
       return Effect.gen(function* () {
         if (disabled) return
+        const s = yield* InstanceState.get(state)
+        // Retry pending remote deletes for any sync, not only for a session that still has
+        // a share: after `remove` the local record is gone, so consulting `share` first made
+        // this retry unreachable and left the share world-readable (v8 NEW-04/D-P1-04).
+        if (s.removals.size > 0 && Date.now() - s.removalsRequestedAt > REMOVAL_RETRY_MS) {
+          s.removalsRequestedAt = Date.now()
+          yield* retryRemovals(s).pipe(
+            Effect.catchCause((cause) => Effect.logWarning("share removal retry failed", { cause })),
+            Effect.forkIn(s.scope),
+          )
+        }
         const share = yield* getCached(sessionID)
         if (!share) return
 
-        const s = yield* InstanceState.get(state)
         const existing = s.queue.get(sessionID)
         if (existing) {
           for (const item of data) {
@@ -238,14 +283,6 @@ const layer = Layer.effect(
           if (dropped > 0) yield* Effect.logWarning("share queue capped", { sessionID: sessionID, dropped: dropped })
         }
         sweepMaps(s)
-
-        if (s.removals.size > 0 && Date.now() - s.removalsRequestedAt > REMOVAL_RETRY_MS) {
-          s.removalsRequestedAt = Date.now()
-          yield* retryRemovals(s).pipe(
-            Effect.catchCause((cause) => Effect.logWarning("share removal retry failed", { cause })),
-            Effect.forkIn(s.scope),
-          )
-        }
 
         // One delayed flush per session; while one is scheduled or in flight the batch
         // is only merged so a stalled/failed POST cannot race a second one.
@@ -433,6 +470,7 @@ const layer = Layer.effect(
       }
       s.shared.set(sessionID, share)
       s.misses.delete(sessionID)
+      sweepMaps(s)
       return share
     })
 
@@ -530,6 +568,9 @@ const layer = Layer.effect(
           Effect.sync(() => {
             s.inflight.delete(sessionID)
             s.scheduled.delete(sessionID)
+            // A finished flush frees its id, so retry the bound now instead of waiting
+            // for the next sync (v8 NEW-03: the sweep must be able to make progress).
+            sweepMaps(s)
           }),
         ),
       )
@@ -626,6 +667,7 @@ const layer = Layer.effect(
       const s = yield* InstanceState.get(state)
       s.shared.set(sessionID, result)
       s.misses.delete(sessionID)
+      sweepMaps(s)
       yield* fullWithRetry(sessionID).pipe(Effect.forkIn(s.scope))
       return result
     })
@@ -656,7 +698,7 @@ const layer = Layer.effect(
       )
 
       if (Exit.isFailure(result)) {
-        s.removals.set(sessionID, share)
+        rememberRemoval(s, sessionID, share)
         yield* Effect.logWarning("failed to remove share", { sessionID: sessionID, cause: result.cause })
       } else {
         s.removals.delete(sessionID)

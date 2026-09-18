@@ -300,6 +300,10 @@ export const layerWith = (options?: LayerOptions) =>
         typed: new Map<string, PubSub.PubSub<Payload>>(),
       }
       const projectors = new Map<string, Subscriber[]>()
+      // Aggregates removed by `remove()`: a durable stream created afterwards must end
+      // immediately instead of parking on a wake that will never receive a null. Cleared
+      // when the aggregate is re-created by a later commit (v8 NEW-07).
+      const removedAggregates = new Set<string>()
       // TODO: Bind durable projectors to exact type+version before supporting incompatible historical payloads.
       const listeners = new Array<Subscriber>()
       const { db } = yield* Database.Service
@@ -478,6 +482,7 @@ export const layerWith = (options?: LayerOptions) =>
                     )
                     .pipe(retryDurableWrite("durableEvent.commit"), Effect.orDie)
                   if (committed) {
+                    removedAggregates.delete(committed.aggregateID)
                     const wakes = pubsub.durable.get(committed.aggregateID)
                     if (wakes) {
                       const wakePayload = {
@@ -686,6 +691,7 @@ export const layerWith = (options?: LayerOptions) =>
             .pipe(retryDurableWrite("event.remove"), Effect.orDie)
           // Terminal null marker ends durable streams against a deleted log; the Deferred
           // guarantees termination even when the sliding(1) wake evicts the null.
+          removedAggregates.add(aggregateID)
           const wakes = pubsub.durable.get(aggregateID)
           if (wakes)
             yield* Effect.forEach(
@@ -771,6 +777,9 @@ export const layerWith = (options?: LayerOptions) =>
                 if (wakes?.size === 0) pubsub.durable.delete(aggregateID)
               }).pipe(Effect.andThen(PubSub.shutdown(wake))),
           )
+          // A subscriber created after the aggregate was removed would otherwise never
+          // receive the terminal signal; complete its own deferred up front.
+          if (removedAggregates.has(aggregateID)) yield* Deferred.succeed(removed, undefined)
           return { subscription, removed }
         })
 

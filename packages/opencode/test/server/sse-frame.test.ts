@@ -70,4 +70,16 @@ describe("SSE frame encoding", () => {
     clearFrameCache()
     expect(frame("evt_clear_1", "evt_clear_1", payload)).not.toBe(first)
   })
+
+  test("clears only the scoped instance's frames", () => {
+    const first = { id: "evt_scope_a", type: "message.part.updated", properties: {} }
+    const second = { id: "evt_scope_b", type: "message.part.updated", properties: {} }
+    const cachedA = frame("evt_scope_a", "evt_scope_a", first, true, "/dir/a")
+    const cachedB = frame("evt_scope_b", "evt_scope_b", second, true, "/dir/b")
+
+    clearFrameCache("/dir/a")
+
+    expect(frame("evt_scope_a", "evt_scope_a", first, true, "/dir/a")).not.toBe(cachedA)
+    expect(frame("evt_scope_b", "evt_scope_b", second, true, "/dir/b")).toBe(cachedB)
+  })
 })

@@ -5,7 +5,23 @@ import { type ChildProcess, spawnSync } from "node:child_process"
 const STOP_ESCALATE_MS = 2_000
 const STOP_FINAL_WAIT_MS = 5_000
 
+// Concurrent stop() calls must share one teardown: without this each caller attaches its
+// own exit listener and escalation timer and sends its own SIGTERM (v8 NEW-09).
+const stopping = new WeakMap<ChildProcess, Promise<void>>()
+
 export async function stop(proc: ChildProcess) {
+  const pending = stopping.get(proc)
+  if (pending) return pending
+  const task = stopProcess(proc)
+  stopping.set(proc, task)
+  try {
+    await task
+  } finally {
+    if (stopping.get(proc) === task) stopping.delete(proc)
+  }
+}
+
+async function stopProcess(proc: ChildProcess) {
   if (proc.exitCode !== null || proc.signalCode !== null) return
 
   if (process.platform === "win32" && proc.pid) {

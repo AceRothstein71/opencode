@@ -119,6 +119,27 @@ describe("util.process", () => {
     expect(await proc.exited).toBe(0)
   })
 
+  test("coalesces concurrent stop calls into a single signal", async () => {
+    if (process.platform === "win32") return
+    const proc = Process.spawn(node('process.on("SIGTERM", () => process.exit(0)); setInterval(() => {}, 1000)'), {
+      stdin: "ignore",
+      stdout: "ignore",
+      stderr: "ignore",
+    })
+    await new Promise<void>((resolve) => proc.once("spawn", () => resolve()))
+
+    let kills = 0
+    const kill = proc.kill.bind(proc)
+    proc.kill = ((signal?: NodeJS.Signals | number) => {
+      kills++
+      return kill(signal)
+    }) as typeof proc.kill
+
+    await Promise.all([Process.stop(proc), Process.stop(proc), Process.stop(proc)])
+
+    expect(kills).toBe(1)
+  })
+
   test("rejects missing commands without leaking unhandled errors", async () => {
     await using tmp = await tmpdir()
     const cmd = path.join(tmp.path, "missing" + (process.platform === "win32" ? ".cmd" : ""))

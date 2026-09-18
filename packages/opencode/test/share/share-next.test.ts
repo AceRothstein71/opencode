@@ -15,7 +15,7 @@ import type { SessionID } from "../../src/session/schema"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
-import { ShareNext, trimQueue } from "@/share/share-next"
+import { ShareNext, boundQueueMaps, trimQueue } from "@/share/share-next"
 import { SessionShareTable } from "@opencode-ai/core/share/sql"
 import { Database } from "@opencode-ai/core/database/database"
 import { eq } from "drizzle-orm"
@@ -515,6 +515,105 @@ describe("ShareNext", () => {
       { config: { enterprise: { url: "https://legacy-share.example.com" } } },
     ),
   )
+
+  it.live("retries a failed remote unshare on a later sync from another session", () =>
+    provideTmpdirInstance(
+      () => {
+        const deletes: string[] = []
+        const client = HttpClient.make((req) => {
+          if (req.method === "DELETE") {
+            deletes.push(req.url)
+            return Effect.succeed(json(req, { error: "boom" }, 500))
+          }
+          return Effect.succeed(json(req, { ok: true }))
+        })
+        return Effect.gen(function* () {
+          const events = yield* EventV2Bridge.Service
+          const share = yield* ShareNext.Service
+          const session = yield* Session.Service
+          const first = yield* session.create({ title: "first" })
+          const second = yield* session.create({ title: "second" })
+          yield* share.init()
+          yield* Effect.sleep(50)
+          const { db } = yield* Database.Service
+          yield* db
+            .insert(SessionShareTable)
+            .values([
+              { session_id: first.id, id: "shr_first", url: "https://x/first", secret: "sec_first" },
+              { session_id: second.id, id: "shr_second", url: "https://x/second", secret: "sec_second" },
+            ])
+            .run()
+            .pipe(Effect.orDie)
+
+          yield* share.remove(first.id)
+          expect(deletes).toEqual(["https://legacy-share.example.com/api/share/shr_first"])
+
+          yield* events.publish(Session.Event.Diff, {
+            sessionID: second.id,
+            diff: [{ file: "x.ts", patch: "P", additions: 1, deletions: 0, status: "modified" }],
+          })
+          yield* pollWithTimeout(
+            Effect.sync(() => (deletes.length >= 2 ? true : undefined)),
+            "timed out waiting for the remote unshare retry",
+            "5 seconds",
+          )
+
+          expect(deletes).toEqual([
+            "https://legacy-share.example.com/api/share/shr_first",
+            "https://legacy-share.example.com/api/share/shr_first",
+          ])
+        }).pipe(Effect.provide(integrationLayer(client)))
+      },
+      { config: { enterprise: { url: "https://legacy-share.example.com" } } },
+    ),
+  )
+})
+
+describe("ShareNext.boundQueueMaps", () => {
+  const id = (value: string) => value as SessionID
+  const share = (value: string) => ({ id: value, url: value, secret: value })
+
+  test("caps both maps even when every queued session is also shared", () => {
+    const queue = new Map<SessionID, Map<string, { type: string }>>()
+    const shared = new Map<SessionID, ReturnType<typeof share>>()
+    for (let index = 0; index < 300; index++) {
+      queue.set(id(`ses_${index}`), new Map([["session", { type: "session" }]]))
+      shared.set(id(`ses_${index}`), share(`shr_${index}`))
+    }
+
+    const dropped = boundQueueMaps(
+      queue,
+      shared,
+      { inflight: new Set<SessionID>(), scheduled: new Set<SessionID>(), removals: new Map() },
+      10,
+      10,
+    )
+
+    expect(dropped).toEqual({ queuedDropped: 290, sharedDropped: 290 })
+    expect(queue.size).toBe(10)
+    expect(shared.size).toBe(10)
+    expect(queue.has(id("ses_299"))).toBe(true)
+    expect(queue.has(id("ses_0"))).toBe(false)
+    expect(shared.has(id("ses_299"))).toBe(true)
+    expect(shared.has(id("ses_0"))).toBe(false)
+  })
+
+  test("skips sessions with in-flight work so a bound never tears down an active flush", () => {
+    const queue = new Map<SessionID, Map<string, { type: string }>>()
+    const shared = new Map<SessionID, ReturnType<typeof share>>()
+    for (let index = 0; index < 20; index++) {
+      queue.set(id(`ses_${index}`), new Map([["session", { type: "session" }]]))
+      shared.set(id(`ses_${index}`), share(`shr_${index}`))
+    }
+    const scheduled = new Set([id("ses_0"), id("ses_1")])
+
+    boundQueueMaps(queue, shared, { inflight: new Set(), scheduled, removals: new Map() }, 10, 10)
+
+    expect(queue.size).toBe(10)
+    expect(queue.has(id("ses_0"))).toBe(true)
+    expect(queue.has(id("ses_1"))).toBe(true)
+    expect(queue.has(id("ses_2"))).toBe(false)
+  })
 })
 
 describe("ShareNext.trimQueue", () => {

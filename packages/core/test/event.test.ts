@@ -1160,6 +1160,42 @@ describe("EventV2", () => {
     }),
   )
 
+  it.effect("ends a durable stream created after the aggregate was removed", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const aggregateID = Session.ID.create()
+      yield* events.publish(DurableMessage, durableData(aggregateID, "zero"))
+      yield* events.remove(aggregateID)
+
+      const result = yield* events
+        .durable({ aggregateID })
+        .pipe(Stream.runCollect, Effect.timeoutOption("1 second"))
+
+      expect(Option.isSome(result)).toBe(true)
+      if (Option.isSome(result)) expect(Array.from(result.value)).toEqual([])
+    }),
+  )
+
+  it.effect("allows durable streaming after the aggregate is re-created", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const aggregateID = Session.ID.create()
+      yield* events.publish(DurableMessage, durableData(aggregateID, "zero"))
+      yield* events.remove(aggregateID)
+      yield* events.publish(DurableMessage, durableData(aggregateID, "reborn"))
+
+      const result = yield* events
+        .durable({ aggregateID })
+        .pipe(Stream.take(1), Stream.runCollect, Effect.timeoutOption("1 second"))
+
+      expect(Option.isSome(result)).toBe(true)
+      if (!Option.isSome(result)) return
+      const received = Array.from(result.value)
+      expect(received).toHaveLength(1)
+      expect(received[0]?.data).toEqual(durableData(aggregateID, "reborn"))
+    }),
+  )
+
   it.effect("runs every live-only listener and the pubsub fan-out before re-raising the defect", () =>
     Effect.gen(function* () {
       const events = yield* EventV2.Service

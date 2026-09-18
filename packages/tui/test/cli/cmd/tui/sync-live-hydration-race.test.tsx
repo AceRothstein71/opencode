@@ -65,8 +65,17 @@ test("session deletion drops a buffered diff before the page merges", async () =
         properties: { sessionID, info: { ...session, slug: sessionID, projectID: "project" } },
       }),
     )
-    emit(global({ id: "evt_todo_tick", type: "todo.updated", properties: { sessionID, todos: [] } }))
-    await wait(() => sync.data.todo[sessionID] !== undefined)
+    // Barrier: `todo.updated` for the deleted id is now dropped by the tombstone, so wait
+    // on an unrelated session.updated that flushes after the delete in the same batch.
+    const barrierID = "ses_hydration_barrier"
+    emit(
+      global({
+        id: "evt_barrier",
+        type: "session.updated",
+        properties: { sessionID: barrierID, info: { ...session, id: barrierID, slug: barrierID, projectID: "project" } },
+      }),
+    )
+    await wait(() => sync.data.session.some((item) => item.id === barrierID))
     resolveMessages(json([{ info: raceUser, parts: [] }]))
     await hydrate
 

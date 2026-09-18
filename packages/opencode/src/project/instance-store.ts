@@ -67,6 +67,17 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
         return ctx
       }).pipe(Effect.withSpan("InstanceStore.boot"))
 
+    // Explicit lifecycle ops must not tear down resources an active `provide` lease is
+    // using. Wait (bounded) for the lease to drain; after the timeout an operator-explicit
+    // teardown proceeds and logs, so a stuck lease can never deadlock disposal (v8 NEW-05).
+    const LEASE_DRAIN_TIMEOUT_MS = 2_000
+    const awaitLease = (entry: Entry) =>
+      Effect.gen(function* () {
+        const deadline = Date.now() + LEASE_DRAIN_TIMEOUT_MS
+        while (entry.uses > 0 && Date.now() < deadline) yield* Effect.sleep("10 millis")
+        if (entry.uses > 0) yield* Effect.logWarning("instance lease did not drain before disposal", { uses: entry.uses })
+      })
+
     const removeEntry = (directory: string, entry: Entry) =>
       Effect.sync(() => {
         if (cache.get(directory) !== entry) return false
@@ -104,6 +115,8 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
 
     const disposeEntry = Effect.fnUntraced(function* (directory: string, entry: Entry, ctx: InstanceContext) {
       if (cache.get(directory) !== entry) return false
+      yield* awaitLease(entry)
+      if (cache.get(directory) !== entry) return false
       yield* disposeContext(ctx)
       if (cache.get(directory) !== entry) return false
       cache.delete(directory)
@@ -123,7 +136,7 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
       }
     })
 
-    const load = (input: LoadInput): Effect.Effect<InstanceContext> => {
+    const loadEntry = (input: LoadInput): Effect.Effect<{ ctx: InstanceContext; entry: Entry }> => {
       const directory = FSUtil.resolve(input.directory)
       return Effect.uninterruptibleMask((restore) =>
         Effect.gen(function* () {
@@ -131,7 +144,7 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
           if (existing) {
             cache.delete(directory)
             cache.set(directory, existing)
-            return yield* restore(Deferred.await(existing.deferred))
+            return { ctx: yield* restore(Deferred.await(existing.deferred)), entry: existing }
           }
 
           yield* evictStale()
@@ -141,10 +154,16 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
             yield* Effect.logInfo("creating instance", { directory: directory })
             yield* completeLoad(directory, input, entry)
           }).pipe(Effect.forkIn(scope, { startImmediately: true }))
-          return yield* restore(Deferred.await(entry.deferred))
+          return { ctx: yield* restore(Deferred.await(entry.deferred)), entry }
         }),
-      ).pipe(Effect.withSpan("InstanceStore.load"))
+      )
     }
+
+    const load = (input: LoadInput): Effect.Effect<InstanceContext> =>
+      loadEntry(input).pipe(
+        Effect.map((loaded) => loaded.ctx),
+        Effect.withSpan("InstanceStore.load"),
+      )
 
     const reload = (input: LoadInput): Effect.Effect<InstanceContext> => {
       const directory = FSUtil.resolve(input.directory)
@@ -160,6 +179,7 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
             yield* Effect.logInfo("reloading instance", { directory: directory })
             if (previous) {
               yield* Deferred.await(previous.deferred).pipe(Effect.ignore)
+              yield* awaitLease(previous)
               yield* Effect.promise(() => runDisposers(directory))
               yield* emitDisposed({ directory, project: input.project?.id })
             }
@@ -214,16 +234,15 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
 
     const provide = <A, E, R>(input: LoadInput, effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>
       Effect.gen(function* () {
-        const ctx = yield* load(input)
-        // Hold a lease for the effect's lifetime so eviction cannot dispose resources
-        // the effect is still using; released on success, failure, or interruption.
-        const entry = cache.get(ctx.directory)
-        if (entry) entry.uses += 1
+        const { ctx, entry } = yield* loadEntry(input)
+        // Hold the lease on the exact entry the effect is using, not whatever the cache
+        // holds now, so a concurrent reload cannot make the lease land on the wrong entry.
+        entry.uses += 1
         return yield* effect.pipe(
           Effect.provideService(InstanceRef, ctx),
           Effect.ensuring(
             Effect.sync(() => {
-              if (entry) entry.uses = Math.max(0, entry.uses - 1)
+              entry.uses = Math.max(0, entry.uses - 1)
             }),
           ),
         )
