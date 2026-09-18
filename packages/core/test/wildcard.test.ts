@@ -49,4 +49,20 @@ describe("Wildcard.match", () => {
     expect(Wildcard.matchStrict("git push origin main", "git push *")).toBe(true)
     expect(Wildcard.matchStrict("chmod 777 /etc", "chmod *")).toBe(true)
   })
+
+  test("matchStrict refuses pathname globs from inheriting a literal grant", () => {
+    expect(Wildcard.matchStrict("cat */../../../../etc/passwd", "cat *")).toBe(false)
+    expect(Wildcard.matchStrict("cat ?/etc/passwd", "cat *")).toBe(false)
+    expect(Wildcard.matchStrict("cat [a]/etc/passwd", "cat *")).toBe(false)
+    expect(Wildcard.matchStrict("cat a*/../../etc/passwd", "cat *")).toBe(false)
+    expect(Wildcard.matchStrict("rm *", "rm *")).toBe(false)
+    expect(Wildcard.matchStrict("cat foo.txt", "cat *")).toBe(true)
+    expect(Wildcard.matchStrict("rm file.txt", "rm *")).toBe(true)
+  })
+
+  test("matchStrict treats file-path patterns verbatim", () => {
+    expect(Wildcard.matchStrict("src/foo.ts", "src/*")).toBe(true)
+    expect(Wildcard.matchStrict('my"file.txt', "myfile.txt")).toBe(false)
+    expect(Wildcard.matchStrict("myfile.txt", "myfile.txt")).toBe(true)
+  })
 })

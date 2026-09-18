@@ -47,13 +47,25 @@ export function defs(client: Client, timeout?: number) {
 
 export function convertTool(mcpTool: MCPToolDef, client: Client, timeout?: number, server?: string): Tool {
   const bounded = boundSchema(mcpTool.inputSchema)
-  const schema = bounded === BOUNDED ? {} : (bounded as JSONSchema7)
+  // A non-object input schema never reaches here (the MCP SDK zod schema requires an
+  // object), but guard anyway so a malformed or null tool cannot throw a `TypeError`.
+  const schema = typeof bounded === "object" && bounded !== null ? (bounded as JSONSchema7) : {}
+  const properties = (schema.properties ?? {}) as NonNullable<JSONSchema7["properties"]>
+  // Pruning can drop a property while its `required` entry survives, and the root
+  // sets `additionalProperties: false`; the result is a schema no instance can
+  // satisfy, silently making the tool permanently uncallable. Restrict `required`
+  // to keys that still exist, dropping the keyword entirely when none survive.
+  const required = Array.isArray(schema.required)
+    ? schema.required.filter((key): key is string => typeof key === "string" && Object.hasOwn(properties, key))
+    : undefined
   const inputSchema: JSONSchema7 = {
     ...schema,
     type: "object",
-    properties: (schema.properties ?? {}) as JSONSchema7["properties"],
+    properties,
     additionalProperties: false,
   }
+  if (required && required.length > 0) inputSchema.required = required
+  else delete inputSchema.required
 
   return dynamicTool({
     description: describeTool(mcpTool.description, server),
@@ -186,13 +198,25 @@ function boundSchema(
   seen.add(value)
   counter.nodes++
   if (Array.isArray(value)) {
-    return value.flatMap((item) => {
-      const bounded = boundSchema(item, depth + 1, seen, counter)
-      return bounded === BOUNDED ? [] : [bounded]
+    const bounded = value.flatMap((item) => {
+      const child = boundSchema(item, depth + 1, seen, counter)
+      return child === BOUNDED ? [] : [child]
     })
+    // `anyOf`/`oneOf`/`allOf`/`enum` must be non-empty when present. If every member
+    // of a non-empty source array was pruned, return BOUNDED so the *parent* drops
+    // the keyword instead of emitting `[]`, which ajv 2020-12 rejects (`minItems`)
+    // and providers surface as a whole-manifest rejection. A genuinely empty source
+    // array (e.g. `required: []`) is preserved verbatim.
+    if (value.length > 0 && bounded.length === 0) return BOUNDED
+    return bounded
   }
   return Object.fromEntries(
     Object.entries(value).flatMap(([key, item]) => {
+      // Draft-07 tuple form (`items: [a, b]`) is invalid under 2020-12, where `items`
+      // must be a single schema. Normalize conservatively to an unconstrained schema
+      // instead of re-expressing positional constraints; the input was already
+      // non-2020-12, and the bounded output must not be.
+      if (key === "items" && Array.isArray(item)) return [[key, {}]]
       const bounded = boundSchema(item, depth + 1, seen, counter)
       return bounded === BOUNDED ? [] : [[key, bounded]]
     }),

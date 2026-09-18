@@ -20,7 +20,7 @@ import { ConfigMCPV1 } from "@opencode-ai/core/v1/config/mcp"
 import { NamedError } from "@opencode-ai/core/util/error"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
 import { withTimeout } from "@/util/timeout"
-import { sanitizePluginEnv } from "@/util/plugin-env"
+import { sanitizePluginEnv, userPluginEnvAllowlist } from "@/util/plugin-env"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { McpOAuthPendingProvider, McpOAuthProvider, OAUTH_CALLBACK_PATH } from "./oauth-provider"
 import { McpOAuthCallback } from "./oauth-callback"
@@ -380,6 +380,12 @@ const layer = Layer.effect(
           status: { status: "failed" as const, error: `MCP server cwd escapes the workspace: ${cwd}` },
         }
       }
+      const sanitized = sanitizePluginEnv(mcp.environment ?? {}, userPluginEnvAllowlist())
+      if (sanitized.dropped.length > 0)
+        yield* Effect.logWarning("mcp.environment dropped variables not on the allowlist", {
+          key,
+          keys: sanitized.dropped,
+        })
       const transport = new StdioClientTransport({
         stderr: "pipe",
         command: cmd,
@@ -388,7 +394,7 @@ const layer = Layer.effect(
         env: {
           ...process.env,
           ...(cmd === "opencode" ? { BUN_BE_BUN: "1" } : {}),
-          ...sanitizePluginEnv(mcp.environment ?? {}),
+          ...sanitized.env,
         },
       })
 

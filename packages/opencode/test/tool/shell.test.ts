@@ -342,6 +342,56 @@ describe("tool.shell permissions", () => {
     ),
   )
 
+  each("offers no always grant for glob-bearing arguments", () =>
+    Effect.gen(function* () {
+      const tmp = yield* tmpdirScoped()
+      yield* runIn(
+        tmp,
+        Effect.gen(function* () {
+          const requests: Array<Omit<PermissionV1.Request, "id" | "sessionID" | "tool">> = []
+          yield* run({ command: "cat *" }, capture(requests))
+          const bashReq = requests.find((r) => r.permission === "bash")
+          expect(bashReq).toBeDefined()
+          expect(bashReq!.patterns).toContain("cat *")
+          expect(bashReq!.always).not.toContain("cat *")
+        }),
+      )
+    }),
+  )
+
+  each("offers an always grant for literal arguments", () =>
+    Effect.gen(function* () {
+      const tmp = yield* tmpdirScoped()
+      yield* runIn(
+        tmp,
+        Effect.gen(function* () {
+          const requests: Array<Omit<PermissionV1.Request, "id" | "sessionID" | "tool">> = []
+          yield* run({ command: "cat file.txt" }, capture(requests))
+          const bashReq = requests.find((r) => r.permission === "bash")
+          expect(bashReq).toBeDefined()
+          expect(bashReq!.always).toContain("cat *")
+        }),
+      )
+    }),
+  )
+
+  each("scans external directories for a leading-glob traversal argument", () =>
+    Effect.gen(function* () {
+      const tmp = yield* tmpdirScoped()
+      yield* runIn(
+        tmp,
+        Effect.gen(function* () {
+          const err = new Error("stop after permission")
+          const requests: Array<Omit<PermissionV1.Request, "id" | "sessionID" | "tool">> = []
+          expect(
+            yield* fail({ command: "cat */../../../../../../../../etc/passwd" }, capture(requests, err)),
+          ).toMatchObject({ message: err.message })
+          expect(requests.find((r) => r.permission === "external_directory")).toBeDefined()
+        }),
+      )
+    }),
+  )
+
   if (process.platform === "win32") {
     if (bash) {
       it.live("asks for nested bash command permissions [bash]", () =>

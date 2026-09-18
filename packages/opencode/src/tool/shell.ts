@@ -179,6 +179,10 @@ function provider(text: string) {
 function dynamic(text: string, ps: boolean) {
   if (text.startsWith("(") || text.startsWith("@(")) return true
   if (text.includes("$(") || text.includes("${") || text.includes("`")) return true
+  // Pathname expansion is a shell expansion too: the argument the matcher sees
+  // (`cat *`) is not the path the shell executes (`cat /etc/passwd`), so a glob
+  // must never inherit a literal `always` grant.
+  if (/[?*[]/.test(text)) return true
   if (ps) return /\$(?!env:)/i.test(text)
   return text.includes("$")
 }
@@ -188,6 +192,14 @@ function prefix(text: string) {
   if (!match) return text
   if (match.index === 0) return
   return text.slice(0, match.index)
+}
+
+function globAnchor(text: string) {
+  // A leading glob has no literal prefix to resolve. Keep one placeholder segment
+  // per glob metacharacter (so a trailing `..` traversal still cancels correctly),
+  // then drop the final, glob-selected segment. `*` anchors at cwd; `*/../..`
+  // anchors at the directory the traversal reaches, so it is still scanned.
+  return path.dirname(text.replace(/[*?[\]]/g, "_"))
 }
 
 function pathArgs(list: Part[], ps: boolean, cmd = false) {
@@ -373,8 +385,13 @@ export const ShellTool = Tool.define(
 
     const argPath = Effect.fn("ShellTool.argPath")(function* (arg: string, cwd: string, ps: boolean, shell: string) {
       const text = ps ? expand(arg, cwd, shell) : home(unquote(arg))
-      const file = text && prefix(text)
-      if (!file || dynamic(file, ps)) return
+      if (!text) return
+      const file = prefix(text)
+      // A glob at position 0 has no literal prefix, but the shell still expands it
+      // relative to cwd and it can traverse out of the worktree (`*/../../etc`).
+      // Resolve the reachable directory so the external_directory scan still runs.
+      if (!file) return yield* resolvePath(globAnchor(text), cwd, shell)
+      if (dynamic(file, ps)) return
       const next = ps ? provider(file) : file
       if (!next) return
       return yield* resolvePath(next, cwd, shell)
@@ -432,9 +449,14 @@ export const ShellTool = Tool.define(
         { cwd, sessionID: ctx.sessionID, callID: ctx.callID },
         { env: {} },
       )
+      const sanitized = sanitizePluginEnv(extra.env)
+      if (sanitized.dropped.length > 0)
+        yield* Effect.logWarning("dropped plugin shell.env variables not on the allowlist", {
+          keys: sanitized.dropped,
+        })
       return {
         ...process.env,
-        ...sanitizePluginEnv(extra.env),
+        ...sanitized.env,
       }
     })
 

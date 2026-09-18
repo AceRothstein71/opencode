@@ -53,9 +53,11 @@ function glob(pattern: string, strict: boolean) {
   // The strict group refuses a flag in any argument position *and* refuses an
   // argument that still contains a shell expansion after unquoting. `cat $FILE`
   // executes against a path the matcher never saw, and `$(echo -rf) /` can expand
-  // to flags, so neither may inherit a saved `cat *` grant.
+  // to flags, so neither may inherit a saved `cat *` grant. Pathname globs
+  // (`*`, `?`, `[`) are expansions too: `cat */../../etc/passwd` must not match a
+  // saved literal grant as if the glob were an ordinary argument.
   if (escaped.endsWith(" .*"))
-    escaped = escaped.slice(0, -3) + (strict ? "( (?!-)[^\\s$`(){}]*)*" : "( .*)?")
+    escaped = escaped.slice(0, -3) + (strict ? "( (?!-)[^\\s$`(){}*?\\[\\]]*)*" : "( .*)?")
 
   const expression = new RegExp("^" + escaped + "$", process.platform === "win32" ? "si" : "s")
   if (compiled.size >= 512) {
@@ -79,5 +81,10 @@ export function match(input: string, pattern: string) {
  * flag-bearing or expansion-bearing invocations.
  */
 export function matchStrict(input: string, pattern: string) {
-  return glob(unquote(pattern), true).test(unquote(input).replaceAll("\\", "/"))
+  // Shell grants are stored as `"<literal prefix> *"` and must be unquoted so a
+  // quoted flag (`rm "-rf" /`) cannot masquerade as a literal argument. File-path
+  // patterns (external_directory globs, read/write paths) are not shell text, so
+  // match them verbatim — unquoting could collapse distinct filenames.
+  const shell = pattern.endsWith(" *")
+  return glob(shell ? unquote(pattern) : pattern, true).test((shell ? unquote(input) : input).replaceAll("\\", "/"))
 }

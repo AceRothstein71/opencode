@@ -156,6 +156,33 @@ describe("McpCatalog.convertTool bounds untrusted server input", () => {
     expect(() => McpCatalog.convertTool(deep, clientReturning({ content: [], structuredContent: {} }))).not.toThrow()
   })
 
+  const invalidSchemaKeywords = (schema: unknown) => {
+    const invalid: string[] = []
+    const walk = (value: unknown, path: string) => {
+      if (value === null || typeof value !== "object") return
+      if (Array.isArray(value)) return value.forEach((item, index) => walk(item, `${path}[${index}]`))
+      const entries = value as Record<string, unknown>
+      if ("required" in entries && !Array.isArray(entries.required)) invalid.push(`${path}.required`)
+      if ("properties" in entries && (typeof entries.properties !== "object" || Array.isArray(entries.properties)))
+        invalid.push(`${path}.properties`)
+      for (const keyword of ["anyOf", "oneOf", "allOf", "enum"]) {
+        const members = entries[keyword]
+        if (Array.isArray(members) && members.length === 0) invalid.push(`${path}.${keyword}`)
+      }
+      Object.entries(entries).forEach(([key, item]) => walk(item, `${path}.${key}`))
+    }
+    walk(schema, "schema")
+    return invalid
+  }
+
+  const emitted = (inputSchema: unknown) => {
+    const tool = mcpTool()
+    tool.inputSchema = inputSchema
+    return asSchema(
+      McpCatalog.convertTool(tool, clientReturning({ content: [], structuredContent: {} })).inputSchema!,
+    ).jsonSchema as Record<string, unknown>
+  }
+
   test("drops over-budget subtrees instead of emitting invalid JSON Schema keywords", () => {
     const node = (depth: number): Record<string, unknown> =>
       depth === 0
@@ -166,24 +193,63 @@ describe("McpCatalog.convertTool bounds untrusted server input", () => {
             required: ["name"],
           }
 
-    const deep = mcpTool()
-    deep.inputSchema = { type: "object", properties: { data: node(6) }, required: ["data"] }
+    expect(invalidSchemaKeywords(emitted({ type: "object", properties: { data: node(6) }, required: ["data"] }))).toEqual(
+      [],
+    )
+  })
 
-    const tool = McpCatalog.convertTool(deep, clientReturning({ content: [], structuredContent: {} }))
-    const schema = asSchema(tool.inputSchema!).jsonSchema as Record<string, unknown>
+  test("never emits empty anyOf/oneOf/allOf/enum at the depth or node budget boundary", () => {
+    const union = { anyOf: [{ type: "string" }, { type: "number" }] }
+    let depthSchema: Record<string, unknown> = union
+    for (let index = 0; index < 5; index++) depthSchema = { items: depthSchema }
 
-    const invalid: string[] = []
-    const walk = (value: unknown, path: string) => {
-      if (value === null || typeof value !== "object") return
-      if (Array.isArray(value)) return value.forEach((item, index) => walk(item, `${path}[${index}]`))
-      const entries = value as Record<string, unknown>
-      if ("required" in entries && !Array.isArray(entries.required)) invalid.push(`${path}.required`)
-      if ("properties" in entries && (typeof entries.properties !== "object" || Array.isArray(entries.properties)))
-        invalid.push(`${path}.properties`)
-      Object.entries(entries).forEach(([key, item]) => walk(item, `${path}.${key}`))
-    }
-    walk(schema, "schema")
+    const props: Record<string, unknown> = {}
+    for (let index = 0; index < 496; index++) props[`p${index}`] = { type: "string" }
+    props.zzz_enum = { enum: [{ deep: { type: "string" } }, { deep: { type: "string" } }] }
+    props.zzz_union = union
 
-    expect(invalid).toEqual([])
+    expect(invalidSchemaKeywords(emitted({ type: "object", properties: { k: depthSchema } }))).toEqual([])
+    expect(invalidSchemaKeywords(emitted({ type: "object", properties: props }))).toEqual([])
+  })
+
+  test("keeps a cyclic tool callable by dropping required entries whose property was pruned", () => {
+    const cyclic: Record<string, unknown> = { type: "object", properties: { kept: { type: "string" } } }
+    cyclic.properties = { kept: { type: "string" }, self: cyclic }
+    cyclic.required = ["kept", "self"]
+
+    const schema = emitted(cyclic)
+
+    expect(schema.required).toEqual(["kept"])
+    expect(invalidSchemaKeywords(schema)).toEqual([])
+  })
+
+  test("drops a fully pruned required list rather than emitting an unsatisfiable tool", () => {
+    const cyclic: Record<string, unknown> = { type: "object", properties: {} }
+    cyclic.properties = { self: cyclic }
+    cyclic.required = ["self"]
+
+    const schema = emitted(cyclic)
+
+    expect(schema.required).toBeUndefined()
+    expect(schema.additionalProperties).toBe(false)
+  })
+
+  test("normalizes draft-07 tuple items to a single schema", () => {
+    const schema = emitted({
+      type: "object",
+      properties: { k: { type: "array", items: [{ type: "string" }, { type: "number" }] } },
+    })
+
+    expect(schema.properties).toMatchObject({ k: { type: "array", items: {} } })
+    expect(invalidSchemaKeywords(schema)).toEqual([])
+  })
+
+  test("does not throw on a null input schema", () => {
+    const tool = mcpTool()
+    tool.inputSchema = null
+
+    expect(() =>
+      McpCatalog.convertTool(tool, clientReturning({ content: [], structuredContent: {} })),
+    ).not.toThrow()
   })
 })

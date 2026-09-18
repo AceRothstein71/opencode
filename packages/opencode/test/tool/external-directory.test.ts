@@ -11,6 +11,7 @@ import { assertExternalDirectoryEffect } from "../../src/tool/external-directory
 import { Filesystem } from "@/util/filesystem"
 import { TestInstance, tmpdirScoped } from "../fixture/fixture"
 import type { Permission } from "../../src/permission"
+import { evaluate, fromConfig } from "../../src/permission"
 import { SessionID, MessageID } from "../../src/session/schema"
 import { testEffect } from "../lib/effect"
 
@@ -94,6 +95,50 @@ describe("tool.assertExternalDirectory", () => {
       expect(req).toBeDefined()
       expect(req!.patterns).toEqual([expected])
       expect(req!.always).toEqual([expected])
+    }),
+  )
+
+  it.instance("requests the lexical pattern and persists the resolved always grant", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const outside = yield* tmpdirScoped()
+      yield* Effect.promise(() => Bun.write(path.join(outside, "file.txt"), "x"))
+      const alias = path.join(test.directory, "alias")
+      yield* Effect.promise(() => symlink(outside, alias, "dir"))
+      const { requests, ctx } = makeCtx()
+
+      yield* assertExternalDirectoryEffect(ctx, path.join(alias, "file.txt"))
+
+      const req = requests.find((r) => r.permission === "external_directory")
+      expect(req).toBeDefined()
+      expect(req!.patterns).toEqual([glob(path.join(alias, "*"))])
+      expect(req!.always).toEqual([glob(path.join(outside, "*"))])
+    }),
+  )
+
+  it.instance("does not ask when an allow rule matches the lexical alias path", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const outside = yield* tmpdirScoped()
+      yield* Effect.promise(() => Bun.write(path.join(outside, "file.txt"), "x"))
+      const alias = path.join(test.directory, "alias")
+      yield* Effect.promise(() => symlink(outside, alias, "dir"))
+      const ruleset = fromConfig({ external_directory: { [path.join(alias, "*")]: "allow" } })
+      const { requests, ctx } = makeCtx()
+      const next: Tool.Context = {
+        ...ctx,
+        ask: (req) =>
+          Effect.sync(() => {
+            const needsAsk = req.patterns.some(
+              (pattern) => evaluate(req.permission, pattern, ruleset).action !== "allow",
+            )
+            if (needsAsk) requests.push(req)
+          }),
+      }
+
+      yield* assertExternalDirectoryEffect(next, path.join(alias, "file.txt"))
+
+      expect(requests.find((r) => r.permission === "external_directory")).toBeUndefined()
     }),
   )
 
