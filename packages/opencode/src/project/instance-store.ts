@@ -124,6 +124,18 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
       yield* emitDisposed({ directory: ctx.directory, project: ctx.project.id })
     })
 
+    // Release a claimed entry: drop it from the cache (only if it is still the cached one, so a
+    // reload that already installed a replacement is not clobbered) and resolve `closed` so a
+    // `provide` waiting on the claim can reload. Must be uninterruptible: the whole point is that
+    // this runs even when the teardown around it is interrupted or times out (REGRESSION-2).
+    const releaseClaim = (directory: string, entry: Entry) =>
+      Effect.uninterruptible(
+        Effect.gen(function* () {
+          if (cache.get(directory) === entry) cache.delete(directory)
+          yield* Deferred.succeed(entry.closed, undefined)
+        }),
+      )
+
     const disposeEntry = Effect.fnUntraced(function* (directory: string, entry: Entry, ctx: InstanceContext) {
       if (cache.get(directory) !== entry) return false
       // Claim the entry in one synchronous step, *before* draining. Setting `disposed` makes
@@ -144,15 +156,16 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
       // an explicit dispose that aborted here would silently strand the prompt (R-V10-01). A
       // stuck lease can never deadlock disposal (v8 NEW-05); the W5 handshake above keeps a
       // provide-after-dispose from ever using the disposed context.
-      yield* awaitLease(entry)
-      yield* disposeContext(ctx).pipe(
-        Effect.ensuring(
-          Effect.gen(function* () {
-            if (cache.get(directory) === entry) cache.delete(directory)
-            yield* Deferred.succeed(entry.closed, undefined)
-          }),
-        ),
-      )
+      //
+      // The `ensuring` wraps the *whole* post-claim region, not just `disposeContext`: an
+      // interrupt or timeout inside `awaitLease` used to skip the finalizer entirely (the claim
+      // is synchronous, the finalizer was attached after the drain), leaving `disposed=true`
+      // with `closed` pending and the entry cached, so every later `provide` for this directory
+      // awaited `closed` forever (REGRESSION-2). The finalizer must always run.
+      yield* Effect.gen(function* () {
+        yield* awaitLease(entry)
+        yield* disposeContext(ctx)
+      }).pipe(Effect.ensuring(releaseClaim(directory, entry)))
       return true
     })
 
@@ -216,6 +229,13 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
               yield* awaitLease(reusable)
               yield* Effect.promise(() => runDisposers(directory))
               yield* emitDisposed({ directory, project: input.project?.id })
+            } else if (previous) {
+              // The previous entry is already claimed by a draining `disposeEntry`. Its late
+              // teardown runs the directory-global disposers, so booting the replacement before
+              // it finishes would tear the fresh entry's resources down (NEW-V11-07). `closed`
+              // resolves after that teardown (or immediately if it was interrupted), so await it
+              // to serialize reload against a claimed entry.
+              yield* Deferred.await(previous.closed)
             }
             yield* completeLoad(directory, input, entry)
           }).pipe(Effect.forkIn(scope, { startImmediately: true }))

@@ -1,7 +1,7 @@
 import { describe, expect } from "bun:test"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
-import { Deferred, Effect, Fiber, Layer } from "effect"
+import { Deferred, Effect, Fiber, Layer, Option } from "effect"
 import { InstanceRef } from "../../src/effect/instance-ref"
 import { registerDisposer } from "../../src/effect/instance-registry"
 import { InstanceBootstrap } from "../../src/project/bootstrap"
@@ -445,6 +445,153 @@ describe("InstanceStore", () => {
       expect(captured).toBeDefined()
       expect(captured).not.toBe(ctx)
     }),
+  )
+
+  it.live(
+    "an interrupted dispose during the drain does not strand later provides (REGRESSION-2)",
+    () =>
+      Effect.gen(function* () {
+        const dir = yield* tmpdirScoped({ git: true })
+        const store = yield* InstanceStore.Service
+
+        for (let round = 0; round < 3; round++) {
+          const ctx = yield* store.load({ directory: dir })
+          const leased = yield* Deferred.make<void>()
+          const held = yield* store
+            .provide(
+              { directory: dir },
+              Effect.gen(function* () {
+                yield* Deferred.succeed(leased, undefined)
+                yield* Effect.never
+              }),
+            )
+            .pipe(Effect.forkScoped)
+          yield* Deferred.await(leased)
+
+          // The claim is set synchronously, then dispose blocks in the bounded drain while the
+          // lease is held; interrupt it inside that window. Before the fix the `ensuring` lived on
+          // `disposeContext`, which is never reached, so `closed` stayed pending forever.
+          const interrupted = yield* store.dispose(ctx).pipe(Effect.timeoutOption("300 millis"))
+          expect(Option.isNone(interrupted)).toBe(true)
+
+          // A later provide must resolve to a fresh, live context instead of awaiting `closed`.
+          let captured: unknown
+          const provided = yield* store
+            .provide(
+              { directory: dir },
+              Effect.gen(function* () {
+                captured = yield* InstanceRef
+              }),
+            )
+            .pipe(Effect.timeoutOption("4 seconds"))
+          expect(Option.isSome(provided)).toBe(true)
+          expect(captured).toBeDefined()
+          expect(captured).not.toBe(ctx)
+
+          yield* Fiber.interrupt(held)
+        }
+      }),
+    30_000,
+  )
+
+  it.live(
+    "reload waits for a draining dispose before booting the replacement (NEW-V11-07)",
+    () =>
+      Effect.gen(function* () {
+        const dir = yield* tmpdirScoped({ git: true })
+        const store = yield* InstanceStore.Service
+        const events: string[] = []
+        yield* registerDisposerScoped(async (directory) => {
+          events.push("dispose")
+        })
+        yield* setBootstrap(
+          Effect.sync(() => {
+            events.push("boot")
+          }),
+        )
+
+        const first = yield* store.load({ directory: dir })
+        const leased = yield* Deferred.make<void>()
+        const held = yield* store
+          .provide(
+            { directory: dir },
+            Effect.gen(function* () {
+              yield* Deferred.succeed(leased, undefined)
+              yield* Effect.never
+            }),
+          )
+          .pipe(Effect.forkScoped)
+        yield* Deferred.await(leased)
+
+        const disposing = yield* store.dispose(first).pipe(Effect.forkScoped)
+        yield* Effect.sleep("300 millis")
+        const reloaded = yield* store.reload({ directory: dir }).pipe(Effect.timeoutOption("10 seconds"))
+        yield* Fiber.join(disposing)
+
+        // boot (first) -> dispose (the claimed entry's late teardown) -> boot (replacement):
+        // the replacement is only booted after the directory-global disposers have run.
+        expect(Option.isSome(reloaded)).toBe(true)
+        expect(events).toEqual(["boot", "dispose", "boot"])
+
+        yield* Fiber.interrupt(held)
+      }),
+    30_000,
+  )
+
+  it.live(
+    "a reload racing a dispose never tears down the fresh entry (NEW-V11-07)",
+    () =>
+      Effect.gen(function* () {
+        const store = yield* InstanceStore.Service
+        const events: string[] = []
+        yield* registerDisposerScoped(async (directory) => {
+          events.push("dispose")
+        })
+        yield* setBootstrap(
+          Effect.sync(() => {
+            events.push("boot")
+          }),
+        )
+
+        for (let round = 0; round < 4; round++) {
+          events.length = 0
+          const dir = yield* tmpdirScoped({ git: true })
+          const first = yield* store.load({ directory: dir })
+          const leased = yield* Deferred.make<void>()
+          const held = yield* store
+            .provide(
+              { directory: dir },
+              Effect.gen(function* () {
+                yield* Deferred.succeed(leased, undefined)
+                yield* Effect.never
+              }),
+            )
+            .pipe(Effect.forkScoped)
+          yield* Deferred.await(leased)
+
+          const disposing = yield* store.dispose(first).pipe(Effect.forkScoped)
+          // Alternate the head start so both the dispose-claims-first and reload-first orderings
+          // are exercised; the odd rounds deterministically open the claimed-but-not-closed window.
+          if (round % 2 === 1) yield* Effect.sleep("50 millis")
+          const reloaded = yield* store.reload({ directory: dir }).pipe(Effect.timeoutOption("10 seconds"))
+          yield* Fiber.join(disposing)
+          expect(Option.isSome(reloaded)).toBe(true)
+          if (Option.isSome(reloaded)) expect(reloaded.value).not.toBe(first)
+
+          // Whichever side wins the race, the last lifecycle event is the replacement's boot:
+          // the old teardown ran before it, never after.
+          expect(events.at(-1)).toBe("boot")
+          expect(events.filter((event) => event === "dispose")).toHaveLength(1)
+
+          const alive = yield* store
+            .provide({ directory: dir }, Effect.succeed("alive" as const))
+            .pipe(Effect.timeoutOption("4 seconds"))
+          expect(Option.isSome(alive)).toBe(true)
+
+          yield* Fiber.interrupt(held)
+        }
+      }),
+    60_000,
   )
 
   it.live(

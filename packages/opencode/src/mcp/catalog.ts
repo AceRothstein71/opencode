@@ -213,9 +213,35 @@ const SCHEMA_VALUE_KEYWORDS = new Set([
   "if",
   "then",
   "else",
+  "contentSchema",
 ])
 // Keywords whose value is an array of schemas.
 const SCHEMA_ARRAY_KEYWORDS = new Set(["anyOf", "oneOf", "allOf"])
+// Numeric keywords that must be non-negative integers, and those that must be finite numbers.
+// A wrongly-typed bound makes the whole document meta-invalid and ajv refuses to compile it.
+const NON_NEGATIVE_INTEGER_KEYWORDS = new Set([
+  "minLength",
+  "maxLength",
+  "minItems",
+  "maxItems",
+  "minProperties",
+  "maxProperties",
+  "minContains",
+  "maxContains",
+])
+const NUMBER_KEYWORDS = new Set(["minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf"])
+// String- and boolean-valued keywords; a wrong type is meta-invalid.
+const STRING_KEYWORDS = new Set([
+  "pattern",
+  "format",
+  "contentEncoding",
+  "contentMediaType",
+  "$comment",
+  "$id",
+  "$anchor",
+  "$dynamicAnchor",
+])
+const BOOLEAN_KEYWORDS = new Set(["uniqueItems", "deprecated", "readOnly", "writeOnly"])
 
 const isPlainObject = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value)
@@ -324,6 +350,56 @@ function boundSchema(
         out[key] = bounded
         continue
       }
+      if (key === "$dynamicRef") {
+        // ajv only resolves hash-fragment dynamic refs; an absolute/flat form is rejected.
+        if (typeof bounded === "string" && bounded.startsWith("#")) out[key] = bounded
+        continue
+      }
+      if (SCHEMA_ARRAY_KEYWORDS.has(key)) {
+        // Array members must themselves be schemas (object or boolean). `prefixItems` already
+        // filters, but `anyOf`/`oneOf`/`allOf` emitted a non-schema member verbatim, which is
+        // meta-invalid and makes ajv refuse the whole manifest (NEW-V11-03).
+        if (!Array.isArray(bounded)) continue
+        const members = bounded.filter(isSchema)
+        if (members.length > 0) out[key] = members
+        continue
+      }
+      if (key === "enum") {
+        if (Array.isArray(bounded) && bounded.length > 0) out[key] = bounded
+        continue
+      }
+      if (key === "examples") {
+        if (Array.isArray(bounded)) out[key] = bounded
+        continue
+      }
+      if (NON_NEGATIVE_INTEGER_KEYWORDS.has(key)) {
+        if (typeof bounded === "number" && Number.isInteger(bounded) && bounded >= 0) out[key] = bounded
+        continue
+      }
+      if (NUMBER_KEYWORDS.has(key)) {
+        if (typeof bounded !== "number" || !Number.isFinite(bounded)) continue
+        if (key === "multipleOf" && bounded <= 0) continue
+        out[key] = bounded
+        continue
+      }
+      if (key === "pattern") {
+        if (typeof bounded !== "string") continue
+        try {
+          new RegExp(bounded)
+        } catch {
+          continue
+        }
+        out[key] = bounded
+        continue
+      }
+      if (STRING_KEYWORDS.has(key)) {
+        if (typeof bounded === "string") out[key] = bounded
+        continue
+      }
+      if (BOOLEAN_KEYWORDS.has(key)) {
+        if (typeof bounded === "boolean") out[key] = bounded
+        continue
+      }
       if (NON_EMPTY_ARRAY_KEYWORDS.has(key) && Array.isArray(bounded) && bounded.length === 0) continue
       if (SCHEMA_MAP_KEYWORDS.has(key)) {
         if (!isPlainObject(bounded)) continue
@@ -407,7 +483,13 @@ function dropDanglingRefs(
   if (!isPlainObject(value)) return
   for (const [key, item] of Object.entries(value)) {
     if (kind === "schema" && key === "$ref") {
-      if (typeof item !== "string" || !item.startsWith("#")) continue
+      // Only local `#` pointers are resolvable in the emitted document. `urn:`/relative/
+      // absolute refs make ajv (and strict providers) reject the whole manifest, so drop
+      // them along with genuinely dangling local pointers (NEW-V11-04).
+      if (typeof item !== "string" || !item.startsWith("#")) {
+        delete value[key]
+        continue
+      }
       const def = /^#\/(\$defs|definitions)\/([^/]+)$/.exec(item)
       if (def) {
         if (!defs.get(def[1])?.has(def[2])) delete value[key]

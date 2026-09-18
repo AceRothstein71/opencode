@@ -389,6 +389,113 @@ describe("McpCatalog.convertTool bounds untrusted server input", () => {
     expect(() => new Ajv2020({ strict: false }).compile(schema)).not.toThrow()
   })
 
+  test("drops non-schema members of anyOf/oneOf/allOf but preserves boolean schemas", () => {
+    const schema = emitted({
+      type: "object",
+      properties: {
+        k: {
+          type: ["string", "notatype", null],
+          anyOf: [{ type: "string" }, 1, null, "x", true],
+          oneOf: ["x", { type: "number" }],
+          allOf: [null],
+        },
+      },
+    })
+    const k = (schema.properties as Record<string, Record<string, unknown>>).k
+
+    expect(k.type).toEqual(["string"])
+    expect(k.anyOf).toEqual([{ type: "string" }, true])
+    expect(k.oneOf).toEqual([{ type: "number" }])
+    expect(k.allOf).toBeUndefined()
+    expect(() => new Ajv2020({ strict: false }).compile(schema)).not.toThrow()
+  })
+
+  test("drops source-typed bounds, contentSchema, enum and ref forms that ajv refuses", () => {
+    const schema = emitted({
+      type: "object",
+      properties: {
+        k: {
+          type: "string",
+          minLength: "x",
+          maxItems: -1,
+          minProperties: 1.5,
+          multipleOf: 0,
+          maximum: "x",
+          pattern: 5,
+          contentEncoding: 5,
+          format: 5,
+          uniqueItems: "x",
+          examples: 5,
+          enum: 5,
+          contentSchema: { required: { a: 1 } },
+          $dynamicRef: "urn:example:x",
+          $ref: "urn:example:x",
+        },
+        regex: { type: "string", pattern: "(" },
+        valid: {
+          type: "string",
+          minLength: 2,
+          maxItems: 3,
+          pattern: "^a+$",
+          contentEncoding: "base64",
+          format: "email",
+          uniqueItems: true,
+          examples: [1],
+        },
+      },
+    })
+    const props = schema.properties as Record<string, Record<string, unknown>>
+
+    for (const keyword of [
+      "minLength",
+      "maxItems",
+      "minProperties",
+      "multipleOf",
+      "maximum",
+      "pattern",
+      "contentEncoding",
+      "format",
+      "uniqueItems",
+      "examples",
+      "enum",
+      "$dynamicRef",
+      "$ref",
+    ])
+      expect(props.k[keyword]).toBeUndefined()
+    expect(props.k.contentSchema).toEqual({})
+    expect(props.regex.pattern).toBeUndefined()
+    expect(props.valid).toMatchObject({
+      minLength: 2,
+      maxItems: 3,
+      pattern: "^a+$",
+      contentEncoding: "base64",
+      format: "email",
+      uniqueItems: true,
+      examples: [1],
+    })
+    expect(() => new Ajv2020({ strict: false }).compile(schema)).not.toThrow()
+  })
+
+  test("drops refs that are not resolvable local pointers", () => {
+    const schema = emitted({
+      type: "object",
+      properties: {
+        urn: { $ref: "urn:example:x" },
+        relative: { $ref: "other.json#/A" },
+        absolute: { $ref: "https://example.com/x" },
+        local: { $ref: "#/$defs/Kept" },
+      },
+      $defs: { Kept: { type: "string" } },
+    })
+    const props = schema.properties as Record<string, Record<string, unknown>>
+
+    expect(props.urn.$ref).toBeUndefined()
+    expect(props.relative.$ref).toBeUndefined()
+    expect(props.absolute.$ref).toBeUndefined()
+    expect(props.local.$ref).toBe("#/$defs/Kept")
+    expect(() => new Ajv2020({ strict: false }).compile(schema)).not.toThrow()
+  })
+
   test("accepts only refs that resolve from the top-level document", () => {
     const schema = emitted({
       type: "object",
