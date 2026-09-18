@@ -46,11 +46,12 @@ export function defs(client: Client, timeout?: number) {
 }
 
 export function convertTool(mcpTool: MCPToolDef, client: Client, timeout?: number, server?: string): Tool {
-  const bounded = boundSchema(mcpTool.inputSchema) as JSONSchema7
+  const bounded = boundSchema(mcpTool.inputSchema)
+  const schema = bounded === BOUNDED ? {} : (bounded as JSONSchema7)
   const inputSchema: JSONSchema7 = {
-    ...bounded,
+    ...schema,
     type: "object",
-    properties: (bounded.properties ?? {}) as JSONSchema7["properties"],
+    properties: (schema.properties ?? {}) as JSONSchema7["properties"],
     additionalProperties: false,
   }
 
@@ -162,19 +163,39 @@ function describeTool(description: string | undefined, server: string | undefine
   return server ? `[${server}] ${capped}` : capped
 }
 
-// `{}` means "allow anything" in JSON Schema, so a bound that returns it *widens*
-// validation. Return an unsatisfiable schema instead: exceeding the depth/node cap
-// or hitting a cycle must reject that subtree, not accept it unchecked.
-const UNSATISFIABLE: JSONSchema7 = { not: {} }
+// A hostile MCP server controls its own input schema, so bound its depth and node
+// count to keep it from dominating the prompt or forcing pathological serialization.
+// When a subtree exceeds the bound (or cycles) DROP it rather than substituting a
+// placeholder: `{}` widens validation, while any non-array placeholder substituted
+// into an array-valued keyword (`required: {}`) or a schema-object keyword
+// (`properties: { not: {} }`) emits invalid JSON Schema — strict providers then
+// reject the whole tool manifest (Anthropic: "must match JSON Schema draft
+// 2020-12"; Meta/OpenRouter: "not valid under any of the schemas"). Dropping keeps
+// the bounded document valid; the omitted subtree simply stops constraining.
+const BOUNDED = Symbol("opencode.mcp.boundedSchema")
+type Bounded = typeof BOUNDED
 
-function boundSchema(value: unknown, depth = 0, seen = new WeakSet<object>(), counter = { nodes: 0 }): unknown {
+function boundSchema(
+  value: unknown,
+  depth = 0,
+  seen = new WeakSet<object>(),
+  counter = { nodes: 0 },
+): unknown | Bounded {
   if (value === null || typeof value !== "object") return value
-  if (depth > MAX_SCHEMA_DEPTH || counter.nodes >= MAX_SCHEMA_NODES || seen.has(value)) return UNSATISFIABLE
+  if (depth > MAX_SCHEMA_DEPTH || counter.nodes >= MAX_SCHEMA_NODES || seen.has(value)) return BOUNDED
   seen.add(value)
   counter.nodes++
-  if (Array.isArray(value)) return value.map((item) => boundSchema(item, depth + 1, seen, counter))
+  if (Array.isArray(value)) {
+    return value.flatMap((item) => {
+      const bounded = boundSchema(item, depth + 1, seen, counter)
+      return bounded === BOUNDED ? [] : [bounded]
+    })
+  }
   return Object.fromEntries(
-    Object.entries(value).map(([key, item]) => [key, boundSchema(item, depth + 1, seen, counter)]),
+    Object.entries(value).flatMap(([key, item]) => {
+      const bounded = boundSchema(item, depth + 1, seen, counter)
+      return bounded === BOUNDED ? [] : [[key, bounded]]
+    }),
   )
 }
 

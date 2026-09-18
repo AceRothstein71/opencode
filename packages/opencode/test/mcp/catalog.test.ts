@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test"
+import { asSchema } from "ai"
 import { Client } from "@modelcontextprotocol/sdk/client/index.js"
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js"
 import { Server } from "@modelcontextprotocol/sdk/server/index.js"
@@ -153,5 +154,36 @@ describe("McpCatalog.convertTool bounds untrusted server input", () => {
     deep.inputSchema = schema
 
     expect(() => McpCatalog.convertTool(deep, clientReturning({ content: [], structuredContent: {} }))).not.toThrow()
+  })
+
+  test("drops over-budget subtrees instead of emitting invalid JSON Schema keywords", () => {
+    const node = (depth: number): Record<string, unknown> =>
+      depth === 0
+        ? { type: "object", properties: { name: { type: "string" } }, required: ["name"] }
+        : {
+            type: "object",
+            properties: { name: { type: "string" }, children: { type: "array", items: node(depth - 1) } },
+            required: ["name"],
+          }
+
+    const deep = mcpTool()
+    deep.inputSchema = { type: "object", properties: { data: node(6) }, required: ["data"] }
+
+    const tool = McpCatalog.convertTool(deep, clientReturning({ content: [], structuredContent: {} }))
+    const schema = asSchema(tool.inputSchema!).jsonSchema as Record<string, unknown>
+
+    const invalid: string[] = []
+    const walk = (value: unknown, path: string) => {
+      if (value === null || typeof value !== "object") return
+      if (Array.isArray(value)) return value.forEach((item, index) => walk(item, `${path}[${index}]`))
+      const entries = value as Record<string, unknown>
+      if ("required" in entries && !Array.isArray(entries.required)) invalid.push(`${path}.required`)
+      if ("properties" in entries && (typeof entries.properties !== "object" || Array.isArray(entries.properties)))
+        invalid.push(`${path}.properties`)
+      Object.entries(entries).forEach(([key, item]) => walk(item, `${path}.${key}`))
+    }
+    walk(schema, "schema")
+
+    expect(invalid).toEqual([])
   })
 })
