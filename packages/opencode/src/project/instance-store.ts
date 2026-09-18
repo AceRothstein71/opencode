@@ -38,6 +38,13 @@ interface Entry {
   disposed: boolean
   /** Resolves when a claimed teardown finished and the entry left the cache. */
   readonly closed: Deferred.Deferred<void>
+  /**
+   * Resolves when this entry's directory-global `runDisposers` settles, even if the teardown
+   * fiber was interrupted while it was in flight.
+   */
+  readonly teardown: Deferred.Deferred<void>
+  /** Whether this entry's claim reached `runDisposers`, so `teardown` settles on its own. */
+  teardownStarted: boolean
 }
 
 const makeEntry = (): Entry => ({
@@ -45,6 +52,8 @@ const makeEntry = (): Entry => ({
   uses: 0,
   disposed: false,
   closed: Deferred.makeUnsafe<void>(),
+  teardown: Deferred.makeUnsafe<void>(),
+  teardownStarted: false,
 })
 
 const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Service> = Layer.effect(
@@ -57,6 +66,10 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
     // file-search index), so the cache is bounded and evicts the oldest done entry.
     const MAX_CACHED_INSTANCES = 16
     const cache = new Map<string, Entry>()
+    // Disposers are directory-global and keep running after an interrupt, even though the
+    // interrupted entry has already left `cache`. Track those in-flight teardowns by directory
+    // so a `reload` can wait for them before booting a replacement (NEW-V12-06).
+    const teardowns = new Map<string, Set<Entry>>()
 
     const boot = (input: LoadInput & { directory: string }) =>
       Effect.gen(function* () {
@@ -118,11 +131,37 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
         }),
       )
 
-    const disposeContext = Effect.fn("InstanceStore.disposeContext")(function* (ctx: InstanceContext) {
+    const disposeContext = Effect.fn("InstanceStore.disposeContext")(function* (ctx: InstanceContext, entry?: Entry) {
       yield* Effect.logInfo("disposing instance", { directory: ctx.directory })
-      yield* Effect.promise(() => runDisposers(ctx.directory))
+      const teardown = yield* Effect.sync(() => {
+        const promise = runDisposers(ctx.directory)
+        if (entry) {
+          entry.teardownStarted = true
+          const pending = teardowns.get(ctx.directory) ?? new Set<Entry>()
+          pending.add(entry)
+          teardowns.set(ctx.directory, pending)
+          const settle = () => {
+            const active = teardowns.get(ctx.directory)
+            if (active) {
+              active.delete(entry)
+              if (active.size === 0) teardowns.delete(ctx.directory)
+            }
+            Deferred.doneUnsafe(entry.teardown, Effect.void)
+          }
+          promise.then(settle, settle)
+        }
+        return promise
+      })
+      yield* Effect.promise(() => teardown)
       yield* emitDisposed({ directory: ctx.directory, project: ctx.project.id })
     })
+
+    const awaitTeardowns = (directory: string) =>
+      Effect.gen(function* () {
+        const pending = teardowns.get(directory)
+        if (!pending || pending.size === 0) return
+        yield* Effect.forEach([...pending], (entry) => Deferred.await(entry.teardown), { discard: true })
+      })
 
     // Release a claimed entry: drop it from the cache (only if it is still the cached one, so a
     // reload that already installed a replacement is not clobbered) and resolve `closed` so a
@@ -131,6 +170,9 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
     const releaseClaim = (directory: string, entry: Entry) =>
       Effect.uninterruptible(
         Effect.gen(function* () {
+          // A claim interrupted before it reached the disposers has no teardown left to wait
+          // for; resolve the gate so a reload does not wait on a run that never started.
+          if (!entry.teardownStarted) yield* Deferred.succeed(entry.teardown, undefined)
           if (cache.get(directory) === entry) cache.delete(directory)
           yield* Deferred.succeed(entry.closed, undefined)
         }),
@@ -164,7 +206,7 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
       // awaited `closed` forever (REGRESSION-2). The finalizer must always run.
       yield* Effect.gen(function* () {
         yield* awaitLease(entry)
-        yield* disposeContext(ctx)
+        yield* disposeContext(ctx, entry)
       }).pipe(Effect.ensuring(releaseClaim(directory, entry)))
       return true
     })
@@ -237,6 +279,11 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
               // to serialize reload against a claimed entry.
               yield* Deferred.await(previous.closed)
             }
+            // An interrupted teardown resolves `closed` immediately while its disposers keep
+            // running, and its entry is already gone from the cache, so the check above cannot
+            // see it. Wait for every directory-global teardown still in flight before booting
+            // the replacement (NEW-V12-06).
+            yield* awaitTeardowns(directory)
             yield* completeLoad(directory, input, entry)
           }).pipe(Effect.forkIn(scope, { startImmediately: true }))
           return yield* restore(Deferred.await(entry.deferred))

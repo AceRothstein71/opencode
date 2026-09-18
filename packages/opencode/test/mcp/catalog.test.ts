@@ -496,6 +496,132 @@ describe("McpCatalog.convertTool bounds untrusted server input", () => {
     expect(() => new Ajv2020({ strict: false }).compile(schema)).not.toThrow()
   })
 
+  test("never emits a schema map whose hostile keys inject a prototype", () => {
+    const schema = emitted(
+      JSON.parse(
+        '{"type":"object","properties":{"__proto__":{"type":"string"},"constructor":{"type":"number"},"prototype":{"type":"boolean"}},"$defs":{"__proto__":{"type":"string"}}}',
+      ),
+    )
+    const properties = schema.properties as Record<string, unknown>
+    const defs = schema.$defs as Record<string, unknown>
+
+    expect(Object.hasOwn(properties, "__proto__")).toBe(true)
+    expect(Object.hasOwn(properties, "constructor")).toBe(true)
+    expect(Object.hasOwn(properties, "prototype")).toBe(true)
+    expect(Object.hasOwn(defs, "__proto__")).toBe(true)
+    expect(Object.getPrototypeOf(properties)).not.toBe(Object.prototype)
+    expect(Object.keys(Object.prototype)).toEqual([])
+    expect(() => new Ajv2020({ strict: false }).compile(schema)).not.toThrow()
+  })
+
+  test("drops keyword values that make the emitted document uncompilable", () => {
+    const hostile: Array<[string, Record<string, unknown>]> = [
+      ["invalid $anchor", { type: "object", properties: { p: { $anchor: "not valid!" } } }],
+      ["invalid $dynamicAnchor", { type: "object", properties: { p: { $dynamicAnchor: "1bad" } } }],
+      ["invalid root $anchor", { $anchor: "bad name", type: "object" }],
+      ["invalid anchor in $defs", { type: "object", $defs: { D: { $anchor: "1 bad", type: "string" } } }],
+      ["$anchor wrong type", { type: "object", properties: { p: { $anchor: 5 } } }],
+      ["$schema wrong type", { $schema: 5, type: "object" }],
+      ["$schema bogus", { $schema: "bogus", type: "object" }],
+      ["$schema unresolvable dialect", { $schema: "https://json-schema.org/draft/2019-09/schema", type: "object" }],
+      ["nested bogus $schema", { type: "object", properties: { p: { $schema: "bogus" } } }],
+      ["$vocabulary wrong type", { type: "object", $vocabulary: 5 }],
+      [
+        "$vocabulary non-boolean member",
+        { type: "object", $vocabulary: { "https://json-schema.org/draft/2020-12/vocab/core": 5 } },
+      ],
+      ["invalid patternProperties key", { type: "object", patternProperties: { "(": { type: "string" } } }],
+      ["invalid nested patternProperties key", { type: "object", properties: { p: { patternProperties: { "[a": {} } } } }],
+      ["non-string title", { type: "object", title: 7 }],
+      ["non-string description", { type: "object", description: [] }],
+      ["non-string nested title", { type: "object", properties: { p: { title: 7 } } }],
+      [
+        "malformed urn $id",
+        {
+          $id: "urn:root",
+          type: "object",
+          $defs: { A: { type: "string" } },
+          properties: { a: { $ref: "#/$defs/A" } },
+        },
+      ],
+      ["interior fragment $id", { $id: "foo#bar", type: "object" }],
+      ["$schema inside contentSchema", { type: "object", properties: { p: { contentSchema: { $schema: 5 } } } }],
+      [
+        "invalid anchor inside contentSchema",
+        { type: "object", properties: { p: { contentSchema: { $anchor: "no good" } } } },
+      ],
+      ["title inside contentSchema", { type: "object", properties: { p: { contentSchema: { title: 7 } } } }],
+      [
+        "hostile keywords inside $defs and allOf members",
+        {
+          type: "object",
+          $defs: { D: { $schema: "bogus", title: 7, patternProperties: { "(": {} } } },
+          properties: { p: { allOf: [{ $anchor: "bad name" }, { $vocabulary: 5 }] } },
+        },
+      ],
+    ]
+
+    for (const [label, input] of hostile) {
+      const schema = emitted(input)
+      try {
+        new Ajv2020({ strict: false }).compile(schema)
+      } catch (error) {
+        throw new Error(`${label}: ${(error as Error).message}\n${JSON.stringify(schema)}`)
+      }
+    }
+  })
+
+  test("preserves resolvable dialects, anchors, ids and string metadata", () => {
+    const schema = emitted({
+      $schema: "https://json-schema.org/draft/2020-12/schema",
+      $id: "https://example.com/schema.json",
+      title: "Tool",
+      description: "A tool",
+      type: "object",
+      properties: {
+        p: {
+          $anchor: "good-anchor_1",
+          patternProperties: { "^a": { type: "string" } },
+        },
+        urn: { $id: "urn:example:x", type: "string" },
+      },
+      $vocabulary: { "https://json-schema.org/draft/2020-12/vocab/core": true, dropped: 5 },
+    })
+
+    expect(schema.$schema).toBe("https://json-schema.org/draft/2020-12/schema")
+    expect(schema.$id).toBe("https://example.com/schema.json")
+    expect(schema.title).toBe("Tool")
+    expect(schema.description).toBe("A tool")
+    expect(schema.$vocabulary).toEqual({ "https://json-schema.org/draft/2020-12/vocab/core": true })
+    const props = schema.properties as Record<string, Record<string, unknown>>
+    expect(props.p.$anchor).toBe("good-anchor_1")
+    expect(props.p.patternProperties).toEqual({ "^a": { type: "string" } })
+    expect(props.urn.$id).toBe("urn:example:x")
+    expect(() => new Ajv2020({ strict: false }).compile(schema)).not.toThrow()
+  })
+
+  test("sanitizes the same keyword families at every container", () => {
+    const schema = emitted({
+      type: "object",
+      $defs: { D: { title: 7, $anchor: "bad name", patternProperties: { "(": {} } } },
+      patternProperties: { "[a": { title: 7 }, "^ok": { $anchor: "fine_1" } },
+      properties: { p: { contentSchema: { $schema: 5, title: 7 }, items: { $vocabulary: 5 } } },
+    })
+    const defs = schema.$defs as Record<string, Record<string, unknown>>
+    const patterns = schema.patternProperties as Record<string, Record<string, unknown>>
+    const p = (schema.properties as Record<string, Record<string, unknown>>).p
+
+    expect(defs.D.title).toBeUndefined()
+    expect(defs.D.$anchor).toBeUndefined()
+    expect(defs.D.patternProperties).toEqual({})
+    expect(Object.hasOwn(patterns, "[a")).toBe(false)
+    expect(patterns["^ok"].$anchor).toBe("fine_1")
+    expect((p.contentSchema as Record<string, unknown>).$schema).toBeUndefined()
+    expect((p.contentSchema as Record<string, unknown>).title).toBeUndefined()
+    expect((p.items as Record<string, unknown>).$vocabulary).toBeUndefined()
+    expect(() => new Ajv2020({ strict: false }).compile(schema)).not.toThrow()
+  })
+
   test("accepts only refs that resolve from the top-level document", () => {
     const schema = emitted({
       type: "object",

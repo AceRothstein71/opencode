@@ -595,6 +595,90 @@ describe("InstanceStore", () => {
   )
 
   it.live(
+    "reload waits for an interrupted teardown's in-flight disposers (NEW-V12-06)",
+    () =>
+      Effect.gen(function* () {
+        const dir = yield* tmpdirScoped({ git: true })
+        const store = yield* InstanceStore.Service
+        const events: string[] = []
+        yield* registerDisposerScoped(async () => {
+          events.push("dispose-start")
+          await new Promise((resolve) => setTimeout(resolve, 700))
+          events.push("dispose-end")
+        })
+        yield* setBootstrap(
+          Effect.sync(() => {
+            events.push("boot")
+          }),
+        )
+
+        const first = yield* store.load({ directory: dir })
+        const disposing = yield* store.dispose(first).pipe(Effect.forkScoped)
+        // Interrupt while `runDisposers` is already executing. `releaseClaim` still resolves
+        // `closed` (REGRESSION-2), but the disposers keep running; a reload must not boot the
+        // replacement until they settle, or the old directory-global teardown tears the fresh
+        // entry down afterwards.
+        yield* Effect.sleep("100 millis")
+        yield* Fiber.interrupt(disposing)
+
+        const reloaded = yield* store.reload({ directory: dir }).pipe(Effect.timeoutOption("10 seconds"))
+        expect(Option.isSome(reloaded)).toBe(true)
+
+        // The replacement's boot is the last lifecycle event; the old teardown finished first.
+        expect(events).toEqual(["boot", "dispose-start", "dispose-end", "boot"])
+        expect(events.lastIndexOf("dispose-end")).toBeLessThan(events.lastIndexOf("boot"))
+
+        const alive = yield* store
+          .provide({ directory: dir }, Effect.succeed("alive" as const))
+          .pipe(Effect.timeoutOption("4 seconds"))
+        expect(Option.isSome(alive)).toBe(true)
+      }),
+    30_000,
+  )
+
+  it.live(
+    "reload after an interrupted drain still boots immediately (NEW-V12-06 control)",
+    () =>
+      Effect.gen(function* () {
+        const dir = yield* tmpdirScoped({ git: true })
+        const store = yield* InstanceStore.Service
+        const events: string[] = []
+        yield* registerDisposerScoped(async () => {
+          events.push("dispose")
+        })
+        yield* setBootstrap(
+          Effect.sync(() => {
+            events.push("boot")
+          }),
+        )
+
+        const first = yield* store.load({ directory: dir })
+        const leased = yield* Deferred.make<void>()
+        const held = yield* store
+          .provide(
+            { directory: dir },
+            Effect.gen(function* () {
+              yield* Deferred.succeed(leased, undefined)
+              yield* Effect.never
+            }),
+          )
+          .pipe(Effect.forkScoped)
+        yield* Deferred.await(leased)
+
+        // Interrupt inside the drain: the disposers never started, so there is nothing for a
+        // reload to wait for and the replacement boots straight away.
+        yield* store.dispose(first).pipe(Effect.timeoutOption("300 millis"))
+        const reloaded = yield* store.reload({ directory: dir }).pipe(Effect.timeoutOption("10 seconds"))
+        expect(Option.isSome(reloaded)).toBe(true)
+        expect(events).toEqual(["boot", "boot"])
+        expect(events.at(-1)).toBe("boot")
+
+        yield* Fiber.interrupt(held)
+      }),
+    30_000,
+  )
+
+  it.live(
     "never uses a disposed context under concurrent provide/dispose (W5/F4a)",
     () =>
       Effect.gen(function* () {

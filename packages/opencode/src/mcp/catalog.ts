@@ -237,15 +237,49 @@ const STRING_KEYWORDS = new Set([
   "contentEncoding",
   "contentMediaType",
   "$comment",
-  "$id",
-  "$anchor",
-  "$dynamicAnchor",
+  "title",
+  "description",
 ])
 const BOOLEAN_KEYWORDS = new Set(["uniqueItems", "deprecated", "readOnly", "writeOnly"])
+
+// ajv compiles `patternProperties` keys and `pattern` values with the JS `RegExp` constructor;
+// a value that does not parse makes the whole document uncompilable.
+const isValidRegex = (value: string) => {
+  try {
+    new RegExp(value)
+    return true
+  } catch {
+    return false
+  }
+}
+
+// JSON Schema 2020-12 anchors start with a letter or underscore and continue with
+// `[-A-Za-z0-9._]`; ajv's meta-schema rejects any other name.
+const ANCHOR_PATTERN = /^[A-Za-z_][-A-Za-z0-9._]*$/
+
+// ajv resolves `$schema` against its registered meta-schemas; any other value fails the whole
+// document with `no schema with key or ref`. Keep only dialects the installed ajv knows.
+const KNOWN_DIALECTS = new Set([
+  "https://json-schema.org/draft/2020-12/schema",
+  "https://json-schema.org/draft/2020-12/schema#",
+  "http://json-schema.org/schema#",
+])
+
+// `$id` must not contain an interior fragment, and a `urn:` id needs a non-empty NID and NSS
+// or ajv cannot serialize it ("URN without nid").
+const isResolvableId = (value: string) => {
+  const hash = value.indexOf("#")
+  if (hash !== -1 && hash !== value.length - 1) return false
+  if (/^urn:/i.test(value) && !/^urn:[a-z0-9][a-z0-9-]*:.+/i.test(value)) return false
+  return true
+}
 
 const isPlainObject = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value)
 const isSchema = (value: unknown) => typeof value === "boolean" || isPlainObject(value)
+// Schema maps are emitted with a null prototype so a `__proto__` member arriving from an
+// untrusted server is stored as an own key instead of rewriting the map's prototype.
+const makeRecord = () => Object.create(null) as Record<string, unknown>
 
 // Schemas, maps of schemas (`properties`/`$defs`) and instance data (`enum`/`const`)
 // all recurse through `boundSchema`. Only real schema nodes are sanitized; without the
@@ -275,7 +309,7 @@ function boundSchema(
     if (value.length > 0 && bounded.length === 0) return BOUNDED
     return bounded
   }
-  const out: Record<string, unknown> = {}
+  const out = makeRecord()
   for (const [key, item] of Object.entries(value)) {
     // Draft-07 tuple form (`items: [a, b]`) is invalid under 2020-12, where `items`
     // must be a single schema. Normalize conservatively to an unconstrained schema
@@ -294,6 +328,20 @@ function boundSchema(
         return bounded === BOUNDED || !isSchema(bounded) ? [] : [bounded]
       })
       if (kept.length > 0) out[key] = kept
+      continue
+    }
+    // `patternProperties` keys are compiled as regular expressions by ajv; an invalid key makes
+    // the whole document uncompilable even though the meta-schema accepts it, so drop that entry.
+    if (kind === "schema" && key === "patternProperties") {
+      if (!isPlainObject(item)) continue
+      const clean = makeRecord()
+      for (const [pattern, entry] of Object.entries(item)) {
+        if (!isValidRegex(pattern)) continue
+        const bounded = boundSchema(entry, depth + 1, seen, counter, "schema")
+        if (bounded === BOUNDED || !isSchema(bounded)) continue
+        clean[pattern] = bounded
+      }
+      out[key] = clean
       continue
     }
     const childKind: SchemaKind =
@@ -336,7 +384,7 @@ function boundSchema(
       }
       if (key === "dependentRequired") {
         if (!isPlainObject(bounded)) continue
-        const clean: Record<string, string[]> = {}
+        const clean = makeRecord() as Record<string, string[]>
         for (const [name, names] of Object.entries(bounded)) {
           if (!Array.isArray(names)) continue
           const kept = names.filter((entry): entry is string => typeof entry === "string")
@@ -353,6 +401,27 @@ function boundSchema(
       if (key === "$dynamicRef") {
         // ajv only resolves hash-fragment dynamic refs; an absolute/flat form is rejected.
         if (typeof bounded === "string" && bounded.startsWith("#")) out[key] = bounded
+        continue
+      }
+      if (key === "$anchor" || key === "$dynamicAnchor") {
+        if (typeof bounded === "string" && ANCHOR_PATTERN.test(bounded)) out[key] = bounded
+        continue
+      }
+      if (key === "$id") {
+        if (typeof bounded === "string" && isResolvableId(bounded)) out[key] = bounded
+        continue
+      }
+      if (key === "$schema") {
+        if (typeof bounded === "string" && KNOWN_DIALECTS.has(bounded)) out[key] = bounded
+        continue
+      }
+      if (key === "$vocabulary") {
+        if (!isPlainObject(bounded)) continue
+        const clean = makeRecord()
+        for (const [vocabulary, flag] of Object.entries(bounded)) {
+          if (typeof flag === "boolean") clean[vocabulary] = flag
+        }
+        out[key] = clean
         continue
       }
       if (SCHEMA_ARRAY_KEYWORDS.has(key)) {
