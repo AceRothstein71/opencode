@@ -679,6 +679,92 @@ describe("InstanceStore", () => {
   )
 
   it.live(
+    "a stalled disposer does not wedge reload or provide (REGRESSION-V13-01)",
+    () =>
+      Effect.gen(function* () {
+        const dir = yield* tmpdirScoped({ git: true })
+        const store = yield* InstanceStore.Service
+        const events: string[] = []
+        let releaseDisposer: () => void = () => {}
+        const gate = new Promise<void>((resolve) => {
+          releaseDisposer = resolve
+        })
+        yield* registerDisposerScoped(async () => {
+          events.push("dispose-start")
+          await gate
+          events.push("dispose-end")
+        })
+        yield* setBootstrap(
+          Effect.sync(() => {
+            events.push("boot")
+          }),
+        )
+
+        const first = yield* store.load({ directory: dir })
+        const disposing = yield* store.dispose(first).pipe(Effect.forkScoped)
+        yield* Effect.sleep("150 millis")
+        yield* Fiber.interrupt(disposing)
+
+        // The stalled disposer may delay the replacement only up to the teardown bound; it must
+        // never leave the directory wedged.
+        const reloaded = yield* store.reload({ directory: dir }).pipe(Effect.timeoutOption("8 seconds"))
+        expect(Option.isSome(reloaded)).toBe(true)
+
+        const alive = yield* store
+          .provide({ directory: dir }, Effect.succeed("alive" as const))
+          .pipe(Effect.timeoutOption("4 seconds"))
+        expect(Option.isSome(alive)).toBe(true)
+
+        // Once the stalled disposer finally settles, the directory recovers fully.
+        releaseDisposer()
+        yield* Effect.gen(function* () {
+          while (!events.includes("dispose-end")) yield* Effect.sleep("25 millis")
+        }).pipe(Effect.timeoutOption("4 seconds"))
+        expect(events.includes("dispose-end")).toBe(true)
+      }),
+    30_000,
+  )
+
+  it.live(
+    "reload serializes with a teardown from an uncached dispose (NEW-V13-06)",
+    () =>
+      Effect.gen(function* () {
+        const dir = yield* tmpdirScoped({ git: true })
+        const store = yield* InstanceStore.Service
+        const events: string[] = []
+        yield* registerDisposerScoped(async () => {
+          events.push("dispose-start")
+          await new Promise((resolve) => setTimeout(resolve, 400))
+          events.push("dispose-end")
+        })
+        yield* setBootstrap(
+          Effect.sync(() => {
+            events.push("boot")
+          }),
+        )
+
+        const first = yield* store.load({ directory: dir })
+        // The first dispose runs the cached path; afterwards the entry has left the cache, so the
+        // second dispose tears down through `disposeContext` without an entry.
+        yield* store.dispose(first)
+        events.length = 0
+
+        const disposing = yield* store.dispose(first).pipe(Effect.forkScoped)
+        yield* Effect.gen(function* () {
+          while (!events.includes("dispose-start")) yield* Effect.sleep("10 millis")
+        }).pipe(Effect.timeoutOption("2 seconds"))
+
+        const reloaded = yield* store.reload({ directory: dir }).pipe(Effect.timeoutOption("10 seconds"))
+        expect(Option.isSome(reloaded)).toBe(true)
+        yield* Fiber.join(disposing)
+
+        // The replacement must boot only after the uncached teardown's disposers settle.
+        expect(events).toEqual(["dispose-start", "dispose-end", "boot"])
+      }),
+    30_000,
+  )
+
+  it.live(
     "never uses a disposed context under concurrent provide/dispose (W5/F4a)",
     () =>
       Effect.gen(function* () {

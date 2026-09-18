@@ -30,7 +30,22 @@ export class Service extends Context.Service<Service, Interface>()("@opencode/In
 
 export const use = serviceUse(Service)
 
-interface Entry {
+/**
+ * A directory-global teardown in flight. Every cached entry carries one; an uncached `dispose`
+ * creates a standalone tracker so a concurrent `reload` still serializes with its disposers
+ * (NEW-V13-06).
+ */
+interface TeardownTracker {
+  /**
+   * Resolves when the directory-global `runDisposers` settles, even if the teardown fiber was
+   * interrupted while it was in flight.
+   */
+  readonly teardown: Deferred.Deferred<void>
+  /** Whether the teardown reached `runDisposers`, so `teardown` settles on its own. */
+  teardownStarted: boolean
+}
+
+interface Entry extends TeardownTracker {
   readonly deferred: Deferred.Deferred<InstanceContext>
   /** Outstanding `provide` leases; a leased entry is never evicted (D-P1-05). */
   uses: number
@@ -38,13 +53,6 @@ interface Entry {
   disposed: boolean
   /** Resolves when a claimed teardown finished and the entry left the cache. */
   readonly closed: Deferred.Deferred<void>
-  /**
-   * Resolves when this entry's directory-global `runDisposers` settles, even if the teardown
-   * fiber was interrupted while it was in flight.
-   */
-  readonly teardown: Deferred.Deferred<void>
-  /** Whether this entry's claim reached `runDisposers`, so `teardown` settles on its own. */
-  teardownStarted: boolean
 }
 
 const makeEntry = (): Entry => ({
@@ -68,8 +76,9 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
     const cache = new Map<string, Entry>()
     // Disposers are directory-global and keep running after an interrupt, even though the
     // interrupted entry has already left `cache`. Track those in-flight teardowns by directory
-    // so a `reload` can wait for them before booting a replacement (NEW-V12-06).
-    const teardowns = new Map<string, Set<Entry>>()
+    // so a `reload` can wait for them before booting a replacement (NEW-V12-06). Trackers can
+    // outlive their entry (uncached `dispose`), so the set holds trackers, not entries.
+    const teardowns = new Map<string, Set<TeardownTracker>>()
 
     const boot = (input: LoadInput & { directory: string }) =>
       Effect.gen(function* () {
@@ -133,34 +142,50 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
 
     const disposeContext = Effect.fn("InstanceStore.disposeContext")(function* (ctx: InstanceContext, entry?: Entry) {
       yield* Effect.logInfo("disposing instance", { directory: ctx.directory })
+      // Track every directory-global teardown, including one started for a context that was never
+      // cached (`dispose` on a foreign context), so a concurrent `reload` cannot boot a
+      // replacement while its disposers still run (NEW-V13-06).
+      const tracker: TeardownTracker = entry ?? { teardown: Deferred.makeUnsafe<void>(), teardownStarted: false }
       const teardown = yield* Effect.sync(() => {
         const promise = runDisposers(ctx.directory)
-        if (entry) {
-          entry.teardownStarted = true
-          const pending = teardowns.get(ctx.directory) ?? new Set<Entry>()
-          pending.add(entry)
-          teardowns.set(ctx.directory, pending)
-          const settle = () => {
-            const active = teardowns.get(ctx.directory)
-            if (active) {
-              active.delete(entry)
-              if (active.size === 0) teardowns.delete(ctx.directory)
-            }
-            Deferred.doneUnsafe(entry.teardown, Effect.void)
+        tracker.teardownStarted = true
+        const pending = teardowns.get(ctx.directory) ?? new Set<TeardownTracker>()
+        pending.add(tracker)
+        teardowns.set(ctx.directory, pending)
+        const settle = () => {
+          const active = teardowns.get(ctx.directory)
+          if (active) {
+            active.delete(tracker)
+            if (active.size === 0) teardowns.delete(ctx.directory)
           }
-          promise.then(settle, settle)
+          Deferred.doneUnsafe(tracker.teardown, Effect.void)
         }
+        promise.then(settle, settle)
         return promise
       })
       yield* Effect.promise(() => teardown)
       yield* emitDisposed({ directory: ctx.directory, project: ctx.project.id })
     })
 
+    // Bounded so a disposer that never settles cannot wedge the directory forever
+    // (REGRESSION-V13-01): past the bound the replacement boots anyway and the deviation is
+    // logged. The normal interrupted-teardown path still waits for the real disposers
+    // (NEW-V12-06). `load`/`provide` stay ungated on purpose (REGRESSION-2 fast-alive).
+    const TEARDOWN_DRAIN_TIMEOUT_MS = 2_000
     const awaitTeardowns = (directory: string) =>
       Effect.gen(function* () {
-        const pending = teardowns.get(directory)
-        if (!pending || pending.size === 0) return
-        yield* Effect.forEach([...pending], (entry) => Deferred.await(entry.teardown), { discard: true })
+        const deadline = Date.now() + TEARDOWN_DRAIN_TIMEOUT_MS
+        while (teardowns.has(directory)) {
+          const pending = [...(teardowns.get(directory) ?? [])]
+          if (pending.length === 0) return
+          const settled = yield* Effect.forEach(pending, (tracker) => Deferred.isDone(tracker.teardown))
+          if (settled.every(Boolean)) return
+          if (Date.now() >= deadline) {
+            yield* Effect.logWarning("instance teardown did not settle before reload", { directory: directory })
+            return
+          }
+          yield* Effect.sleep("25 millis")
+        }
       })
 
     // Release a claimed entry: drop it from the cache (only if it is still the cached one, so a
