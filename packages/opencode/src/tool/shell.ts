@@ -10,6 +10,7 @@ import { sanitizePluginEnv } from "@/util/plugin-env"
 import { Language, type Node } from "web-tree-sitter"
 
 import { FSUtil } from "@opencode-ai/core/fs-util"
+import { Wildcard } from "@opencode-ai/core/util/wildcard"
 import { fileURLToPath } from "url"
 import { Config } from "@/config/config"
 import { RuntimeFlags } from "@/effect/runtime-flags"
@@ -70,6 +71,22 @@ const CMD_FILES = new Set([
 const FLAGS = new Set(["-destination", "-literalpath", "-path"])
 const SWITCHES = new Set(["-confirm", "-debug", "-force", "-nonewline", "-recurse", "-verbose", "-whatif"])
 
+// Node types that become classification tokens. Expansions (`$HOME`, `${X}`,
+// `$(...)`) must be kept or a wrapper argument like `env -C $HOME` is dropped and
+// the command after it is misread as the target.
+const TOKEN_NODES = new Set([
+  "command_name",
+  "command_name_expr",
+  "word",
+  "string",
+  "raw_string",
+  "concatenation",
+  "simple_expansion",
+  "expansion",
+  "command_substitution",
+  "arithmetic_expansion",
+])
+
 type Part = {
   type: string
   text: string
@@ -106,14 +123,7 @@ function parts(node: Node) {
       }
       continue
     }
-    if (
-      child.type !== "command_name" &&
-      child.type !== "command_name_expr" &&
-      child.type !== "word" &&
-      child.type !== "string" &&
-      child.type !== "raw_string" &&
-      child.type !== "concatenation"
-    ) {
+    if (!TOKEN_NODES.has(child.type)) {
       continue
     }
     out.push({ type: child.type, text: child.text })
@@ -129,30 +139,12 @@ function commands(node: Node) {
   return node.descendantsOfType("command").filter((child): child is Node => Boolean(child))
 }
 
-// The shell removes quoting and backslash escapes before it opens a path, so
-// `\.\./etc` really reads `../etc`. Classification and the external-directory scan must
-// see the unescaped form or an escaped traversal is never scanned. On Windows the
-// backslash is a path separator and must be preserved.
-function shellUnescape(text: string) {
-  if (process.platform === "win32") return text
-  let out = ""
-  for (let index = 0; index < text.length; index++) {
-    const char = text[index]
-    if (char === "\\" && index + 1 < text.length) {
-      out += text[++index]
-      continue
-    }
-    out += char
-  }
-  return out
-}
-
+// Classification must see the tokens the shell actually executes. It must use the
+// same position-free quote/escape canonicalization the persisted-grant matcher uses
+// (`Wildcard.unquote`), or a command name built from quotes (`cat""`) is invisible to
+// the FILES/CWD scan while still matching a stored `cat *` grant.
 function unquote(text: string) {
-  if (text.length < 2) return text
-  const first = text[0]
-  const last = text[text.length - 1]
-  const inner = (first === '"' || first === "'") && first === last ? text.slice(1, -1) : text
-  return shellUnescape(inner)
+  return Wildcard.unquote(text)
 }
 
 function home(text: string) {
@@ -253,15 +245,97 @@ function dynamic(text: string, ps: boolean) {
   return text.includes("$")
 }
 
-// A `cd`/`pushd`/`popd` whose destination is not a plain literal moves the shell
-// somewhere the scan cannot resolve (`cd $X`, `cd -`, bare `cd`, `popd` with no
-// argument). Treat that as dynamic so the caller anchors the scan at the filesystem
-// root; otherwise a relative read later in the same command string escapes the
-// worktree with no `external_directory` request (deepseek NEW-V10-01).
-function cwdTargetDynamic(command: Part[], ps: boolean) {
-  const positional = command.slice(1).filter((item) => !item.text.startsWith("-"))
-  if (positional.length === 0) return true
-  return positional.some((item) => dynamic(ps ? item.text : unquote(item.text), ps))
+// Wrappers that run the following command in place. `command cd $HOME` and
+// `\cd $HOME` still move the shell, so classification must resolve through them or
+// the cwd dynamic guard is skipped and a later relative read escapes unseen.
+const WRAPPERS = new Set(["builtin", "command", "exec", "nohup", "time"])
+
+type Effective = {
+  name?: string
+  command: Part[]
+  cwdTarget?: Part
+  evalScript?: string
+}
+
+function commandName(text: string) {
+  const name = Wildcard.unquote(text)
+  return name.startsWith("\\") ? name.slice(1) : name
+}
+
+// Resolve wrapper prefixes (`command cat`, `\cat`, `env -C dir cat`) to the command
+// they actually run, plus any cwd the wrapper changes (`env -C`). An `eval` string is
+// handed back for the caller to inspect: it is re-parsed by the shell, so its cwd
+// effects and file arguments are not visible in this token list.
+function effective(command: Part[]): Effective {
+  let parts = command
+  let cwdTarget: Part | undefined
+  for (let depth = 0; depth < 8 && parts.length > 0; depth++) {
+    const name = commandName(parts[0].text)
+    if (WRAPPERS.has(name)) {
+      let index = 1
+      while (index < parts.length && parts[index].text.startsWith("-")) {
+        index += name === "exec" && parts[index].text === "-a" && index + 1 < parts.length ? 2 : 1
+      }
+      parts = parts.slice(index)
+      continue
+    }
+    if (name === "env") {
+      let index = 1
+      while (index < parts.length) {
+        const text = parts[index].text
+        if (text === "-C" || text === "--chdir") {
+          cwdTarget = parts[index + 1]
+          index += 2
+          continue
+        }
+        if (text.startsWith("--chdir=")) {
+          cwdTarget = { type: "word", text: text.slice(8) }
+          index += 1
+          continue
+        }
+        if (text === "-u" || text === "--unset") {
+          index += 2
+          continue
+        }
+        if (
+          text.startsWith("--unset=") ||
+          text === "-i" ||
+          text === "-0" ||
+          text === "--ignore-environment" ||
+          text === "--null" ||
+          /^[A-Za-z_][A-Za-z0-9_]*=/.test(text)
+        ) {
+          index += 1
+          continue
+        }
+        if (text.startsWith("-")) {
+          index += 1
+          continue
+        }
+        break
+      }
+      parts = parts.slice(index)
+      continue
+    }
+    if (name === "eval") {
+      const script = parts
+        .slice(1)
+        .map((item) => Wildcard.unquote(item.text))
+        .join(" ")
+        .trim()
+      return { name, command: parts, cwdTarget, evalScript: script }
+    }
+    break
+  }
+  return { name: parts.length > 0 ? commandName(parts[0].text) : undefined, command: parts, cwdTarget }
+}
+
+// A dynamic argument cannot be resolved to a real path, but if it still carries a
+// traversal or an absolute prefix the shell may read outside the worktree, so the
+// scan must anchor conservatively rather than skip the argument entirely.
+function unresolvableExternal(text: string) {
+  if (text.startsWith("/") || /^[A-Za-z]:[\\/]/.test(text)) return true
+  return /(^|[\\/])\.\.([\\/]|$)/.test(text)
 }
 
 function prefix(text: string) {
@@ -481,7 +555,10 @@ export const ShellTool = Tool.define(
         if (tilde === true) return { external: true as const }
         if (typeof tilde === "string") return yield* rawPath(tilde, cwd, shell)
       }
-      if (dynamic(file, ps)) return
+      if (dynamic(file, ps)) {
+        if (unresolvableExternal(file)) return { external: true as const }
+        return
+      }
       const next = ps ? provider(file) : file
       if (!next) return
       return yield* rawPath(next, cwd, shell)
@@ -500,53 +577,95 @@ export const ShellTool = Tool.define(
         always: new Set<string>(),
       }
       const shellKind = ShellID.toKind(Shell.name(shell))
-      const entries = commands(root).map((node) => {
-        const command = parts(node)
-        const tokens = command.map((item) => item.text)
-        const cmd = ps || shellKind === "cmd" ? tokens[0]?.toLowerCase() : tokens[0]
-        return { node, command, tokens, cmd }
+      const state = { dynamic: false }
+      const pending: { tokens: string[]; dynamic: boolean }[] = []
+
+      const addPath = Effect.fnUntraced(function* (resolved: string | { external: true } | undefined) {
+        if (!resolved) return
+        // An unresolvable expansion or `~name` leaves the worktree; anchor the scan at
+        // the filesystem root so the external_directory prompt still fires.
+        if (typeof resolved !== "string") {
+          scan.dirs.add(path.parse(cwd).root)
+          return
+        }
+        // Lexical containment is not enough: a symlink inside the worktree can point
+        // outside it. Require both the lexical path and its resolved target.
+        const real = FSUtil.resolveExistingFrom(cwd, resolved)
+        if (containsPath(resolved, instance) && containsPath(real, instance)) return
+        const dir = (yield* fs.isDir(real)) ? real : path.dirname(real)
+        scan.dirs.add(dir)
       })
-      // Resolve every command against one another so a dynamic `cd` anywhere in the
-      // invocation suppresses the always-grant for all of them, not just commands that
-      // happen to parse after it.
-      const dynamicCwd = entries.some(
-        (entry) => entry.cmd !== undefined && CWD.has(entry.cmd) && cwdTargetDynamic(entry.command, ps),
-      )
 
-      for (const entry of entries) {
-        const { node, command, tokens, cmd } = entry
-
-        if (cmd && (FILES.has(cmd) || (shellKind === "cmd" && CMD_FILES.has(cmd)))) {
-          for (const arg of pathArgs(command, ps, shellKind === "cmd")) {
-            const resolved = yield* argPath(arg, cwd, ps, shell)
-            if (!resolved) continue
-            // An unresolvable `~name` expands outside the worktree; anchor the scan at
-            // the filesystem root so the external_directory prompt still fires.
-            if (typeof resolved !== "string") {
-              scan.dirs.add(path.parse(cwd).root)
-              continue
-            }
-            // Lexical containment is not enough: a symlink inside the worktree can
-            // point outside it. Require both the lexical path and its resolved target.
-            const real = FSUtil.resolveExistingFrom(cwd, resolved)
-            if (containsPath(resolved, instance) && containsPath(real, instance)) continue
-            const dir = (yield* fs.isDir(real)) ? real : path.dirname(real)
-            scan.dirs.add(dir)
-          }
-        }
-
-        if (tokens.length && (!cmd || !CWD.has(cmd))) {
-          scan.patterns.add(source(node))
-          // A command whose arguments contain a shell expansion cannot be captured
-          // by a literal `prefix *` grant: the expansion (a variable path, a command
-          // substitution) can resolve to a different path or flag on every run. Offer
-          // only a one-shot prompt, never an "always" pattern, for those commands.
-          const expandable = dynamicCwd || command.some((item) => dynamic(item.text, ps))
-          if (!expandable) scan.always.add(BashArity.prefix(tokens).join(" ") + " *")
-        }
+      // A `cd`/`pushd`/`popd` whose destination is not a plain literal moves the shell
+      // somewhere the scan cannot resolve (`cd $X`, `cd -`, bare `cd`). Treat it as
+      // dynamic so the scan anchors at the filesystem root; otherwise a later relative
+      // read escapes the worktree with no `external_directory` request.
+      const inspectCwd = (name: string | undefined, args: string[]) => {
+        if (!name || !CWD.has(name)) return
+        const positional = args.filter((item) => !item.startsWith("-"))
+        if (positional.length === 0 || positional.some((item) => dynamic(unquote(item), ps))) state.dynamic = true
       }
 
-      if (dynamicCwd) scan.dirs.add(path.parse(cwd).root)
+      // `eval` re-parses its decoded argument as a shell command, so its cwd change or
+      // file arguments are not visible in the outer token list.
+      const classify = Effect.fnUntraced(function* (command: Part[]) {
+        const info = effective(command)
+        const name = shellKind === "cmd" ? info.name?.toLowerCase() : info.name
+        inspectCwd(
+          name,
+          info.command.slice(1).map((item) => item.text),
+        )
+        if (info.cwdTarget && dynamic(unquote(info.cwdTarget.text), ps)) state.dynamic = true
+        if (info.cwdTarget) yield* addPath(yield* argPath(info.cwdTarget.text, cwd, ps, shell))
+        if (name && (FILES.has(name) || (shellKind === "cmd" && CMD_FILES.has(name)))) {
+          for (const arg of pathArgs(info.command, ps, shellKind === "cmd")) {
+            yield* addPath(yield* argPath(arg, cwd, ps, shell))
+          }
+        }
+        if (info.evalScript) {
+          const nested = info.evalScript.split(/\s+/).filter(Boolean)
+          const nestedName = nested.length > 0 ? commandName(nested[0]) : undefined
+          const normalized = shellKind === "cmd" ? nestedName?.toLowerCase() : nestedName
+          inspectCwd(normalized, nested.slice(1))
+          if (normalized && (FILES.has(normalized) || (shellKind === "cmd" && CMD_FILES.has(normalized)))) {
+            const synthetic = nested.map((text) => ({ type: "word", text }))
+            for (const arg of pathArgs(synthetic, ps, shellKind === "cmd")) {
+              yield* addPath(yield* argPath(arg, cwd, ps, shell))
+            }
+          }
+        }
+        return { name, info }
+      })
+
+      const entries = commands(root).map((node) => {
+        const command = parts(node)
+        return { node, command, tokens: command.map((item) => item.text) }
+      })
+
+      // Classify every command before deciding the always-grant, so a dynamic `cd`
+      // anywhere in the invocation (including through a wrapper or `eval`) suppresses
+      // it for all of them, not just commands that happen to parse after it.
+      const resolved: { name?: string; info: Effective }[] = []
+      for (const entry of entries) resolved.push(yield* classify(entry.command))
+
+      for (let index = 0; index < entries.length; index++) {
+        const entry = entries[index]
+        const result = resolved[index]
+        if (!result || entry.tokens.length === 0) continue
+        if (result.name && CWD.has(result.name)) continue
+        scan.patterns.add(source(entry.node))
+        // A command whose arguments contain a shell expansion cannot be captured by a
+        // literal `prefix *` grant: the expansion (a variable path, a command
+        // substitution) can resolve to a different path or flag on every run. Offer
+        // only a one-shot prompt, never an "always" pattern, for those commands.
+        pending.push({ tokens: entry.tokens, dynamic: entry.command.some((item) => dynamic(item.text, ps)) })
+      }
+
+      if (state.dynamic) scan.dirs.add(path.parse(cwd).root)
+      for (const item of pending) {
+        if (state.dynamic || item.dynamic) continue
+        scan.always.add(BashArity.prefix(item.tokens).join(" ") + " *")
+      }
 
       return scan
     })

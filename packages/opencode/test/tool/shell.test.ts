@@ -8,6 +8,7 @@ import { symlink } from "node:fs/promises"
 import path from "path"
 import { Config } from "@/config/config"
 import { Shell } from "@opencode-ai/core/shell"
+import { Wildcard } from "@opencode-ai/core/util/wildcard"
 import { ShellTool } from "../../src/tool/shell"
 import { Filesystem } from "@/util/filesystem"
 import { provideInstance, testInstanceStoreLayer, tmpdirScoped } from "../fixture/fixture"
@@ -1238,6 +1239,190 @@ describe("tool.shell permissions", () => {
         }),
       )
     }),
+  )
+})
+
+describe("tool.shell wave HA classification", () => {
+  if (process.platform === "win32") return
+
+  const requests = (command: string, directory: string, stop: boolean) =>
+    Effect.gen(function* () {
+      const list: Array<Omit<PermissionV1.Request, "id" | "sessionID" | "tool">> = []
+      if (stop) {
+        yield* runIn(directory, fail({ command }, capture(list, new Error("stop after permission"))))
+      } else {
+        yield* runIn(directory, run({ command }, capture(list)))
+      }
+      return list
+    })
+
+  const expectExternal = (command: string, directory: string, stop = false) =>
+    Effect.gen(function* () {
+      const list = yield* requests(command, directory, stop)
+      expect({ command, external: list.some((item) => item.permission === "external_directory") }).toEqual({
+        command,
+        external: true,
+      })
+    })
+
+  const expectDynamic = (command: string, directory: string) =>
+    Effect.gen(function* () {
+      const list = yield* requests(command, directory, false)
+      const bash = list.find((item) => item.permission === "bash")
+      expect({ command, external: list.some((item) => item.permission === "external_directory") }).toEqual({
+        command,
+        external: true,
+      })
+      expect({ command, always: bash?.always ?? [] }).toEqual({ command, always: [] })
+    })
+
+  it.live(
+    "scans quote-obfuscated cat command names as file reads",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        for (const command of [
+          'cat"" /etc/hostname',
+          '"cat" /etc/hostname',
+          "'cat' /etc/hostname",
+          'ca"t" /etc/hostname',
+          "c'a't /etc/hostname",
+        ]) {
+          yield* expectExternal(command, tmp)
+        }
+      }),
+    30_000,
+  )
+
+  it.live(
+    "scans a quote-obfuscated rm before an external delete",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        const marker = path.join(path.dirname(tmp), `ha-marker-${path.basename(tmp)}.txt`)
+        yield* Effect.promise(() => Bun.write(marker, "M"))
+        yield* expectExternal(`rm"" ${marker}`, tmp, true)
+      }),
+    30_000,
+  )
+
+  it.live(
+    "treats wrapper-prefixed cd forms as dynamic cwd",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        for (const command of [
+          "command cd $HOME && cat secret.txt",
+          "builtin cd $HOME && cat secret.txt",
+          "\\cd $HOME && cat secret.txt",
+          '"cd" $HOME && cat secret.txt',
+          "env -C $HOME cat secret.txt",
+          'eval "cd $HOME" && cat secret.txt',
+        ]) {
+          yield* expectDynamic(command, tmp)
+        }
+      }),
+    30_000,
+  )
+
+  it.live(
+    "classifies wrapper-prefixed file commands",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        for (const command of [
+          "command cat /etc/hostname",
+          "\\cat /etc/hostname",
+          "exec cat /etc/hostname",
+          "time cat /etc/hostname",
+          "env cat /etc/hostname",
+        ]) {
+          yield* expectExternal(command, tmp)
+        }
+      }),
+    30_000,
+  )
+
+  it.live(
+    "scans quote-split traversal arguments",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        const name = `ha-marker-${path.basename(tmp)}.txt`
+        yield* Effect.promise(() => Bun.write(path.join(path.dirname(tmp), name), "M"))
+        for (const command of [`cat ".."/${name}`, `cat '..'/${name}`, `cat .""./${name}`, `cat ""../${name}`]) {
+          yield* expectExternal(command, tmp)
+        }
+      }),
+    30_000,
+  )
+
+  it.live(
+    "scans dynamic path arguments that carry traversal",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        for (const command of [
+          "cat $HOME/../opencode-missing",
+          "cat ${HOME}/../opencode-missing",
+          "cat $PWD/../opencode-missing",
+          "cat ${PWD}/../opencode-missing",
+        ]) {
+          yield* expectExternal(command, tmp)
+        }
+      }),
+    30_000,
+  )
+
+  it.live(
+    "forces the external scan when a persisted grant matches an obfuscated name",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        const approved = [{ permission: "bash", pattern: "cat *" }]
+        const seen: Array<Omit<PermissionV1.Request, "id" | "sessionID" | "tool">> = []
+        const next: Tool.Context = {
+          ...ctx,
+          ask: (req) =>
+            Effect.sync(() => {
+              const allowed = req.patterns.every((pattern) =>
+                approved.some(
+                  (rule) =>
+                    Wildcard.matchStrict(req.permission, rule.permission) &&
+                    Wildcard.matchStrict(pattern, rule.pattern),
+                ),
+              )
+              if (!allowed) seen.push(req)
+            }),
+        }
+        yield* runIn(tmp, run({ command: 'cat"" /etc/hostname' }, next))
+        expect(seen.some((item) => item.permission === "external_directory")).toBe(true)
+      }),
+    30_000,
+  )
+
+  it.live(
+    "keeps normal quoted and wrapper arguments prompt-free",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        yield* Effect.promise(() => Bun.write(path.join(tmp, "file name.txt"), "x"))
+        yield* Effect.promise(() => Bun.write(path.join(tmp, "notes.txt"), "x"))
+        for (const command of [
+          'cat "file name.txt"',
+          "cat notes.txt",
+          "cat 'notes.txt'",
+          "command cat notes.txt",
+          "env cat notes.txt",
+        ]) {
+          const list = yield* requests(command, tmp, false)
+          expect({ command, external: list.some((item) => item.permission === "external_directory") }).toEqual({
+            command,
+            external: false,
+          })
+        }
+      }),
+    30_000,
   )
 })
 

@@ -4,17 +4,21 @@ export * as Wildcard from "./wildcard"
 const compiled = new Map<string, RegExp>()
 
 // A shell removes quoting and backslash escapes before it executes a command, so
-// `rm "-rf" /`, `rm '-rf' /` and `rm \-rf /` all run `rm -rf /`. Strip the quoting
-// the shell would strip *before* matching, otherwise the strict argument check can
-// be defeated by wrapping a flag in quotes.
+// `rm "-rf" /`, `rm '-rf' /`, `rm \-rf /` and `ca"t" /etc` all run their unquoted
+// form. Strip the quoting the shell would strip *before* matching, otherwise the
+// strict argument check can be defeated by wrapping a flag (or a whole command
+// name) in quotes.
 //
-// Backslashes are only unescaped when they escape a shell-special character that
-// could hide a flag (or another quote). A Windows path separator is followed by a
-// drive/name character (`C:\Windows`), so it is preserved here and normalized by
-// `glob`/the caller afterwards.
+// Quoting is removed position-free: `cat""` and `"cat"` both canonicalize to
+// `cat`, so the matcher and the shell agree on the effective command. On unix the
+// shell drops the backslash before the next character (`\.` is `.`, `\/` is `/`),
+// so all escapes are removed. A Windows path separator is followed by a
+// drive/name character (`C:\Windows`), so on win32 a backslash is only unescaped
+// when it escapes a shell-special character that could hide a flag or quote; the
+// separator is preserved and normalized by `glob`/the caller afterwards.
 const SHELL_ESCAPES = new Set(["-", '"', "'", "`", "$", " ", "\\", "(", ")"])
 
-function unquote(value: string) {
+export function unquote(value: string) {
   let out = ""
   let quote: "'" | '"' | undefined
   for (let index = 0; index < value.length; index++) {
@@ -31,21 +35,17 @@ function unquote(value: string) {
       quote = char
       continue
     }
-    // `\.` is `..` after the shell strips the escape, so an escaped traversal must
-    // unescape here too or it slips past the TRAVERSAL check below. A backslash is a
-    // Windows separator, not an escape, so only unix honours the dot escape.
-    const escaped = index + 1 < value.length && (SHELL_ESCAPES.has(value[index + 1]) || nextIsDotEscape(value, index))
-    if (char === "\\" && escaped) {
-      out += value[++index]
-      continue
+    if (char === "\\" && index + 1 < value.length) {
+      const next = value[index + 1]
+      if (process.platform !== "win32" || SHELL_ESCAPES.has(next)) {
+        out += next
+        index++
+        continue
+      }
     }
     out += char
   }
   return out
-}
-
-function nextIsDotEscape(value: string, index: number) {
-  return process.platform !== "win32" && value[index + 1] === "."
 }
 
 function glob(pattern: string, strict: boolean) {

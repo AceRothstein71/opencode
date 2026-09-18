@@ -94,3 +94,28 @@ describe("Wildcard.match", () => {
     expect(Wildcard.matchStrict("./nested/file.txt", "./nested/*")).toBe(true)
   })
 })
+
+describe("Wildcard.unquote", () => {
+  test("removes quotes position-free so classification matches execution", () => {
+    expect(Wildcard.unquote('cat""')).toBe("cat")
+    expect(Wildcard.unquote('"cat"')).toBe("cat")
+    expect(Wildcard.unquote("'cat'")).toBe("cat")
+    expect(Wildcard.unquote('ca"t"')).toBe("cat")
+    expect(Wildcard.unquote("c'a't")).toBe("cat")
+    expect(Wildcard.unquote('.""./x')).toBe("../x")
+    expect(Wildcard.unquote('""../x')).toBe("../x")
+    expect(Wildcard.unquote('".."/x')).toBe("../x")
+  })
+
+  test("matchStrict canonicalizes quoted command names consistently", () => {
+    expect(Wildcard.matchStrict('cat"" notes.txt', "cat *")).toBe(true)
+    expect(Wildcard.matchStrict('"cat" notes.txt', "cat *")).toBe(true)
+  })
+
+  if (process.platform !== "win32") {
+    test("unescapes backslash traversal as the shell would", () => {
+      expect(Wildcard.unquote("..\\/etc")).toBe("../etc")
+      expect(Wildcard.unquote("\\.\\./etc")).toBe("../etc")
+    })
+  }
+})
