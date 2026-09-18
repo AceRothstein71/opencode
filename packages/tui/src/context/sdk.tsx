@@ -79,6 +79,18 @@ export const { use: useSDK, provider: SDKProvider } = createSimpleContext({
       flush()
     }
 
+    const parseSseStatus = (error: unknown): string | undefined => {
+      if (error instanceof Error) {
+        const match = /SSE failed:\s*(\d{3})/.exec(error.message)
+        if (match?.[1]) return match[1]
+      }
+      if (typeof error === "object" && error !== null && "status" in error) {
+        const status = (error as { status?: unknown }).status
+        if (typeof status === "number") return String(status)
+      }
+      return undefined
+    }
+
     function startSSE() {
       sse?.abort()
       const ctrl = new AbortController()
@@ -89,39 +101,45 @@ export const { use: useSDK, provider: SDKProvider } = createSimpleContext({
           if (abort.signal.aborted || ctrl.signal.aborted) break
 
           let sseError: unknown
-          const events = await sdk.global.event({
-            signal: ctrl.signal,
-            sseMaxRetryAttempts: 0,
-            onSseError: (error) => {
-              sseError = error
-            },
-          })
+          let received = false
+          try {
+            const events = await sdk.global.event({
+              signal: ctrl.signal,
+              sseMaxRetryAttempts: 0,
+              onSseError: (error) => {
+                sseError = error
+              },
+            })
 
-          if (Flag.OPENCODE_EXPERIMENTAL_WORKSPACES) {
-            // Start syncing workspaces, it's important to do this after
-            // we've started listening to events
-            await sdk.sync.start().catch(() => {})
-          }
+            if (Flag.OPENCODE_EXPERIMENTAL_WORKSPACES) {
+              // Start syncing workspaces, it's important to do this after
+              // we've started listening to events
+              await sdk.sync.start().catch(() => {})
+            }
 
-          for await (const event of events.stream) {
-            if (ctrl.signal.aborted) break
-            handleEvent(event)
+            for await (const event of events.stream) {
+              if (ctrl.signal.aborted) break
+              received = true
+              handleEvent(event)
+            }
+          } catch (error) {
+            // A rejection before `onSseError` fires must still reach the retry path
+            // instead of escaping to the outer catch and deafening the TUI.
+            sseError = error
           }
 
           if (timer) clearTimeout(timer)
           if (queue.length > 0) flush()
-          attempt += 1
           if (abort.signal.aborted || ctrl.signal.aborted) break
 
-          // Auth/not-found rejections never recover on retry; stop instead of
-          // reconnecting silently forever.
-          const status = /SSE failed:\s*(\d{3})/.exec(sseError instanceof Error ? sseError.message : "")?.[1]
-          if (status === "400" || status === "401" || status === "403" || status === "404") {
-            console.error(`[tui] global event stream rejected with HTTP ${status}; giving up`)
-            break
-          }
+          // A run that produced events resets the backoff; only consecutive failures
+          // escalate it, so hours of health cannot pin the delay at the cap.
+          attempt = received ? 1 : attempt + 1
+          const status = parseSseStatus(sseError)
+          if (status) console.error(`[tui] global event stream failed with HTTP ${status}; retrying`)
 
-          // Exponential backoff
+          // Retry every status (including auth) with backoff: a transient token refresh
+          // must not permanently deafen the TUI, and a fixed credential recovers it.
           const backoff = Math.min(retryDelay * 2 ** (attempt - 1), maxRetryDelay)
           await new Promise((resolve) => setTimeout(resolve, backoff))
         }

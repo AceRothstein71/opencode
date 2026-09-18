@@ -15,9 +15,23 @@ export async function stop(proc: ChildProcess) {
     return
   }
 
-  const exited = new Promise<void>((resolve) => proc.once("exit", () => resolve()))
-  proc.kill("SIGTERM")
-  const escalate = setTimeout(() => {
+  let finished = false
+  let escalate: ReturnType<typeof setTimeout> | undefined
+  let resolveExit: (() => void) | undefined
+  const onExit = () => {
+    finished = true
+    if (escalate) clearTimeout(escalate)
+    resolveExit?.()
+  }
+  const exited = new Promise<void>((resolve) => {
+    resolveExit = resolve
+    proc.once("exit", onExit)
+  })
+  try {
+    proc.kill("SIGTERM")
+  } catch {}
+  escalate = setTimeout(() => {
+    if (finished || proc.exitCode !== null || proc.signalCode !== null) return
     try {
       proc.kill("SIGKILL")
     } catch {}
@@ -29,8 +43,11 @@ export async function stop(proc: ChildProcess) {
       finalWait = setTimeout(resolve, STOP_FINAL_WAIT_MS)
     }),
   ])
-  clearTimeout(escalate)
+  if (escalate) clearTimeout(escalate)
   if (finalWait) clearTimeout(finalWait)
+  // The 5s final wait wins over a hung child, whose `exit` never fires; drop the listener
+  // so repeated stop() calls cannot accumulate them or re-arm a SIGKILL per call.
+  proc.removeListener("exit", onExit)
 }
 
 export function bindAbort(proc: ChildProcess, signal?: AbortSignal, onAbort?: () => void) {

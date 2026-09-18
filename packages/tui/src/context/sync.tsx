@@ -151,6 +151,9 @@ export const {
     const syncingSessions = new Map<string, Promise<void>>()
     const hydratingSessions = new Map<string, { messages: Set<string>; parts: Set<string> }>()
     const pendingDiffs = new Map<string, Map<string, SnapshotFileDiff[]>>()
+    // A deleted session must not be resurrected by an in-flight sync that resolves after
+    // the delete; the tombstone is checked before the post-await store write.
+    const deletedSessions = new Set<string>()
     const touchMessage = (sessionID: string, messageID: string) => {
       hydratingSessions.get(sessionID)?.messages.add(messageID)
     }
@@ -180,6 +183,9 @@ export const {
         .then((x) => (x.data ?? []).toSorted((a, b) => a.id.localeCompare(b.id)))
     }
 
+    // Assigned once `result` exists; the desync handler runs later, so the holder lets
+    // it trigger a refetch of everything currently mirrored without a forward reference.
+    let resyncOnDesync: (() => void) | undefined
     const unsubscribeSyncEvent = event.subscribe((event, { directory, workspace }) => {
       if (event.type === "message.diff.updated") {
         const messages = store.message[event.properties.sessionID]
@@ -205,6 +211,13 @@ export const {
           index,
           reconcile({ ...current, summary: { ...current.summary, diffs: event.properties.diffs } }),
         )
+        return
+      }
+      // `server.desync` is a raw SSE marker, not part of the typed Event union.
+      if (String(event.type) === "server.desync") {
+        // The server dropped events for this connection; every incremental mirror may
+        // be stale, so drop the "already synced" markers and refetch what is loaded.
+        resyncOnDesync?.()
         return
       }
       switch (event.type) {
@@ -305,8 +318,13 @@ export const {
 
         case "session.deleted": {
           const sessionID = event.properties.info.id
+          deletedSessions.add(sessionID)
           pendingDiffs.delete(sessionID)
           fullSyncedSessions.delete(sessionID)
+          // Drop in-flight markers so a late resolution cannot re-add the session; the
+          // tombstone guard in sync() is the backstop.
+          syncingSessions.delete(sessionID)
+          hydratingSessions.delete(sessionID)
           const messageIDs = (store.message[sessionID] ?? []).map((message) => message.id)
           const result = search(store.session, sessionID, (s) => s.id)
           if (result.found) {
@@ -357,11 +375,18 @@ export const {
             "part",
             produce((draft) => {
               for (const messageID of messageIDs) delete draft[messageID]
+              // A part can arrive before its message, so sweep by session id too instead
+              // of leaking an orphan mirror that no known message id covers.
+              for (const messageID of Object.keys(draft)) {
+                if (draft[messageID]?.some((part) => part.sessionID === sessionID)) delete draft[messageID]
+              }
             }),
           )
           break
         }
         case "session.updated": {
+          // A genuinely re-created session clears the delete tombstone.
+          deletedSessions.delete(event.properties.info.id)
           const result = search(store.session, event.properties.info.id, (s) => s.id)
           if (result.found) {
             setStore("session", result.index, reconcile(event.properties.info))
@@ -533,6 +558,10 @@ export const {
     async function bootstrap(input: { fatal?: boolean } = {}) {
       const fatal = input.fatal ?? true
       fullSyncedSessions.clear()
+      // Buffered/in-flight state from before a restart must not merge into the fresh fetch.
+      pendingDiffs.clear()
+      syncingSessions.clear()
+      hydratingSessions.clear()
       const workspace = project.workspace.current()
       const projectPromise = project.sync()
       const sessionListPromise = projectPromise.then(() => listSessions())
@@ -675,7 +704,7 @@ export const {
           return last.time.completed ? "idle" : "working"
         },
         async sync(sessionID: string) {
-          if (fullSyncedSessions.has(sessionID)) return
+          if (fullSyncedSessions.has(sessionID) || deletedSessions.has(sessionID)) return
           const syncing = syncingSessions.get(sessionID)
           if (syncing) return syncing
           const tracker = { messages: new Set<string>(), parts: new Set<string>() }
@@ -687,6 +716,8 @@ export const {
               sdk.client.session.todo({ sessionID }),
               sdk.client.session.diff({ sessionID }),
             ])
+            // The session may have been deleted while these four requests were in flight.
+            if (deletedSessions.has(sessionID)) return
             setStore(
               produce((draft) => {
                 const match = search(draft.session, sessionID, (s) => s.id)
@@ -759,6 +790,11 @@ export const {
         },
       },
       bootstrap,
+    }
+    resyncOnDesync = () => {
+      fullSyncedSessions.clear()
+      void bootstrap({ fatal: false })
+      for (const sessionID of Object.keys(store.message)) void result.session.sync(sessionID)
     }
     return result
   },

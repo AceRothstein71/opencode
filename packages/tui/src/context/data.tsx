@@ -142,6 +142,18 @@ export const { use: useData, provider: DataProvider } = createSimpleContext({
     }
 
     function handleEvent(event: Event, metadata: EventMetadata) {
+      // `server.desync` is a raw SSE marker, not part of the typed Event union.
+      if (String(event.type) === "server.desync") {
+        // The server dropped events for this connection; refetch every mirrored session
+        // so the store cannot stay silently behind the authoritative state.
+        for (const sessionID of Object.keys(store.session.info)) {
+          void result.session.refresh(sessionID)
+          void result.session.message.refresh(sessionID)
+          void result.session.permission.refresh(sessionID)
+          void result.session.question.refresh(sessionID)
+        }
+        return
+      }
       switch (event.type) {
         case "catalog.updated":
           void Promise.all([
@@ -495,7 +507,9 @@ export const { use: useData, provider: DataProvider } = createSimpleContext({
           },
           async refresh(sessionID: string) {
             const result = await sdk.client.v2.session.messages({ sessionID }, { throwOnError: true })
-            setStore("session", "message", sessionID, result.data.data)
+            // Server order is newest-first, so cap the page like the event path; an
+            // uncapped refresh would reintroduce the unbounded mirror the cap guards.
+            setStore("session", "message", sessionID, result.data.data.slice(0, MESSAGE_LIMIT))
           },
         },
         permission: {

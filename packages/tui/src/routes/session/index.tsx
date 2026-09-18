@@ -296,6 +296,9 @@ export function Session() {
     void (async () => {
       const previousWorkspace = untrack(() => project.workspace.current())
       const result = await sdk.client.session.get({ sessionID }, { throwOnError: true })
+      // A fast A->B switch dispatches this effect for the old session; drop every side
+      // effect once the route moved on so B never inherits A's workspace/sync state.
+      if (route.sessionID !== sessionID) return
       if (!result.data) {
         toast.show({
           message: `Session not found: ${sessionID}`,
