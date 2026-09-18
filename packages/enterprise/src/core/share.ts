@@ -1,5 +1,4 @@
 import { Message, Model, Part, Session, SnapshotFileDiff } from "@opencode-ai/sdk/v2"
-import { iife } from "@opencode-ai/core/util/iife"
 import { createHash, timingSafeEqual } from "node:crypto"
 import z from "zod"
 import { Storage } from "./storage"
@@ -286,47 +285,6 @@ export namespace Share {
     if (!(await get(shareID))) return []
     return (await readSnapshot(shareID)) ?? legacy(shareID)
   }
-
-  export const syncOld = fn(
-    z.object({
-      share: Info.pick({ id: true, secret: true }),
-      data: Data.array().max(MAX_SYNC_ITEMS),
-    }),
-    async (input) => {
-      const share = await get(input.share.id)
-      if (!share) throw new Errors.NotFound(input.share.id)
-      if (!secretMatches(share.secret, input.share.secret)) throw new Errors.InvalidSecret(input.share.id)
-      const promises = []
-      for (const item of input.data) {
-        promises.push(
-          iife(async () => {
-            switch (item.type) {
-              case "session":
-                await Storage.write(["share_data", input.share.id, "session"], item.data)
-                break
-              case "message": {
-                const data = item.data as Message
-                await Storage.write(["share_data", input.share.id, "message", data.id], item.data)
-                break
-              }
-              case "part": {
-                const data = item.data as Part
-                await Storage.write(["share_data", input.share.id, "part", data.messageID, data.id], item.data)
-                break
-              }
-              case "session_diff":
-                await Storage.write(["share_data", input.share.id, "session_diff"], item.data)
-                break
-              case "model":
-                await Storage.write(["share_data", input.share.id, "model"], item.data)
-                break
-            }
-          }),
-        )
-      }
-      await Promise.all(promises)
-    },
-  )
 
   export const Errors = {
     NotFound: class extends Error {

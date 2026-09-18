@@ -127,6 +127,8 @@ export function client<T extends Definition>(target: {
                 settle(requestId)?.reject(new Error(`RPC call "${String(method)}" timed out after ${timeout}ms`))
               }, timeout)
             : undefined
+        // A 30-minute timeout must not pin the event loop after every other handle drains.
+        if (timer && typeof timer === "object" && "unref" in timer && typeof timer.unref === "function") timer.unref()
         pending.set(requestId, { resolve, reject, timer })
         try {
           target.postMessage(JSON.stringify({ type: "rpc.request", method, input, id: requestId }))

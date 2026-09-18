@@ -94,10 +94,7 @@ function readCappedText(stream: Stream.Stream<Uint8Array, unknown>, max: number)
       acc.truncated = acc.truncated || acc.bytes > max
       return acc
     },
-  ).pipe(
-    Effect.map((acc) => ({ text: new TextDecoder().decode(Buffer.concat(acc.chunks)), truncated: acc.truncated })),
-    Effect.catchCause(() => Effect.succeed({ text: "", truncated: false })),
-  )
+  ).pipe(Effect.map((acc) => ({ text: new TextDecoder().decode(Buffer.concat(acc.chunks)), truncated: acc.truncated })))
 }
 
 export function http(
@@ -109,7 +106,7 @@ export function http(
   return Effect.gen(function* () {
     const response = yield* client.execute(
       HttpClientRequest.make(request.method as never)(url, {
-        headers: ProxyUtil.headers(request.headers as HeadersInit, extra),
+        headers: ProxyUtil.headers(request.headers as HeadersInit, extra, { stripCredentials: true }),
         body: requestBody(request),
       }),
     )

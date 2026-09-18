@@ -79,19 +79,27 @@ const RATE_LIMITS: { match: (method: string, path: string) => boolean; limit: nu
 ]
 
 const rateWindows = new Map<string, { count: number; reset: number }>()
+const RATE_WINDOW_MAX = 10_000
 
 function clientKey(c: Context) {
-  const forwarded = c.req.header("x-forwarded-for")?.split(",")[0]?.trim()
-  return c.req.header("cf-connecting-ip") ?? c.req.header("x-real-ip") ?? forwarded ?? "unknown"
+  // `cf-connecting-ip` is set by the edge and cannot be rotated by the caller.
+  // `x-real-ip` / `x-forwarded-for` are client-controlled, so trusting them lets one
+  // caller mint unlimited rate-limit keys. Headerless clients share one bucket.
+  return c.req.header("cf-connecting-ip") ?? "unknown"
 }
 
 function rateLimited(c: Context) {
   const rule = RATE_LIMITS.find((entry) => entry.match(c.req.method, c.req.path))
   if (!rule) return false
   const now = Date.now()
-  if (rateWindows.size > 10_000) {
+  if (rateWindows.size > RATE_WINDOW_MAX) {
     for (const [key, window] of rateWindows) {
       if (window.reset <= now) rateWindows.delete(key)
+    }
+    while (rateWindows.size > RATE_WINDOW_MAX) {
+      const oldest = rateWindows.keys().next()
+      if (oldest.done) break
+      rateWindows.delete(oldest.value)
     }
   }
   const key = `${rule.limit}:${clientKey(c)}`

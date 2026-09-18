@@ -66,6 +66,15 @@ export function trimQueue<T>(queue: Map<string, T>) {
 // out-of-band, and a permanent null would hide it forever (F-119).
 const NEGATIVE_CACHE_TTL = 30_000
 
+// The negative cache and the per-session queue maps are keyed by session id, so a
+// long-lived server accumulates entries for every session it ever looked up or
+// queued. Bound both.
+const MAX_MISSES = 1_024
+const MAX_QUEUED_SESSIONS = 256
+
+// A failed remote DELETE is retried by a later sync at most this often.
+const REMOVAL_RETRY_MS = 60_000
+
 export type Api = {
   create: string
   sync: (shareID: string) => string
@@ -93,6 +102,28 @@ type State = {
   scope: Scope.Closeable
   shared: Map<SessionID, Share>
   misses: Map<SessionID, number>
+  // Shares whose remote DELETE failed; a later sync retries them so a failed
+  // unshare cannot leave the share world-readable forever.
+  removals: Map<SessionID, Share>
+  removalsRequestedAt: number
+}
+
+function sweepMaps(s: State) {
+  if (s.misses.size > MAX_MISSES) {
+    const now = Date.now()
+    for (const [id, at] of s.misses) if (now - at >= NEGATIVE_CACHE_TTL) s.misses.delete(id)
+    while (s.misses.size > MAX_MISSES) {
+      const oldest = s.misses.keys().next()
+      if (oldest.done) break
+      s.misses.delete(oldest.value)
+    }
+  }
+  if (s.queue.size > MAX_QUEUED_SESSIONS) {
+    for (const id of s.queue.keys()) {
+      if (s.queue.size <= MAX_QUEUED_SESSIONS) break
+      if (!s.shared.has(id)) s.queue.delete(id)
+    }
+  }
 }
 
 type Data =
@@ -122,7 +153,7 @@ export interface Interface {
   readonly url: () => Effect.Effect<string, unknown>
   readonly request: () => Effect.Effect<Req, unknown>
   readonly create: (sessionID: SessionID) => Effect.Effect<Share, unknown>
-  readonly remove: (sessionID: SessionID) => Effect.Effect<void, unknown>
+  readonly remove: (sessionID: SessionID) => Effect.Effect<{ remoteDeleted: boolean }, unknown>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/ShareNext") {}
@@ -206,6 +237,15 @@ const layer = Layer.effect(
           const dropped = trimQueue(queued)
           if (dropped > 0) yield* Effect.logWarning("share queue capped", { sessionID: sessionID, dropped: dropped })
         }
+        sweepMaps(s)
+
+        if (s.removals.size > 0 && Date.now() - s.removalsRequestedAt > REMOVAL_RETRY_MS) {
+          s.removalsRequestedAt = Date.now()
+          yield* retryRemovals(s).pipe(
+            Effect.catchCause((cause) => Effect.logWarning("share removal retry failed", { cause })),
+            Effect.forkIn(s.scope),
+          )
+        }
 
         // One delayed flush per session; while one is scheduled or in flight the batch
         // is only merged so a stalled/failed POST cannot race a second one.
@@ -228,6 +268,8 @@ const layer = Layer.effect(
           scope: yield* Scope.make(),
           shared: new Map(),
           misses: new Map(),
+          removals: new Map(),
+          removalsRequestedAt: 0,
         }
 
         yield* Effect.addFinalizer(() =>
@@ -239,6 +281,7 @@ const layer = Layer.effect(
                 cache.scheduled.clear()
                 cache.shared.clear()
                 cache.misses.clear()
+                cache.removals.clear()
               }),
             ),
           ),
@@ -377,17 +420,55 @@ const layer = Layer.effect(
       const cached = s.shared.get(sessionID)
       if (cached) return cached
       const missAt = s.misses.get(sessionID)
-      if (missAt !== undefined && Date.now() - missAt < NEGATIVE_CACHE_TTL) return undefined
+      if (missAt !== undefined) {
+        if (Date.now() - missAt < NEGATIVE_CACHE_TTL) return undefined
+        s.misses.delete(sessionID)
+      }
 
       const share = yield* get(sessionID)
       if (!share) {
         s.misses.set(sessionID, Date.now())
+        sweepMaps(s)
         return undefined
       }
       s.shared.set(sessionID, share)
       s.misses.delete(sessionID)
       return share
     })
+
+    // Retry remote deletes whose first attempt failed. `remove` stores a tombstone
+    // instead of dropping the failure, so a later sync can complete the unshare.
+    const retryRemovals = Effect.fnUntraced(function* (s: State) {
+      if (s.removals.size === 0) return
+      const req = yield* request()
+      for (const [sessionID, share] of Array.from(s.removals)) {
+        const result = yield* Effect.exit(
+          HttpClientRequest.delete(`${req.baseUrl}${req.api.remove(share.id)}`).pipe(
+            HttpClientRequest.setHeaders(req.headers),
+            HttpClientRequest.bodyJson({ secret: share.secret }),
+            Effect.flatMap((r) => httpOk.execute(r)),
+            Effect.timeout(SHARE_REQUEST_TIMEOUT),
+          ),
+        )
+        if (Exit.isSuccess(result)) s.removals.delete(sessionID)
+      }
+    })
+
+    const cleanupLocal = (sessionID: SessionID, s: State) =>
+      Effect.gen(function* () {
+        yield* db
+          .delete(SessionShareTable)
+          .where(eq(SessionShareTable.session_id, sessionID))
+          .run()
+          .pipe(Effect.orDie)
+        yield* Effect.sync(() => {
+          s.shared.delete(sessionID)
+          s.queue.delete(sessionID)
+          s.misses.delete(sessionID)
+          s.inflight.delete(sessionID)
+          s.scheduled.delete(sessionID)
+        })
+      })
 
     const drain = (sessionID: SessionID, s: State) =>
       Effect.gen(function* () {
@@ -550,41 +631,47 @@ const layer = Layer.effect(
     })
 
     const remove = Effect.fn("ShareNext.remove")(function* (sessionID: SessionID) {
-      if (disabled) return
+      if (disabled) return { remoteDeleted: true }
       yield* Effect.logInfo("removing share", { sessionID: sessionID })
       const s = yield* InstanceState.get(state)
       const share = yield* getCached(sessionID)
 
-      yield* Effect.gen(function* () {
-        if (!share) return
-        const req = yield* request()
-        yield* HttpClientRequest.delete(`${req.baseUrl}${req.api.remove(share.id)}`).pipe(
-          HttpClientRequest.setHeaders(req.headers),
-          HttpClientRequest.bodyJson({ secret: share.secret }),
-          Effect.flatMap((r) => httpOk.execute(r)),
-          Effect.timeout(SHARE_REQUEST_TIMEOUT),
-        )
-      }).pipe(
-        Effect.catchCause((cause) => Effect.logWarning("failed to remove share", { sessionID: sessionID, cause })),
-        // Local state is dropped whether or not the remote delete succeeded, so a
-        // dead endpoint cannot leave the session marked shared forever (O-16).
-        Effect.ensuring(
-          Effect.gen(function* () {
-            yield* db
-              .delete(SessionShareTable)
-              .where(eq(SessionShareTable.session_id, sessionID))
-              .run()
-              .pipe(Effect.orDie)
-            yield* Effect.sync(() => {
-              s.shared.delete(sessionID)
-              s.queue.delete(sessionID)
-              s.misses.delete(sessionID)
-              s.inflight.delete(sessionID)
-              s.scheduled.delete(sessionID)
-            })
-          }),
-        ),
+      if (!share) {
+        // Local state is always cleared, so a dead endpoint cannot leave the
+        // session marked shared forever (O-16).
+        yield* cleanupLocal(sessionID, s)
+        return { remoteDeleted: true }
+      }
+
+      const result = yield* Effect.exit(
+        Effect.gen(function* () {
+          const req = yield* request()
+          yield* HttpClientRequest.delete(`${req.baseUrl}${req.api.remove(share.id)}`).pipe(
+            HttpClientRequest.setHeaders(req.headers),
+            HttpClientRequest.bodyJson({ secret: share.secret }),
+            Effect.flatMap((r) => httpOk.execute(r)),
+            Effect.timeout(SHARE_REQUEST_TIMEOUT),
+          )
+        }),
       )
+
+      if (Exit.isFailure(result)) {
+        s.removals.set(sessionID, share)
+        yield* Effect.logWarning("failed to remove share", { sessionID: sessionID, cause: result.cause })
+      } else {
+        s.removals.delete(sessionID)
+      }
+      yield* cleanupLocal(sessionID, s)
+      // Schedule one delayed retry so an unshare that hit a transient failure is
+      // completed without waiting for unrelated share activity.
+      if (s.removals.size > 0) {
+        yield* retryRemovals(s).pipe(
+          Effect.delay(`${REMOVAL_RETRY_MS} millis`),
+          Effect.catchCause((cause) => Effect.logWarning("share removal retry failed", { cause })),
+          Effect.forkIn(s.scope),
+        )
+      }
+      return { remoteDeleted: Exit.isSuccess(result) }
     })
 
     return Service.of({ init, url, request, create, remove })

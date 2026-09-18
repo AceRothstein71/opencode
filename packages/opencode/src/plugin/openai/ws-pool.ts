@@ -1,4 +1,5 @@
 import WebSocket from "ws"
+import { createHash } from "node:crypto"
 import { ProviderError } from "@/provider/error"
 import { isRecord } from "@/util/record"
 import { OpenAIWebSocket } from "./ws"
@@ -20,9 +21,12 @@ interface PoolEntry {
   socket?: WebSocket
   connectedAt?: number
   lastUsedAt: number
+  busyAt: number
   busy: boolean
   fallback: boolean
   streamFailures: number
+  backoff: number
+  nextAttemptAt: number
 }
 
 const DEFAULT_CONNECT_TIMEOUT = 15_000
@@ -31,6 +35,8 @@ const DEFAULT_FALLBACK_TIMEOUT = 10 * 60 * 1000
 const DEFAULT_MAX_CONNECTION_AGE = 55 * 60 * 1000
 const CONNECTION_LIMIT_REACHED_CODE = "websocket_connection_limit_reached"
 const MAX_POOL_SIZE = 32
+const BACKOFF_BASE_MS = 25
+const BACKOFF_MAX_MS = 5_000
 
 export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
   const httpFetch = options?.httpFetch ?? globalThis.fetch
@@ -81,9 +87,12 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
     const entry = existing ?? {
       sessionID,
       lastUsedAt: Date.now(),
+      busyAt: 0,
       busy: false,
       fallback: false,
       streamFailures: 0,
+      backoff: 0,
+      nextAttemptAt: 0,
     }
     pool.set(key, entry)
 
@@ -93,10 +102,19 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
     if (entry.busy) {
       return httpFetch(input, httpInit)
     }
-
     entry.busy = true
+    entry.busyAt = Date.now()
     entry.lastUsedAt = Date.now()
     try {
+      // Back off after a failed attempt so a struggling endpoint is not hammered with
+      // immediate reconnects (which worsens `websocket_connection_limit_reached`).
+      // Reserve the lane before yielding, or a concurrent caller can admit a second
+      // connection for this key while the delay is pending.
+      await waitForBackoff(entry, init?.signal)
+      if (entry.fallback) {
+        entry.busy = false
+        return httpFetch(input, httpInit)
+      }
       entry.socket = await socket(entry, socketURL, authHeaders, connectTimeout, maxConnectionAge, init?.signal)
       let resolveFirstEvent: (event: boolean | OpenAIWebSocket.WrappedError) => void = () => {}
       let rejectFirstEvent: (error: Error) => void = () => {}
@@ -114,6 +132,7 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
           entry.busy = false
           entry.lastUsedAt = Date.now()
           entry.streamFailures = 0
+          resetBackoff(entry)
           if (event.type !== "response.completed" && event.type !== "response.done") {
             invalidate(entry)
           }
@@ -130,6 +149,7 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
           entry.busy = false
           entry.lastUsedAt = Date.now()
           entry.streamFailures = 0
+          resetBackoff(entry)
           invalidate(entry)
           rejectFirstEvent(error)
         },
@@ -141,6 +161,7 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
       })
       const first = await firstEvent
       if (first !== false) {
+        resetBackoff(entry)
         if (first === true || first.status < 200 || first.status > 599) return response
         return new Response(first.body, {
           status: first.status,
@@ -171,8 +192,15 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
 
   function recordStreamFailure(entry: PoolEntry) {
     entry.streamFailures++
+    entry.backoff = entry.backoff === 0 ? BACKOFF_BASE_MS : Math.min(entry.backoff * 2, BACKOFF_MAX_MS)
+    entry.nextAttemptAt = Date.now() + entry.backoff + Math.floor(Math.random() * entry.backoff)
     // Codex counts retries after the initial failed WebSocket attempt.
     if (entry.streamFailures > streamRetries) entry.fallback = true
+  }
+
+  function resetBackoff(entry: PoolEntry) {
+    entry.backoff = 0
+    entry.nextAttemptAt = 0
   }
 
   // Bound total entries, not just idle ones: when every slot is busy the caller
@@ -191,8 +219,19 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
 
   function prune() {
     const now = Date.now()
+    const busyTimeout = Math.max(idleTimeout, 60_000)
     for (const [key, entry] of pool) {
-      if (entry.busy) continue
+      // A caller that drops the response without reading or cancelling never fires
+      // `onTerminal`/`onAbort`, so reclaim a slot that has been busy far longer than
+      // any real stream. Do not reclaim while a backoff is pending or during a
+      // shorter-configured idle window.
+      if (entry.busy && (entry.nextAttemptAt > now || now - entry.busyAt < busyTimeout)) continue
+      if (entry.busy) {
+        entry.busy = false
+        invalidate(entry)
+      }
+      // Keep the retry budget and backoff state while a reconnect is pending.
+      if (entry.nextAttemptAt > now) continue
       if (now - entry.lastUsedAt < (entry.fallback ? fallbackTimeout : idleTimeout)) continue
       invalidate(entry)
       pool.delete(key)
@@ -216,17 +255,30 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
   return Object.assign(websocketFetch, { close, remove })
 }
 
-function fingerprint(url: string, headers: Record<string, string>) {
-  let hash = 2166136261
-  const feed = (text: string) => {
-    for (let index = 0; index < text.length; index++) {
-      hash ^= text.charCodeAt(index)
-      hash = Math.imul(hash, 16777619)
+function waitForBackoff(entry: PoolEntry, signal?: AbortSignal | null) {
+  const remaining = entry.nextAttemptAt - Date.now()
+  if (remaining <= 0) return Promise.resolve()
+  return new Promise<void>((resolve) => {
+    if (signal?.aborted) return resolve()
+    const onAbort = () => {
+      clearTimeout(timer)
+      resolve()
     }
-  }
-  feed(url)
-  for (const key of Object.keys(headers).sort()) feed(`\u0000${key}:${headers[key]}`)
-  return (hash >>> 0).toString(36)
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort)
+      resolve()
+    }, remaining)
+    signal?.addEventListener("abort", onAbort, { once: true })
+  })
+}
+
+// Key on a 256-bit digest, not a 32-bit FNV-1a: two callers sharing a sessionID
+// with different bearer tokens must never collide and reuse each other's socket.
+function fingerprint(url: string, headers: Record<string, string>) {
+  const hash = createHash("sha256")
+  hash.update(url)
+  for (const key of Object.keys(headers).sort()) hash.update(`\u0000${key}:${headers[key]}`)
+  return hash.digest("hex")
 }
 
 function connectionLimitError(event: Record<string, unknown>) {

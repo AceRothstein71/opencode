@@ -117,6 +117,9 @@ export namespace Storage {
   }
 
   export async function list(options?: { prefix?: string[]; limit?: number; after?: string; before?: string }) {
+    for (const segment of options?.prefix ?? []) {
+      if (!KEY_SEGMENT.test(segment)) throw new Error(`Invalid storage key segment: ${segment}`)
+    }
     const p = options?.prefix ? options.prefix.join("/") + (options.prefix.length ? "/" : "") : ""
     const result = await adapter().list({
       prefix: p,

@@ -582,7 +582,6 @@ const layer = Layer.effect(
           { concurrency: "unbounded" },
         )
 
-        McpOAuthCallback.retain()
         yield* Effect.addFinalizer(() =>
           Effect.gen(function* () {
             const clients = Object.values(s.clients)
@@ -597,6 +596,9 @@ const layer = Layer.effect(
             yield* Effect.promise(() => McpOAuthCallback.release())
           }),
         )
+        // Register the releaser before taking the reference, so an interrupted init
+        // can never leave `consumers` incremented without a matching release.
+        McpOAuthCallback.retain()
 
         return s
       }),

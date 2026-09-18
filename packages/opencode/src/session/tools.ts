@@ -69,7 +69,9 @@ function capMetadataValue(value: unknown, depth: number): unknown {
   const next: Record<string, unknown> = {}
   for (const [key, item] of Object.entries(value)) {
     const capped = capMetadataValue(item, depth + 1)
-    next[key] = capped
+    // `next[key] = capped` would hit the `__proto__` setter and rewrite the clone's
+    // prototype instead of adding an own property, silently dropping the key.
+    Object.defineProperty(next, key, { value: capped, enumerable: true, configurable: true, writable: true })
     if (capped !== item) changed = true
   }
   return changed ? next : value

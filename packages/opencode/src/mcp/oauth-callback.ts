@@ -155,6 +155,7 @@ export function waitForCallback(oauthState: string, mcpName?: string): Promise<s
         stopIfIdle()
       }
     }, CALLBACK_TIMEOUT_MS)
+    if (typeof timeout === "object" && "unref" in timeout && typeof timeout.unref === "function") timeout.unref()
 
     pendingAuths.set(oauthState, { resolve, reject, timeout })
   })

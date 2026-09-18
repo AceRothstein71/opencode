@@ -162,9 +162,14 @@ function describeTool(description: string | undefined, server: string | undefine
   return server ? `[${server}] ${capped}` : capped
 }
 
+// `{}` means "allow anything" in JSON Schema, so a bound that returns it *widens*
+// validation. Return an unsatisfiable schema instead: exceeding the depth/node cap
+// or hitting a cycle must reject that subtree, not accept it unchecked.
+const UNSATISFIABLE: JSONSchema7 = { not: {} }
+
 function boundSchema(value: unknown, depth = 0, seen = new WeakSet<object>(), counter = { nodes: 0 }): unknown {
   if (value === null || typeof value !== "object") return value
-  if (depth > MAX_SCHEMA_DEPTH || counter.nodes >= MAX_SCHEMA_NODES || seen.has(value)) return {}
+  if (depth > MAX_SCHEMA_DEPTH || counter.nodes >= MAX_SCHEMA_NODES || seen.has(value)) return UNSATISFIABLE
   seen.add(value)
   counter.nodes++
   if (Array.isArray(value)) return value.map((item) => boundSchema(item, depth + 1, seen, counter))

@@ -40,6 +40,10 @@ import { WorkspaceEvent } from "@opencode-ai/schema/workspace-event"
 // must agree on the bound and this module already sits below both.
 export const SYNC_HISTORY_LIMIT = 1000
 
+// A misbehaving workspace can return a full, ever-advancing page forever, so bound
+// the history pull instead of looping without end.
+const SYNC_HISTORY_MAX_PAGES = 1000
+
 export const Info = Schema.Struct({
   ...WorkspaceInfoSchema.fields,
   timeUsed: Schema.Number,
@@ -333,7 +337,7 @@ const layer = Layer.effect(
 
       // The server caps a single page, so keep requesting with the advanced
       // per-aggregate sequence until it returns no further events.
-      while (true) {
+      for (let page = 0; page < SYNC_HISTORY_MAX_PAGES; page++) {
         const response = yield* http.execute(
           HttpClientRequest.post(route(url, "/sync/history"), {
             headers: new Headers(headers),
@@ -379,6 +383,10 @@ const layer = Layer.effect(
         }
         if (history.length < SYNC_HISTORY_LIMIT || !progressed) return
       }
+      return yield* new SyncHttpError({
+        message: `Workspace history exceeded ${SYNC_HISTORY_MAX_PAGES} pages`,
+        status: 0,
+      })
     })
 
     const syncWorkspaceLoop = Effect.fn("Workspace.syncWorkspaceLoop")(function* (space: Info) {
