@@ -242,6 +242,7 @@ export const {
           void bootstrap()
           break
         case "permission.replied": {
+          if (deletedSessions.has(event.properties.sessionID)) break
           const requests = store.permission[event.properties.sessionID]
           if (!requests) break
           const match = search(requests, event.properties.requestID, (r) => r.id)
@@ -257,6 +258,7 @@ export const {
         }
 
         case "permission.asked": {
+          if (deletedSessions.has(event.properties.sessionID)) break
           const request = event.properties
           if (permission.mode === "auto") {
             void sdk.client.permission.reply({
@@ -289,6 +291,7 @@ export const {
 
         case "question.replied":
         case "question.rejected": {
+          if (deletedSessions.has(event.properties.sessionID)) break
           const requests = store.question[event.properties.sessionID]
           if (!requests) break
           const match = search(requests, event.properties.requestID, (r) => r.id)
@@ -304,6 +307,7 @@ export const {
         }
 
         case "question.asked": {
+          if (deletedSessions.has(event.properties.sessionID)) break
           const request = event.properties
           const requests = store.question[request.sessionID]
           if (!requests) {

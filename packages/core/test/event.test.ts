@@ -1,4 +1,4 @@
-import { describe, expect } from "bun:test"
+import { describe, expect, test } from "bun:test"
 import { Cause, DateTime, Deferred, Effect, Exit, Fiber, Layer, Option, Schema, Stream } from "effect"
 import { EventV2 } from "@opencode-ai/core/event"
 import { Event } from "@opencode-ai/schema/event"
@@ -1196,6 +1196,24 @@ describe("EventV2", () => {
     }),
   )
 
+  it.effect("ends a durable stream for the most recent of many removals", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const removed = Array.from({ length: 4 }, () => Session.ID.create())
+      for (const aggregateID of removed) {
+        yield* events.publish(DurableMessage, durableData(aggregateID, "seed"))
+        yield* events.remove(aggregateID)
+      }
+
+      const result = yield* events
+        .durable({ aggregateID: removed.at(-1)! })
+        .pipe(Stream.runCollect, Effect.timeoutOption("1 second"))
+
+      expect(Option.isSome(result)).toBe(true)
+      if (Option.isSome(result)) expect(Array.from(result.value)).toEqual([])
+    }),
+  )
+
   it.effect("runs every live-only listener and the pubsub fan-out before re-raising the defect", () =>
     Effect.gen(function* () {
       const events = yield* EventV2.Service
@@ -1317,4 +1335,22 @@ describe("EventV2", () => {
       expect(received.at(-1)?.durable?.seq).toBe(count - 1)
     }),
   )
+})
+
+describe("EventV2.rememberRemoved", () => {
+  test("bounds the tombstone, evicting the oldest removals first", () => {
+    const removed = new Set<string>()
+    for (let index = 0; index < 5; index++) EventV2.rememberRemoved(removed, `ses_${index}`, 3)
+
+    expect([...removed]).toEqual(["ses_2", "ses_3", "ses_4"])
+  })
+
+  test("moves a re-removed aggregate to the newest position", () => {
+    const removed = new Set<string>()
+    EventV2.rememberRemoved(removed, "ses_a", 2)
+    EventV2.rememberRemoved(removed, "ses_b", 2)
+    EventV2.rememberRemoved(removed, "ses_a", 2)
+
+    expect([...removed]).toEqual(["ses_b", "ses_a"])
+  })
 })

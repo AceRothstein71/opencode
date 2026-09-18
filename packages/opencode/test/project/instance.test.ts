@@ -106,6 +106,10 @@ describe("InstanceStore", () => {
       yield* Deferred.succeed(release, undefined)
       yield* Fiber.join(fiber)
     }),
+    // 17 real git worktrees; under concurrent load the default 5 s budget is too tight, so
+    // give the setup an explicit budget instead of flaking (v9 F4b). The ordering itself is
+    // deterministic: `held` guards the lease and `store.load` awaits the eviction.
+    { timeout: 15_000 },
   )
 
   it.live("runs bootstrap with InstanceRef provided", () =>
@@ -400,6 +404,46 @@ describe("InstanceStore", () => {
       yield* Fiber.join(fiber)
       yield* Fiber.join(disposing)
       expect(disposed).toEqual([dir])
+    }),
+  )
+
+  it.live("reloads instead of leasing an instance that is already being disposed", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped({ git: true })
+      const store = yield* InstanceStore.Service
+      const disposed: string[] = []
+      const disposing = yield* Deferred.make<void>()
+      const releaseDispose = yield* Deferred.make<() => void>()
+      yield* registerDisposerScoped((directory) => {
+        disposed.push(directory)
+        Deferred.doneUnsafe(disposing, Effect.void)
+        return new Promise<void>((resolve) => {
+          Deferred.doneUnsafe(releaseDispose, Effect.succeed(resolve))
+        })
+      })
+
+      const ctx = yield* store.load({ directory: dir })
+      const disposingFiber = yield* store.dispose(ctx).pipe(Effect.forkScoped)
+      yield* Deferred.await(disposing)
+
+      let captured: unknown
+      const provided = yield* store
+        .provide(
+          { directory: dir },
+          Effect.gen(function* () {
+            captured = yield* InstanceRef
+          }),
+        )
+        .pipe(Effect.forkScoped)
+
+      const release = yield* Deferred.await(releaseDispose)
+      yield* Effect.sync(release)
+      yield* Fiber.join(disposingFiber)
+      yield* Fiber.join(provided)
+
+      expect(disposed).toEqual([dir])
+      expect(captured).toBeDefined()
+      expect(captured).not.toBe(ctx)
     }),
   )
 })

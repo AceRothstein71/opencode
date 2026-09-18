@@ -34,7 +34,18 @@ interface Entry {
   readonly deferred: Deferred.Deferred<InstanceContext>
   /** Outstanding `provide` leases; a leased entry is never evicted (D-P1-05). */
   uses: number
+  /** Set synchronously once a teardown claims the entry; a `provide` that observes it reloads. */
+  disposed: boolean
+  /** Resolves when a claimed teardown finished and the entry left the cache. */
+  readonly closed: Deferred.Deferred<void>
 }
+
+const makeEntry = (): Entry => ({
+  deferred: Deferred.makeUnsafe<InstanceContext>(),
+  uses: 0,
+  disposed: false,
+  closed: Deferred.makeUnsafe<void>(),
+})
 
 const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Service> = Layer.effect(
   Service,
@@ -116,10 +127,26 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
     const disposeEntry = Effect.fnUntraced(function* (directory: string, entry: Entry, ctx: InstanceContext) {
       if (cache.get(directory) !== entry) return false
       yield* awaitLease(entry)
-      if (cache.get(directory) !== entry) return false
-      yield* disposeContext(ctx)
-      if (cache.get(directory) !== entry) return false
-      cache.delete(directory)
+      // Claim the entry in one synchronous step. A `provide` may have leased it after
+      // `awaitLease` observed `uses === 0`; both this claim and `provide`'s check-and-increment
+      // are synchronous critical sections, so whichever runs first is observed by the other.
+      // If a lease landed, leave the entry alive rather than tearing down under it (W5).
+      const claimed = yield* Effect.sync(() => {
+        if (cache.get(directory) !== entry) return false
+        if (entry.disposed) return false
+        if (entry.uses > 0) return false
+        entry.disposed = true
+        return true
+      })
+      if (!claimed) return false
+      yield* disposeContext(ctx).pipe(
+        Effect.ensuring(
+          Effect.gen(function* () {
+            if (cache.get(directory) === entry) cache.delete(directory)
+            yield* Deferred.succeed(entry.closed, undefined)
+          }),
+        ),
+      )
       return true
     })
 
@@ -148,7 +175,7 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
           }
 
           yield* evictStale()
-          const entry: Entry = { deferred: Deferred.makeUnsafe<InstanceContext>(), uses: 0 }
+          const entry = makeEntry()
           cache.set(directory, entry)
           yield* Effect.gen(function* () {
             yield* Effect.logInfo("creating instance", { directory: directory })
@@ -170,16 +197,17 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
       return Effect.uninterruptibleMask((restore) =>
         Effect.gen(function* () {
           const previous = cache.get(directory)
+          const reusable = previous && !previous.disposed ? previous : undefined
           // A reload for a directory not already cached adds an entry like `load`, so it
           // must enforce the bound too; a replacement keeps the size unchanged.
-          if (!previous) yield* evictStale()
-          const entry: Entry = { deferred: Deferred.makeUnsafe<InstanceContext>(), uses: 0 }
+          if (!reusable) yield* evictStale()
+          const entry = makeEntry()
           cache.set(directory, entry)
           yield* Effect.gen(function* () {
             yield* Effect.logInfo("reloading instance", { directory: directory })
-            if (previous) {
-              yield* Deferred.await(previous.deferred).pipe(Effect.ignore)
-              yield* awaitLease(previous)
+            if (reusable) {
+              yield* Deferred.await(reusable.deferred).pipe(Effect.ignore)
+              yield* awaitLease(reusable)
               yield* Effect.promise(() => runDisposers(directory))
               yield* emitDisposed({ directory, project: input.project?.id })
             }
@@ -209,6 +237,10 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
       yield* disposeEntry(directory, entry, exit.value).pipe(Effect.asVoid)
     })
 
+    // Runs entries sequentially: each `disposeEntry` may wait up to LEASE_DRAIN_TIMEOUT_MS for a
+    // lease to drain, so the worst case is MAX_CACHED_INSTANCES * 2 s (~32 s) during explicit
+    // shutdown. Parallelising would shorten it but changes teardown ordering, so the bound is
+    // documented rather than changed here (W5/F4c).
     const disposeAllOnce = Effect.fnUntraced(function* () {
       yield* Effect.logInfo("disposing all instances")
       yield* Effect.forEach(
@@ -234,15 +266,22 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
 
     const provide = <A, E, R>(input: LoadInput, effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>
       Effect.gen(function* () {
-        const { ctx, entry } = yield* loadEntry(input)
+        const loaded = yield* loadEntry(input)
+        // A teardown may have claimed this entry between `loadEntry` returning it and the
+        // lease increment; wait for that teardown to finish, then load a fresh entry rather
+        // than run against a disposed context (W5).
+        if (loaded.entry.disposed) {
+          yield* Deferred.await(loaded.entry.closed)
+          return yield* provide(input, effect)
+        }
         // Hold the lease on the exact entry the effect is using, not whatever the cache
         // holds now, so a concurrent reload cannot make the lease land on the wrong entry.
-        entry.uses += 1
+        loaded.entry.uses += 1
         return yield* effect.pipe(
-          Effect.provideService(InstanceRef, ctx),
+          Effect.provideService(InstanceRef, loaded.ctx),
           Effect.ensuring(
             Effect.sync(() => {
-              entry.uses = Math.max(0, entry.uses - 1)
+              loaded.entry.uses = Math.max(0, loaded.entry.uses - 1)
             }),
           ),
         )

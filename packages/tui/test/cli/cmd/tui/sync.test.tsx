@@ -213,4 +213,42 @@ describe("tui sync", () => {
       app.renderer.destroy()
     }
   })
+
+  test("late permission and question events cannot repopulate a deleted session", async () => {
+    await using tmp = await tmpdir()
+    await Bun.write(`${tmp.path}/kv.json`, "{}")
+    const { app, emit, sync } = await mount(undefined, tmp.path)
+
+    const sessionID = "ses_deleted_attention"
+    const info = {
+      id: sessionID,
+      slug: sessionID,
+      projectID: "project",
+      directory: "/tmp/opencode/packages/tui",
+      title: "deleted",
+      version: "1.15.13",
+      time: { created: 0, updated: 0 },
+    }
+    const permission = {
+      id: "per_deleted",
+      sessionID,
+      permission: "edit",
+      patterns: [],
+      metadata: {},
+      always: [],
+    }
+    const question = { id: "que_deleted", sessionID, questions: [] }
+
+    try {
+      emit(global({ id: "evt_attn_deleted", type: "session.deleted", properties: { sessionID, info } }))
+      emit(global({ id: "evt_attn_permission", type: "permission.asked", properties: permission }))
+      emit(global({ id: "evt_attn_question", type: "question.asked", properties: question }))
+      await Bun.sleep(30)
+
+      expect(sync.data.permission[sessionID]).toBeUndefined()
+      expect(sync.data.question[sessionID]).toBeUndefined()
+    } finally {
+      app.renderer.destroy()
+    }
+  })
 })

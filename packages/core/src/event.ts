@@ -283,6 +283,26 @@ export interface LayerOptions {
   readonly beforeAggregateRead?: (aggregateID: string) => Effect.Effect<void>
 }
 
+// Aggregates removed by `remove()` are tombstoned so a durable stream created afterwards
+// ends immediately instead of parking on a wake that will never receive a null (v8 NEW-07).
+// The tombstone is bounded: a workload that removes many aggregates without ever re-creating
+// them would otherwise grow it for the process lifetime (v9 NEW-V9-05). Oldest removals are
+// evicted first, so the newest removes stay terminal. Residual: a `durable()` created after
+// more than MAX_REMOVED_AGGREGATES later removes on that same aggregate can park again, which
+// is preferable to unbounded growth; re-creating the aggregate clears the tombstone either way.
+export const MAX_REMOVED_AGGREGATES = 4_096
+
+export function rememberRemoved(removed: Set<string>, aggregateID: string, max = MAX_REMOVED_AGGREGATES) {
+  // Re-insert so eviction order tracks the latest removal, then drop the oldest tombstones.
+  removed.delete(aggregateID)
+  removed.add(aggregateID)
+  while (removed.size > max) {
+    const oldest = removed.values().next()
+    if (oldest.done) break
+    removed.delete(oldest.value)
+  }
+}
+
 // A durable wake coalesces payloads through a sliding(1) pubsub, so a terminal removal
 // can be evicted by a later signal. The Deferred carries termination independently.
 type DurableWake = {
@@ -300,9 +320,8 @@ export const layerWith = (options?: LayerOptions) =>
         typed: new Map<string, PubSub.PubSub<Payload>>(),
       }
       const projectors = new Map<string, Subscriber[]>()
-      // Aggregates removed by `remove()`: a durable stream created afterwards must end
-      // immediately instead of parking on a wake that will never receive a null. Cleared
-      // when the aggregate is re-created by a later commit (v8 NEW-07).
+      // Tombstones for `remove()`d aggregates; bounded by `rememberRemoved`. Cleared when
+      // the aggregate is re-created by a later commit.
       const removedAggregates = new Set<string>()
       // TODO: Bind durable projectors to exact type+version before supporting incompatible historical payloads.
       const listeners = new Array<Subscriber>()
@@ -691,7 +710,7 @@ export const layerWith = (options?: LayerOptions) =>
             .pipe(retryDurableWrite("event.remove"), Effect.orDie)
           // Terminal null marker ends durable streams against a deleted log; the Deferred
           // guarantees termination even when the sliding(1) wake evicts the null.
-          removedAggregates.add(aggregateID)
+          rememberRemoved(removedAggregates, aggregateID)
           const wakes = pubsub.durable.get(aggregateID)
           if (wakes)
             yield* Effect.forEach(

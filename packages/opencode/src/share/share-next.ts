@@ -151,14 +151,35 @@ function sweepMaps(s: State) {
   boundQueueMaps(s.queue, s.shared, s)
 }
 
-function rememberRemoval(s: State, sessionID: SessionID, share: Share) {
-  s.removals.delete(sessionID)
-  s.removals.set(sessionID, share)
-  while (s.removals.size > MAX_REMOVALS) {
-    const oldest = s.removals.keys().next()
+// Every entry here is a DELETE that is still pending, so the cap can only drop pending
+// work; it drops the oldest first, keeping the most recent failures (the ones a live client
+// is most likely waiting on). Residual: a dropped tombstone is no longer retried in this
+// process, so if its share is still readable it stays that way until a reconnect or restart.
+// The alternative is unbounded growth, which the bound exists to prevent (v9 NEW-V9-06).
+export function rememberRemoval(
+  removals: Map<SessionID, Share>,
+  sessionID: SessionID,
+  share: Share,
+  max = MAX_REMOVALS,
+) {
+  removals.delete(sessionID)
+  removals.set(sessionID, share)
+  const evicted: SessionID[] = []
+  while (removals.size > max) {
+    const oldest = removals.keys().next()
     if (oldest.done) break
-    s.removals.delete(oldest.value)
+    removals.delete(oldest.value)
+    evicted.push(oldest.value)
   }
+  return evicted
+}
+
+export function reportRemovalEviction(evicted: ReadonlyArray<SessionID>) {
+  if (evicted.length === 0) return Effect.void
+  return Effect.logWarning("share removal tombstones capped; oldest pending remote deletes dropped", {
+    dropped: evicted.length,
+    sessionIDs: evicted,
+  })
 }
 
 type Data =
@@ -698,7 +719,7 @@ const layer = Layer.effect(
       )
 
       if (Exit.isFailure(result)) {
-        rememberRemoval(s, sessionID, share)
+        yield* reportRemovalEviction(rememberRemoval(s.removals, sessionID, share))
         yield* Effect.logWarning("failed to remove share", { sessionID: sessionID, cause: result.cause })
       } else {
         s.removals.delete(sessionID)

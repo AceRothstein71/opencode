@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, test } from "bun:test"
-import { Effect, Exit, Layer, Option } from "effect"
+import { Effect, Exit, Layer, Logger, Option } from "effect"
 import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/unstable/http"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { httpClient } from "@opencode-ai/core/effect/app-node-platform"
@@ -15,7 +15,7 @@ import type { SessionID } from "../../src/session/schema"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
-import { ShareNext, boundQueueMaps, trimQueue } from "@/share/share-next"
+import { ShareNext, boundQueueMaps, rememberRemoval, reportRemovalEviction, trimQueue } from "@/share/share-next"
 import { SessionShareTable } from "@opencode-ai/core/share/sql"
 import { Database } from "@opencode-ai/core/database/database"
 import { eq } from "drizzle-orm"
@@ -613,6 +613,68 @@ describe("ShareNext.boundQueueMaps", () => {
     expect(queue.has(id("ses_0"))).toBe(true)
     expect(queue.has(id("ses_1"))).toBe(true)
     expect(queue.has(id("ses_2"))).toBe(false)
+  })
+})
+
+describe("ShareNext.rememberRemoval", () => {
+  const id = (value: string) => value as SessionID
+  const share = (value: string) => ({ id: value, url: value, secret: value })
+
+  test("bounds the pending removals and reports the oldest evictions", () => {
+    const removals = new Map<SessionID, ReturnType<typeof share>>()
+    let evicted: SessionID[] = []
+    for (let index = 0; index < 5; index++) {
+      evicted = rememberRemoval(removals, id(`ses_${index}`), share(`shr_${index}`), 3)
+    }
+
+    expect([...removals.keys()].map(String)).toEqual(["ses_2", "ses_3", "ses_4"])
+    expect(evicted.map(String)).toEqual(["ses_1"])
+  })
+
+  test("moves a re-remembered session to the newest position", () => {
+    const removals = new Map<SessionID, ReturnType<typeof share>>()
+    rememberRemoval(removals, id("ses_a"), share("shr_a"), 2)
+    rememberRemoval(removals, id("ses_b"), share("shr_b"), 2)
+    const evicted = rememberRemoval(removals, id("ses_a"), share("shr_a2"), 2)
+
+    expect(evicted.map(String)).toEqual([])
+    expect([...removals.keys()].map(String)).toEqual(["ses_b", "ses_a"])
+  })
+
+  test("warns with the dropped session names when the cap evicts", async () => {
+    const messages: unknown[] = []
+    await Effect.runPromise(
+      reportRemovalEviction([id("ses_old")]).pipe(
+        Effect.provide(
+          Logger.layer([
+            Logger.make<unknown, void>((options) => {
+              messages.push(options.message)
+            }),
+          ]),
+        ),
+      ),
+    )
+
+    expect(messages).toEqual([
+      ["share removal tombstones capped; oldest pending remote deletes dropped", { dropped: 1, sessionIDs: ["ses_old"] }],
+    ])
+  })
+
+  test("stays silent when nothing is evicted", async () => {
+    const messages: unknown[] = []
+    await Effect.runPromise(
+      reportRemovalEviction([]).pipe(
+        Effect.provide(
+          Logger.layer([
+            Logger.make<unknown, void>((options) => {
+              messages.push(options.message)
+            }),
+          ]),
+        ),
+      ),
+    )
+
+    expect(messages).toEqual([])
   })
 })
 
