@@ -131,10 +131,11 @@ export const EditTool = Tool.define(
                 contentOld = ""
                 contentNew = next.text
                 diff = trimDiff(createTwoFilesPatch(filePath, filePath, contentOld, contentNew))
+                const relative = path.relative(instance.worktree, filePath)
                 yield* ctx.ask({
                   permission: "edit",
-                  patterns: [path.relative(instance.worktree, filePath)],
-                  always: ["*"],
+                  patterns: [relative],
+                  always: [relative],
                   metadata: {
                     filepath: filePath,
                     diff,
@@ -175,10 +176,11 @@ export const EditTool = Tool.define(
                   normalizeLineEndings(contentNew),
                 ),
               )
+              const relative = path.relative(instance.worktree, filePath)
               yield* ctx.ask({
                 permission: "edit",
-                patterns: [path.relative(instance.worktree, filePath)],
-                always: ["*"],
+                patterns: [relative],
+                always: [relative],
                 metadata: {
                   filepath: filePath,
                   diff,

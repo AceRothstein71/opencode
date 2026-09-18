@@ -221,7 +221,7 @@ export const ApplyPatchTool = Tool.define(
           yield* ctx.ask({
             permission: "edit",
             patterns: relativePaths,
-            always: ["*"],
+            always: relativePaths,
             metadata: {
               filepath: relativePaths.join(", "),
               diff: totalDiff,

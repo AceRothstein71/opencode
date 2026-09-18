@@ -26,10 +26,15 @@ export const assertExternalDirectoryEffect = Effect.fn("Tool.assertExternalDirec
   // Lexical containment is not enough: a symlink inside the worktree can point
   // outside it (e.g. `vendor/x -> /etc`). Require both the lexical path and its
   // symlink-resolved target to stay inside before skipping the prompt.
-  if (containsPath(full, ins) && containsPath(FSUtil.resolveExisting(full), ins)) return false
+  const resolved = FSUtil.resolveExisting(full)
+  if (containsPath(full, ins) && containsPath(resolved, ins)) return false
 
+  // Prompt and persist the glob on the *resolved* target, not the lexical path.
+  // The approval cache matches request patterns against the saved glob, so keying
+  // it lexically would let a later symlink swap (`vendor -> /etc`) reuse a `vendor/*`
+  // grant on `/etc/*` without re-prompting.
   const kind = options?.kind ?? "file"
-  const dir = kind === "directory" ? full : path.dirname(full)
+  const dir = kind === "directory" ? resolved : path.dirname(resolved)
   const glob =
     process.platform === "win32"
       ? FSUtil.normalizePathPattern(path.join(dir, "*"))
@@ -40,7 +45,7 @@ export const assertExternalDirectoryEffect = Effect.fn("Tool.assertExternalDirec
     patterns: [glob],
     always: [glob],
     metadata: {
-      filepath: full,
+      filepath: resolved,
       parentDir: dir,
     },
   })

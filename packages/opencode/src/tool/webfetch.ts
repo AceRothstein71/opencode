@@ -7,6 +7,9 @@ import DESCRIPTION from "./webfetch.txt"
 import { isImageAttachment } from "@/util/media"
 import { isIP } from "node:net"
 import { lookup } from "node:dns/promises"
+import { request as httpsRequest } from "node:https"
+import { Readable } from "node:stream"
+import type { LookupFunction } from "node:net"
 
 const MAX_RESPONSE_SIZE = 5 * 1024 * 1024 // 5MB
 const DEFAULT_TIMEOUT = 30 * 1000 // 30 seconds
@@ -105,13 +108,18 @@ export function isBlockedAddress(address: string): boolean {
   return false
 }
 
-type PinnedTarget = { dial: string; host?: string }
+type Pin = { address: string; family: 4 | 6 }
+type PinnedTarget = { dial: string; host?: string; pin?: Pin }
 
-// Resolve and vet once, then dial the vetted IP for plain HTTP so a name that
-// rebinds between check and use cannot reach a private address. HTTPS keeps the
-// hostname to preserve SNI/certificate validation (residual documented in the lane).
+const ALLOWED_PROTOCOLS = new Set(["http:", "https:"])
+
+// Resolve and vet once, then pin the connection to the vetted address so a name
+// that rebinds between check and use cannot reach a private address. Plain HTTP
+// rewrites the URL host to the vetted IP; HTTPS keeps the hostname for SNI and
+// certificate validation and pins the address through a custom DNS lookup.
 async function pinnedTarget(raw: string): Promise<PinnedTarget> {
   const url = new URL(raw)
+  if (!ALLOWED_PROTOCOLS.has(url.protocol)) throw new Error(`Unsupported URL scheme: ${url.protocol}`)
   const hostname = url.hostname.replace(/^\[|\]$/g, "")
   if (isIP(hostname)) {
     if (isBlockedAddress(hostname)) throw new Error(`Refusing to fetch blocked address: ${hostname}`)
@@ -123,11 +131,57 @@ async function pinnedTarget(raw: string): Promise<PinnedTarget> {
     if (isBlockedAddress(record.address))
       throw new Error(`Refusing to fetch ${hostname}: resolves to ${record.address}`)
   }
-  if (url.protocol !== "http:") return { dial: raw }
   const chosen = records.find((record) => record.family === 4) ?? records[0]
-  const dial = new URL(url)
-  dial.hostname = chosen.family === 6 ? `[${chosen.address}]` : chosen.address
-  return { dial: dial.toString(), host: url.host }
+  const family: 4 | 6 = chosen.family === 6 ? 6 : 4
+  if (url.protocol === "http:") {
+    const dial = new URL(url)
+    dial.hostname = family === 6 ? `[${chosen.address}]` : chosen.address
+    return { dial: dial.toString(), host: url.host }
+  }
+  return { dial: raw, pin: { address: chosen.address, family } }
+}
+
+// A fetch that resolves the request hostname to the already-vetted address while
+// keeping the URL hostname for TLS SNI and certificate validation. Only HTTPS
+// requests reach here.
+function pinnedFetch(pin: Pin): typeof globalThis.fetch {
+  const pinnedLookup: LookupFunction = (_hostname, options, callback) => {
+    // Node's happy-eyeballs path requests `all: true` and expects an address list.
+    if (options.all) return callback(null, [{ address: pin.address, family: pin.family }])
+    return callback(null, pin.address, pin.family)
+  }
+  const fetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    const raw = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url
+    const url = new URL(raw)
+    const headers = new Headers(init?.headers)
+    const response = await new Promise<import("node:http").IncomingMessage>((resolve, reject) => {
+      const req = httpsRequest(
+        {
+          protocol: url.protocol,
+          hostname: url.hostname,
+          port: url.port || 443,
+          path: `${url.pathname}${url.search}`,
+          method: init?.method ?? "GET",
+          headers: Object.fromEntries(headers.entries()),
+          signal: init?.signal ?? undefined,
+          lookup: pinnedLookup,
+        },
+        resolve,
+      )
+      req.on("error", reject)
+      req.end()
+    })
+    return new Response(Readable.toWeb(response) as unknown as ReadableStream<Uint8Array>, {
+      status: response.statusCode ?? 500,
+      statusText: response.statusMessage,
+      headers: Object.fromEntries(
+        Object.entries(response.headers).flatMap(([key, value]) =>
+          value === undefined ? [] : [[key, Array.isArray(value) ? value.join(", ") : value]],
+        ),
+      ),
+    })
+  }
+  return Object.assign(fetch, { preconnect: () => undefined })
 }
 
 export async function assertAllowedUrl(raw: string): Promise<void> {
@@ -159,13 +213,20 @@ export const WebFetchTool = Tool.define(
       let current = url
       let hop = 0
       while (true) {
-        const target = ctx.extra?.["bypassNetworkCheck"]
-          ? { dial: current }
-          : yield* Effect.promise(() => pinnedTarget(current))
+        // `bypassNetworkCheck` is a test-only escape hatch: `session/tools.ts` builds
+        // the tool context `extra` from a fixed key set and never sets this flag.
+        const target =
+          ctx.extra?.["bypassNetworkCheck"] === true
+            ? { dial: current }
+            : yield* Effect.promise(() => pinnedTarget(current))
         const requestHeaders = target.host ? { ...headers, Host: target.host } : headers
-        const response = yield* http
-          .execute(HttpClientRequest.get(target.dial).pipe(HttpClientRequest.setHeaders(requestHeaders)))
+        const request = HttpClientRequest.get(target.dial).pipe(HttpClientRequest.setHeaders(requestHeaders))
+        const raw = http
+          .execute(request)
           .pipe(Effect.provideService(FetchHttpClient.RequestInit, { redirect: "manual" }))
+        const response = target.pin
+          ? yield* raw.pipe(Effect.provideService(FetchHttpClient.Fetch, pinnedFetch(target.pin)))
+          : yield* raw
 
         // Cloudflare challenge 403s clear with an honest User-Agent (the browser UA's TLS fingerprint is rejected).
         if (
@@ -182,7 +243,10 @@ export const WebFetchTool = Tool.define(
         if (hop >= MAX_REDIRECTS) throw new Error(`Too many redirects (max ${MAX_REDIRECTS})`)
         const location = response.headers["location"]
         if (!location) throw new Error("Redirect response missing a Location header")
-        current = new URL(location, current).toString()
+        const next = new URL(location, current)
+        if (!ALLOWED_PROTOCOLS.has(next.protocol))
+          throw new Error(`Refusing redirect to unsupported scheme: ${next.protocol}`)
+        current = next.toString()
         hop++
       }
     })

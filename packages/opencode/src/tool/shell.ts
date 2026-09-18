@@ -414,7 +414,12 @@ export const ShellTool = Tool.define(
 
         if (tokens.length && (!cmd || !CWD.has(cmd))) {
           scan.patterns.add(source(node))
-          scan.always.add(BashArity.prefix(tokens).join(" ") + " *")
+          // A command whose arguments contain a shell expansion cannot be captured
+          // by a literal `prefix *` grant: the expansion (a variable path, a command
+          // substitution) can resolve to a different path or flag on every run. Offer
+          // only a one-shot prompt, never an "always" pattern, for those commands.
+          const expandable = command.some((item) => dynamic(item.text, ps))
+          if (!expandable) scan.always.add(BashArity.prefix(tokens).join(" ") + " *")
         }
       }
 
