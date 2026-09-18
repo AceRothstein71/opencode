@@ -1,4 +1,4 @@
-import { Effect, Schedule, Stream } from "effect"
+import { Effect, Exit, Schedule, Stream } from "effect"
 import os from "os"
 import { createWriteStream, readFileSync } from "node:fs"
 import * as Tool from "./tool"
@@ -85,6 +85,10 @@ const TOKEN_NODES = new Set([
   "expansion",
   "command_substitution",
   "arithmetic_expansion",
+  "ansi_c_string",
+  // Option values (`timeout 5`, `nice -n 5`) parse as `number`; dropping them shifts
+  // every later token so wrapper option-skipping lands on the wrong command.
+  "number",
 ])
 
 type Part = {
@@ -110,8 +114,90 @@ const resolveWasm = (asset: string) => {
   return fileURLToPath(url)
 }
 
+const ANSI_ESCAPES: Record<string, string> = {
+  a: "\x07",
+  b: "\b",
+  e: "\x1b",
+  f: "\f",
+  n: "\n",
+  r: "\r",
+  t: "\t",
+  v: "\v",
+  "\\": "\\",
+  "'": "'",
+  '"': '"',
+}
+
+// Bash decodes `$'…'` ANSI-C quoting (octal `\057`, hex `\x2f`, `\n`) before it runs,
+// so `$'\057etc\057hostname'` reads `/etc/hostname`. The raw token must not reach the
+// path scan intact or the file command looks argument-free.
+function decodeAnsiC(text: string) {
+  if (!text.includes("$'")) return text
+  let out = ""
+  for (let index = 0; index < text.length; index++) {
+    if (text[index] !== "$" || text[index + 1] !== "'") {
+      out += text[index]
+      continue
+    }
+    let value = ""
+    let closed = false
+    for (let scan = index + 2; scan < text.length; scan++) {
+      const char = text[scan]
+      if (char === "'") {
+        closed = true
+        index = scan
+        break
+      }
+      if (char !== "\\") {
+        value += char
+        continue
+      }
+      const rest = text.slice(scan + 1)
+      const octal = /^[0-7]{1,3}/.exec(rest)
+      if (octal) {
+        value += String.fromCharCode(Number.parseInt(octal[0], 8))
+        scan += octal[0].length
+        continue
+      }
+      const hex = /^x([0-9A-Fa-f]{1,2})/.exec(rest)
+      if (hex) {
+        value += String.fromCharCode(Number.parseInt(hex[1], 16))
+        scan += hex[0].length
+        continue
+      }
+      const unicode = /^u([0-9A-Fa-f]{1,4})/.exec(rest)
+      if (unicode) {
+        value += String.fromCodePoint(Number.parseInt(unicode[1], 16))
+        scan += unicode[0].length
+        continue
+      }
+      const next = rest[0]
+      if (next === undefined) break
+      value += ANSI_ESCAPES[next] ?? next
+      scan += 1
+    }
+    if (!closed) return text
+    out += value
+  }
+  return out
+}
+
 function parts(node: Node) {
   const out: Part[] = []
+  let prevEnd: number | undefined
+  const push = (type: string, text: string, start: number, end: number) => {
+    const decoded = decodeAnsiC(text)
+    const last = out[out.length - 1]
+    // tree-sitter splits one shell word into adjacent nodes with no separator
+    // (`"."\./x` is `string` + `word`); the shell concatenates them, so the scan must
+    // see the joined word or `..` is hidden across the split.
+    if (last && prevEnd !== undefined && start === prevEnd) {
+      out[out.length - 1] = { type: last.type, text: last.text + decoded }
+    } else {
+      out.push({ type, text: decoded })
+    }
+    prevEnd = end
+  }
   for (let i = 0; i < node.childCount; i++) {
     const child = node.child(i)
     if (!child) continue
@@ -119,14 +205,14 @@ function parts(node: Node) {
       for (let j = 0; j < child.childCount; j++) {
         const item = child.child(j)
         if (!item || item.type === "command_argument_sep" || item.type === "redirection") continue
-        out.push({ type: item.type, text: item.text })
+        push(item.type, item.text, item.startIndex, item.endIndex)
       }
       continue
     }
     if (!TOKEN_NODES.has(child.type)) {
       continue
     }
-    out.push({ type: child.type, text: child.text })
+    push(child.type, child.text, child.startIndex, child.endIndex)
   }
   return out
 }
@@ -137,6 +223,150 @@ function source(node: Node) {
 
 function commands(node: Node) {
   return node.descendantsOfType("command").filter((child): child is Node => Boolean(child))
+}
+
+// Bash deletes `\<newline>` continuations before parsing, so `ca\<newline>t` runs `cat`.
+// Single quotes keep the backslash literal; escapes inside double quotes are preserved.
+function stripLineContinuations(text: string) {
+  let out = ""
+  let quote: "'" | '"' | undefined
+  for (let index = 0; index < text.length; index++) {
+    const char = text[index]
+    if (char === "\\" && quote !== "'") {
+      if (text[index + 1] === "\n") {
+        index++
+        continue
+      }
+      if (text[index + 1] === "\r" && text[index + 2] === "\n") {
+        index += 2
+        continue
+      }
+      out += char
+      if (index + 1 < text.length) {
+        out += text[index + 1]
+        index++
+      }
+      continue
+    }
+    if (quote) {
+      out += char
+      if (char === quote) quote = undefined
+      continue
+    }
+    if (char === "'" || char === '"') {
+      quote = char
+      out += char
+      continue
+    }
+    out += char
+  }
+  return out
+}
+
+function braceEnd(text: string, start: number) {
+  let depth = 0
+  let quote: "'" | '"' | undefined
+  for (let index = start; index < text.length; index++) {
+    const char = text[index]
+    if (char === "\\") {
+      index++
+      continue
+    }
+    if (quote) {
+      if (char === quote) quote = undefined
+      continue
+    }
+    if (char === "'" || char === '"') {
+      quote = char
+      continue
+    }
+    if (char === "{") depth++
+    if (char === "}" && --depth === 0) return index
+  }
+  return -1
+}
+
+function topComma(text: string, start: number, end: number) {
+  let depth = 0
+  let quote: "'" | '"' | undefined
+  for (let index = start; index < end; index++) {
+    const char = text[index]
+    if (char === "\\") {
+      index++
+      continue
+    }
+    if (quote) {
+      if (char === quote) quote = undefined
+      continue
+    }
+    if (char === "'" || char === '"') {
+      quote = char
+      continue
+    }
+    if (char === "{") depth++
+    if (char === "}") depth--
+    if (char === "," && depth === 1) return true
+  }
+  return false
+}
+
+// tree-sitter emits no `command` node for a bare brace list `{cat,/etc/hostname}`, so
+// the whole classifier is skipped and the command runs unprompted. Bash brace-expands
+// the list before execution; replacing the brace/comma characters with spaces keeps the
+// effective words visible to the scan. `always` is suppressed by the caller because the
+// offered pattern no longer matches the raw command.
+function flattenBraces(text: string) {
+  let out = ""
+  let found = false
+  let index = 0
+  while (index < text.length) {
+    const char = text[index]
+    if (char === "\\" && index + 1 < text.length) {
+      out += char + text[index + 1]
+      index += 2
+      continue
+    }
+    if (char !== "{" || (index > 0 && text[index - 1] === "$")) {
+      out += char
+      index++
+      continue
+    }
+    const end = braceEnd(text, index)
+    if (end < 0 || !topComma(text, index, end)) {
+      out += char
+      index++
+      continue
+    }
+    found = true
+    out += " "
+    let depth = 0
+    let quote: "'" | '"' | undefined
+    index++
+    for (; index < end; index++) {
+      const inner = text[index]
+      if (inner === "\\" && index + 1 < end) {
+        out += inner + text[index + 1]
+        index++
+        continue
+      }
+      if (quote) {
+        out += inner
+        if (inner === quote) quote = undefined
+        continue
+      }
+      if (inner === "'" || inner === '"') {
+        quote = inner
+        out += inner
+        continue
+      }
+      if (inner === "{") depth++
+      if (inner === "}") depth--
+      out += inner === "{" || inner === "}" || (inner === "," && depth === 0) ? " " : inner
+    }
+    out += " "
+    index = end + 1
+  }
+  return { text: out, found }
 }
 
 // Classification must see the tokens the shell actually executes. It must use the
@@ -217,7 +447,7 @@ function expand(text: string, cwd: string, shell: string) {
   const out = unquote(text)
     .replace(/\$\{env:([^}]+)\}/gi, (_, key: string) => envValue(key) || "")
     .replace(/\$env:([A-Za-z_][A-Za-z0-9_]*)/gi, (_, key: string) => envValue(key) || "")
-    .replace(/\$(HOME|PWD|PSHOME)(?=$|[\\/])/gi, (_, key: string) => auto(key, cwd, shell) || "")
+    .replace(/\$\{?(HOME|PWD|PSHOME)\}?(?=$|[\\/])/gi, (_, key: string) => auto(key, cwd, shell) || "")
   return home(out)
 }
 
@@ -245,16 +475,75 @@ function dynamic(text: string, ps: boolean) {
   return text.includes("$")
 }
 
-// Wrappers that run the following command in place. `command cd $HOME` and
-// `\cd $HOME` still move the shell, so classification must resolve through them or
-// the cwd dynamic guard is skipped and a later relative read escapes unseen.
-const WRAPPERS = new Set(["builtin", "command", "exec", "nohup", "time"])
+// Exec-preserving wrappers. The inner command must be resolved or the wrapper name
+// becomes the grant key, the real file command is never scanned, and the tool offers an
+// `always` pattern that absorbs it. Each spec records which option characters consume a
+// value and how many positional arguments precede the command.
+type Wrapper = {
+  valueChars: string
+  valueLong: Set<string>
+  positionals: number
+  shellString?: string
+}
+
+const WRAPPERS: Record<string, Wrapper> = {
+  builtin: { valueChars: "", valueLong: new Set(), positionals: 0 },
+  command: { valueChars: "", valueLong: new Set(), positionals: 0 },
+  exec: { valueChars: "a", valueLong: new Set(), positionals: 0 },
+  nohup: { valueChars: "", valueLong: new Set(), positionals: 0 },
+  time: { valueChars: "", valueLong: new Set(), positionals: 0 },
+  setsid: { valueChars: "", valueLong: new Set(["--wait"]), positionals: 0 },
+  stdbuf: { valueChars: "ioe", valueLong: new Set(["--input", "--output", "--error"]), positionals: 0 },
+  xargs: {
+    valueChars: "InPsaEdL",
+    valueLong: new Set([
+      "--arg-file",
+      "--delimiter",
+      "--eof",
+      "--max-args",
+      "--max-chars",
+      "--max-lines",
+      "--max-procs",
+      "--process-slot-var",
+      "--replace",
+    ]),
+    positionals: 0,
+  },
+  watch: { valueChars: "n", valueLong: new Set(["--interval"]), positionals: 0 },
+  nice: { valueChars: "n", valueLong: new Set(["--adjustment"]), positionals: 0 },
+  ionice: { valueChars: "cnp", valueLong: new Set(["--class", "--classdata", "--pid"]), positionals: 0 },
+  timeout: { valueChars: "sk", valueLong: new Set(["--signal", "--kill-after"]), positionals: 1 },
+  taskset: { valueChars: "p", valueLong: new Set(["--pid"]), positionals: 1 },
+  chrt: { valueChars: "", valueLong: new Set(["--pid"]), positionals: 1 },
+  flock: { valueChars: "wE", valueLong: new Set(["--wait", "--conflict-exit-code"]), positionals: 1 },
+  sudo: {
+    valueChars: "ugpCDRTU",
+    valueLong: new Set([
+      "--user",
+      "--group",
+      "--prompt",
+      "--chdir",
+      "--chroot",
+      "--role",
+      "--type",
+      "--close-from",
+      "--other-user",
+      "--host",
+      "--login-class",
+    ]),
+    positionals: 0,
+  },
+  doas: { valueChars: "u", valueLong: new Set(), positionals: 0 },
+  script: { valueChars: "", valueLong: new Set(), positionals: 0, shellString: "c" },
+}
 
 type Effective = {
   name?: string
   command: Part[]
   cwdTarget?: Part
   evalScript?: string
+  wrapped?: boolean
+  unresolved?: boolean
 }
 
 function commandName(text: string) {
@@ -262,59 +551,142 @@ function commandName(text: string) {
   return name.startsWith("\\") ? name.slice(1) : name
 }
 
-// Resolve wrapper prefixes (`command cat`, `\cat`, `env -C dir cat`) to the command
-// they actually run, plus any cwd the wrapper changes (`env -C`). An `eval` string is
-// handed back for the caller to inspect: it is re-parsed by the shell, so its cwd
-// effects and file arguments are not visible in this token list.
+// Strip one wrapper's options and positional prefixes so the next token is the command
+// it runs. An option shape the spec does not model returns `unresolved` instead of
+// guessing: a wrong guess would skip the real file command and hide the read.
+function stripWrapperOptions(parts: Part[], spec: Wrapper) {
+  let index = 1
+  while (index < parts.length) {
+    const text = parts[index].text
+    if (text === "--") {
+      index++
+      break
+    }
+    if (!text.startsWith("-") || text === "-") break
+    if (text.startsWith("--")) {
+      if (text.includes("=")) {
+        index++
+        continue
+      }
+      if (spec.valueLong.has(text)) {
+        index += 2
+        continue
+      }
+      if (spec.shellString && text === "--command") {
+        const value = parts[index + 1]?.text
+        return { rest: parts.slice(index + 2), shell: value === undefined ? "" : unquote(value), wrapped: true }
+      }
+      return { rest: parts, wrapped: true, unresolved: true }
+    }
+    const body = text.slice(1)
+    let consumed = false
+    for (let position = 0; position < body.length; position++) {
+      const flag = body[position]
+      if (flag === spec.shellString) {
+        const attached = body.slice(position + 1)
+        const value = attached || parts[index + 1]?.text
+        return {
+          rest: parts.slice(attached ? index + 1 : index + 2),
+          shell: value === undefined ? "" : unquote(value),
+          wrapped: true,
+        }
+      }
+      if (!spec.valueChars.includes(flag)) continue
+      consumed = true
+      index += position === body.length - 1 ? 2 : 1
+      break
+    }
+    if (!consumed) index += 1
+  }
+  let rest = parts.slice(index)
+  for (let skip = 0; skip < spec.positionals && rest.length > 0; skip++) rest = rest.slice(1)
+  return { rest, wrapped: true }
+}
+
+function stripEnvOptions(parts: Part[]) {
+  let index = 1
+  let cwdTarget: Part | undefined
+  while (index < parts.length) {
+    const text = parts[index].text
+    if (text === "-C" || text === "--chdir") {
+      cwdTarget = parts[index + 1]
+      index += 2
+      continue
+    }
+    if (text.startsWith("--chdir=")) {
+      cwdTarget = { type: "word", text: text.slice(8) }
+      index += 1
+      continue
+    }
+    if (text.startsWith("-C") && text.length > 2) {
+      cwdTarget = { type: "word", text: text.slice(2) }
+      index += 1
+      continue
+    }
+    if (text === "-S" || text === "--split-string") {
+      const value = parts[index + 1]?.text
+      return { rest: parts.slice(index + 2), cwdTarget, shell: value === undefined ? "" : unquote(value), wrapped: true }
+    }
+    if (text.startsWith("--split-string=")) {
+      return { rest: parts.slice(index + 1), cwdTarget, shell: unquote(text.slice(15)), wrapped: true }
+    }
+    if (text.startsWith("-S") && text.length > 2) {
+      return { rest: parts.slice(index + 1), cwdTarget, shell: unquote(text.slice(2)), wrapped: true }
+    }
+    if (text === "-u" || text === "--unset") {
+      index += 2
+      continue
+    }
+    if (text.startsWith("-u") && text.length > 2) {
+      index += 1
+      continue
+    }
+    if (
+      text.startsWith("--unset=") ||
+      text === "-i" ||
+      text === "-0" ||
+      text === "--ignore-environment" ||
+      text === "--null" ||
+      /^[A-Za-z_][A-Za-z0-9_]*=/.test(text)
+    ) {
+      index += 1
+      continue
+    }
+    if (text.startsWith("-") && text !== "-") {
+      index += 1
+      continue
+    }
+    break
+  }
+  return { rest: parts.slice(index), cwdTarget, wrapped: true }
+}
+
+// Resolve wrapper prefixes (`command cat`, `xargs cat`, `timeout 5 rm`, `env -C dir cat`)
+// to the command they actually run, plus any cwd the wrapper changes. An `eval` or
+// `env -S` string is handed back for the caller to re-parse. A wrapper whose options
+// cannot be modelled returns `unresolved` so the caller scans conservatively.
 function effective(command: Part[]): Effective {
   let parts = command
   let cwdTarget: Part | undefined
-  for (let depth = 0; depth < 8 && parts.length > 0; depth++) {
+  let evalScript: string | undefined
+  let wrapped = false
+  for (let depth = 0; depth < 64 && parts.length > 0; depth++) {
     const name = commandName(parts[0].text)
-    if (WRAPPERS.has(name)) {
-      let index = 1
-      while (index < parts.length && parts[index].text.startsWith("-")) {
-        index += name === "exec" && parts[index].text === "-a" && index + 1 < parts.length ? 2 : 1
-      }
-      parts = parts.slice(index)
+    const spec = WRAPPERS[name]
+    if (spec) {
+      const stripped = stripWrapperOptions(parts, spec)
+      wrapped = true
+      if (stripped.unresolved) return { name: undefined, command, wrapped, unresolved: true }
+      if (stripped.shell !== undefined) evalScript = stripped.shell
+      parts = stripped.rest
       continue
     }
     if (name === "env") {
-      let index = 1
-      while (index < parts.length) {
-        const text = parts[index].text
-        if (text === "-C" || text === "--chdir") {
-          cwdTarget = parts[index + 1]
-          index += 2
-          continue
-        }
-        if (text.startsWith("--chdir=")) {
-          cwdTarget = { type: "word", text: text.slice(8) }
-          index += 1
-          continue
-        }
-        if (text === "-u" || text === "--unset") {
-          index += 2
-          continue
-        }
-        if (
-          text.startsWith("--unset=") ||
-          text === "-i" ||
-          text === "-0" ||
-          text === "--ignore-environment" ||
-          text === "--null" ||
-          /^[A-Za-z_][A-Za-z0-9_]*=/.test(text)
-        ) {
-          index += 1
-          continue
-        }
-        if (text.startsWith("-")) {
-          index += 1
-          continue
-        }
-        break
-      }
-      parts = parts.slice(index)
+      const stripped = stripEnvOptions(parts)
+      wrapped = true
+      if (stripped.shell !== undefined) evalScript = stripped.shell
+      cwdTarget = stripped.cwdTarget ?? cwdTarget
+      parts = stripped.rest
       continue
     }
     if (name === "eval") {
@@ -323,11 +695,14 @@ function effective(command: Part[]): Effective {
         .map((item) => Wildcard.unquote(item.text))
         .join(" ")
         .trim()
-      return { name, command: parts, cwdTarget, evalScript: script }
+      return { name, command: parts, cwdTarget, evalScript: script, wrapped: true }
     }
     break
   }
-  return { name: parts.length > 0 ? commandName(parts[0].text) : undefined, command: parts, cwdTarget }
+  if (parts.length > 0 && WRAPPERS[commandName(parts[0].text)]) {
+    return { name: undefined, command, wrapped, unresolved: true }
+  }
+  return { name: parts.length > 0 ? commandName(parts[0].text) : undefined, command: parts, cwdTarget, evalScript, wrapped }
 }
 
 // A dynamic argument cannot be resolved to a real path, but if it still carries a
@@ -335,6 +710,9 @@ function effective(command: Part[]): Effective {
 // scan must anchor conservatively rather than skip the argument entirely.
 function unresolvableExternal(text: string) {
   if (text.startsWith("/") || /^[A-Za-z]:[\\/]/.test(text)) return true
+  // A word-splitting `$IFS` can turn one token into a path; an undecoded `$'…'` still
+  // hides its bytes. Both are anchored at the filesystem root rather than skipped.
+  if (/\$\{?IFS\}?/i.test(text) || text.includes("$'")) return true
   return /(^|[\\/])\.\.([\\/]|$)/.test(text)
 }
 
@@ -543,7 +921,7 @@ export const ShellTool = Tool.define(
     })
 
     const argPath = Effect.fn("ShellTool.argPath")(function* (arg: string, cwd: string, ps: boolean, shell: string) {
-      const text = ps ? expand(arg, cwd, shell) : home(unquote(arg))
+      const text = expand(arg, cwd, shell)
       if (!text) return
       const file = prefix(text)
       // A glob at position 0 has no literal prefix, but the shell still expands it
@@ -606,11 +984,23 @@ export const ShellTool = Tool.define(
         if (positional.length === 0 || positional.some((item) => dynamic(unquote(item), ps))) state.dynamic = true
       }
 
-      // `eval` re-parses its decoded argument as a shell command, so its cwd change or
-      // file arguments are not visible in the outer token list.
-      const classify = Effect.fnUntraced(function* (command: Part[]) {
+      // `eval` and `env -S` re-parse their decoded string as a shell command, so its cwd
+      // change or file arguments are not visible in the outer token list. Reparse it and
+      // classify the nested commands through the same wrapper resolution.
+      const classify: (
+        command: Part[],
+        depth?: number,
+      ) => Effect.Effect<{ name?: string; info: Effective }, never, never> = Effect.fnUntraced(function* (
+        command: Part[],
+        depth = 0,
+      ) {
         const info = effective(command)
         const name = shellKind === "cmd" ? info.name?.toLowerCase() : info.name
+        // A command name that is itself a shell expansion (`$D $HOME`, `cd${IFS}$HOME`)
+        // can be a cwd change or any other command; without knowing which, the safe move
+        // is to treat the invocation as dynamic so no later relative read inherits an
+        // `always` grant.
+        if (info.unresolved || (name !== undefined && dynamic(name, ps))) state.dynamic = true
         inspectCwd(
           name,
           info.command.slice(1).map((item) => item.text),
@@ -621,17 +1011,28 @@ export const ShellTool = Tool.define(
           for (const arg of pathArgs(info.command, ps, shellKind === "cmd")) {
             yield* addPath(yield* argPath(arg, cwd, ps, shell))
           }
+        } else if (info.unresolved) {
+          // The wrapper could not be resolved, so the real command is somewhere in the
+          // argument list. Scan every token for an external path rather than trust the
+          // wrapper name.
+          for (const item of info.command.slice(1)) {
+            yield* addPath(yield* argPath(item.text, cwd, ps, shell))
+          }
         }
-        if (info.evalScript) {
-          const nested = info.evalScript.split(/\s+/).filter(Boolean)
-          const nestedName = nested.length > 0 ? commandName(nested[0]) : undefined
-          const normalized = shellKind === "cmd" ? nestedName?.toLowerCase() : nestedName
-          inspectCwd(normalized, nested.slice(1))
-          if (normalized && (FILES.has(normalized) || (shellKind === "cmd" && CMD_FILES.has(normalized)))) {
-            const synthetic = nested.map((text) => ({ type: "word", text }))
-            for (const arg of pathArgs(synthetic, ps, shellKind === "cmd")) {
-              yield* addPath(yield* argPath(arg, cwd, ps, shell))
+        if (info.evalScript && depth < 8) {
+          const exit = yield* parse(info.evalScript, ps).pipe(Effect.exit)
+          if (Exit.isSuccess(exit)) {
+            const tree = exit.value
+            const nested = commands(tree.rootNode)
+            for (const node of nested) yield* classify(parts(node), depth + 1)
+            if (nested.length === 0 && tree.rootNode.hasError && info.evalScript.trim().length > 0) {
+              state.dynamic = true
+              scan.dirs.add(path.parse(cwd).root)
             }
+            tree.delete()
+          } else {
+            state.dynamic = true
+            scan.dirs.add(path.parse(cwd).root)
           }
         }
         return { name, info }
@@ -641,6 +1042,15 @@ export const ShellTool = Tool.define(
         const command = parts(node)
         return { node, command, tokens: command.map((item) => item.text) }
       })
+
+      // A non-empty command the parser could not turn into a `command` node (a bare
+      // brace list, any future parse blind spot) must not run unprompted. Anchor the
+      // scan at the filesystem root and prompt; `always` stays empty.
+      if (entries.length === 0 && !ps && root.hasError && root.text.trim().length > 0) {
+        scan.dirs.add(path.parse(cwd).root)
+        scan.patterns.add(root.text.trim())
+        return scan
+      }
 
       // Classify every command before deciding the always-grant, so a dynamic `cd`
       // anywhere in the invocation (including through a wrapper or `eval`) suppresses
@@ -656,9 +1066,16 @@ export const ShellTool = Tool.define(
         scan.patterns.add(source(entry.node))
         // A command whose arguments contain a shell expansion cannot be captured by a
         // literal `prefix *` grant: the expansion (a variable path, a command
-        // substitution) can resolve to a different path or flag on every run. Offer
-        // only a one-shot prompt, never an "always" pattern, for those commands.
-        pending.push({ tokens: entry.tokens, dynamic: entry.command.some((item) => dynamic(item.text, ps)) })
+        // substitution) can resolve to a different path or flag on every run. A wrapper
+        // moves the effective command off the raw token, so its `prefix *` pattern would
+        // absorb a future unrelated invocation. Offer only a one-shot prompt for both.
+        pending.push({
+          tokens: entry.tokens,
+          dynamic:
+            entry.command.some((item) => dynamic(item.text, ps)) ||
+            result.info.wrapped === true ||
+            result.info.unresolved === true,
+        })
       }
 
       if (state.dynamic) scan.dirs.add(path.parse(cwd).root)
@@ -930,10 +1347,12 @@ export const ShellTool = Tool.define(
               const ps = Shell.ps(shell)
               yield* Effect.scoped(
                 Effect.gen(function* () {
-                  const tree = yield* Effect.acquireRelease(parse(params.command, ps), (tree) =>
+                  const braces = flattenBraces(stripLineContinuations(params.command))
+                  const tree = yield* Effect.acquireRelease(parse(braces.text, ps), (tree) =>
                     Effect.sync(() => tree.delete()),
                   )
                   const scan = yield* collect(tree.rootNode, cwd, ps, shell, instanceCtx)
+                  if (braces.found) scan.always.clear()
                   if (!containsPath(cwd, instanceCtx)) scan.dirs.add(cwd)
                   yield* ask(ctx, scan, params)
                 }),

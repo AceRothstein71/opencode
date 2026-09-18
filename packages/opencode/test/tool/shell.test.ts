@@ -1426,6 +1426,277 @@ describe("tool.shell wave HA classification", () => {
   )
 })
 
+describe("tool.shell wave IA classification", () => {
+  if (process.platform === "win32") return
+
+  const requests = (command: string, directory: string, stop: boolean) =>
+    Effect.gen(function* () {
+      const list: Array<Omit<PermissionV1.Request, "id" | "sessionID" | "tool">> = []
+      if (stop) {
+        yield* runIn(directory, fail({ command }, capture(list, new Error("stop after permission"))))
+      } else {
+        yield* runIn(directory, run({ command }, capture(list)))
+      }
+      return list
+    })
+
+  const expectScanned = (command: string, directory: string) =>
+    Effect.gen(function* () {
+      const list = yield* requests(command, directory, false)
+      const bashReq = list.find((item) => item.permission === "bash")
+      expect({ command, external: list.some((item) => item.permission === "external_directory") }).toEqual({
+        command,
+        external: true,
+      })
+      expect({ command, always: bashReq?.always ?? [] }).toEqual({ command, always: [] })
+    })
+
+  const expectExternal = (command: string, directory: string, stop = false) =>
+    Effect.gen(function* () {
+      const list = yield* requests(command, directory, stop)
+      expect({ command, external: list.some((item) => item.permission === "external_directory") }).toEqual({
+        command,
+        external: true,
+      })
+    })
+
+  const expectClean = (command: string, directory: string) =>
+    Effect.gen(function* () {
+      const list = yield* requests(command, directory, false)
+      expect({ command, external: list.some((item) => item.permission === "external_directory") }).toEqual({
+        command,
+        external: false,
+      })
+    })
+
+  const expectNoPersist = (command: string, directory: string) =>
+    Effect.gen(function* () {
+      const list = yield* requests(command, directory, false)
+      const bashReq = list.find((item) => item.permission === "bash")
+      expect({ command, always: bashReq?.always ?? [] }).toEqual({ command, always: [] })
+    })
+
+  it.live(
+    "scans brace-list command forms instead of running them unprompted",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        for (const command of [
+          "{cat,/etc/hostname}",
+          "{cat,/etc/hostname,}",
+          "{cat,/etc/hostname} ",
+          "{cat,/etc/hostname}; echo done",
+          "{cat,/etc/hostname} | head -1",
+        ]) {
+          yield* expectScanned(command, tmp)
+        }
+        yield* expectExternal("{ cat /etc/hostname; }", tmp)
+        yield* expectExternal("( cat /etc/hostname )", tmp)
+      }),
+    30_000,
+  )
+
+  it.live(
+    "scans a brace-list rm before an external delete",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        const marker = path.join(path.dirname(tmp), `ia-marker-${path.basename(tmp)}.txt`)
+        yield* Effect.promise(() => Bun.write(marker, "M"))
+        yield* expectExternal(`{rm,${marker}}`, tmp, true)
+      }),
+    30_000,
+  )
+
+  it.live(
+    "handles nested and degenerate brace lists without a zero-prompt absorb",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        yield* expectNoPersist("{a,{b,c}} /etc/hostname", tmp)
+        for (const command of ["{,cat} /etc/hostname", "{cat}", "{cd,$HOME}; cat secret.txt"]) {
+          yield* expectScanned(command, tmp)
+        }
+      }),
+    30_000,
+  )
+
+  it.live(
+    "scans the extended wrapper family and offers no absorbing always",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        for (const command of [
+          "nice cat /etc/hostname",
+          "nice -n 5 cat /etc/hostname",
+          "setsid cat /etc/hostname",
+          "xargs cat /etc/hostname",
+          "xargs -n1 cat /etc/hostname",
+          "timeout 5 cat /etc/hostname",
+          "timeout -s KILL 5 cat /etc/hostname",
+          "stdbuf cat /etc/hostname",
+          "ionice cat /etc/hostname",
+          "taskset 1 cat /etc/hostname",
+          "chrt 0 cat /etc/hostname",
+          "flock /tmp cat /etc/hostname",
+          "watch cat /etc/hostname",
+          "sudo cat /etc/hostname",
+          "doas cat /etc/hostname",
+        ]) {
+          yield* expectScanned(command, tmp)
+        }
+      }),
+    30_000,
+  )
+
+  it.live(
+    "scans a wrapper-prefixed rm before an external delete",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        const marker = path.join(path.dirname(tmp), `ia-wrap-${path.basename(tmp)}.txt`)
+        yield* Effect.promise(() => Bun.write(marker, "M"))
+        for (const command of [`timeout 5 rm ${marker}`, `nice rm ${marker}`, `setsid rm ${marker}`]) {
+          yield* expectExternal(command, tmp, true)
+        }
+      }),
+    30_000,
+  )
+
+  it.live(
+    "a persisted wrapper-name grant cannot absorb the external request",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        for (const [rule, command] of [
+          ["nice *", "nice cat /etc/hostname"],
+          ["timeout *", "timeout 5 cat /etc/hostname"],
+          ["setsid *", "setsid cat /etc/hostname"],
+          ["xargs *", "xargs cat /etc/hostname"],
+        ]) {
+          const approved = [{ permission: "bash", pattern: rule }]
+          const seen: Array<Omit<PermissionV1.Request, "id" | "sessionID" | "tool">> = []
+          const next: Tool.Context = {
+            ...ctx,
+            ask: (req) =>
+              Effect.sync(() => {
+                const allowed = req.patterns.every((pattern) =>
+                  approved.some(
+                    (item) =>
+                      Wildcard.matchStrict(req.permission, item.permission) &&
+                      Wildcard.matchStrict(pattern, item.pattern),
+                  ),
+                )
+                if (!allowed) seen.push(req)
+              }),
+          }
+          yield* runIn(tmp, run({ command }, next))
+          expect({ rule, external: seen.some((item) => item.permission === "external_directory") }).toEqual({
+            rule,
+            external: true,
+          })
+        }
+      }),
+    30_000,
+  )
+
+  it.live(
+    "resolves deep wrapper chains instead of capping the effective command",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        for (const depth of [9, 20]) {
+          yield* expectScanned(`${Array.from({ length: depth }, () => "command").join(" ")} cat /etc/hostname`, tmp)
+        }
+        yield* expectScanned(`${Array.from({ length: 9 }, () => "builtin").join(" ")} cat /etc/hostname`, tmp)
+      }),
+    30_000,
+  )
+
+  it.live(
+    "classifies wrapper-prefixed commands nested in eval",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        for (const command of [
+          'eval "env cat /etc/hostname"',
+          'eval "command cat /etc/hostname"',
+          'eval "timeout 5 cat /etc/hostname"',
+        ]) {
+          yield* expectScanned(command, tmp)
+        }
+      }),
+    30_000,
+  )
+
+  it.live(
+    "resolves env attached options and split strings",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        for (const command of [
+          `env -C${os.homedir()} cat opencode-missing`,
+          "env -C/etc cat hostname",
+          "env --chdir=/etc cat hostname",
+          "env -S 'cat /etc/hostname'",
+        ]) {
+          yield* expectScanned(command, tmp)
+        }
+      }),
+    30_000,
+  )
+
+  it.live(
+    "recognizes a line-continuation command name",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        yield* expectExternal("ca\\\nt /etc/hostname", tmp)
+      }),
+    30_000,
+  )
+
+  it.live(
+    "classifies ANSI-C, IFS-in-name and resolvable-variable path shapes",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        for (const command of ["$'cat' /etc/hostname", "cat $'\\057etc\\057hostname'"]) {
+          yield* expectExternal(command, tmp)
+        }
+        const marker = `ia-traverse-${path.basename(tmp)}.txt`
+        yield* Effect.promise(() => Bun.write(path.join(path.dirname(tmp), marker), "M"))
+        yield* expectExternal(`cat "."\\./${marker}`, tmp)
+        yield* expectScanned("cd${IFS}$HOME && cat secret.txt", tmp)
+        yield* expectScanned("c$'d' $HOME && cat secret.txt", tmp)
+        yield* expectScanned("cat ${IFS}/etc/hostname", tmp)
+        yield* expectScanned("cat $HOME/opencode-missing", tmp)
+      }),
+    30_000,
+  )
+
+  it.live(
+    "keeps normal wrapper and brace controls prompt-free",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        yield* Effect.promise(() => Bun.write(path.join(tmp, "notes.txt"), "x"))
+        for (const command of [
+          "nice cat notes.txt",
+          "setsid cat notes.txt",
+          "xargs echo notes.txt",
+          "timeout 5 cat notes.txt",
+          "command cat notes.txt",
+          "echo {a,b}",
+          "cat $PWD/notes.txt",
+        ]) {
+          yield* expectClean(command, tmp)
+        }
+      }),
+    30_000,
+  )
+})
+
 describe("tool.shell abort", () => {
   it.live(
     "preserves output when aborted",

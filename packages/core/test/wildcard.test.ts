@@ -112,6 +112,13 @@ describe("Wildcard.unquote", () => {
     expect(Wildcard.matchStrict('"cat" notes.txt', "cat *")).toBe(true)
   })
 
+  test("deletes backslash-newline line continuations like bash", () => {
+    expect(Wildcard.unquote("ca\\\nt")).toBe("cat")
+    expect(Wildcard.unquote("\\\ncat")).toBe("cat")
+    expect(Wildcard.unquote('"a\\\nb"')).toBe("ab")
+    expect(Wildcard.unquote("'a\\\nb'")).toBe("a\\\nb")
+  })
+
   if (process.platform !== "win32") {
     test("unescapes backslash traversal as the shell would", () => {
       expect(Wildcard.unquote("..\\/etc")).toBe("../etc")

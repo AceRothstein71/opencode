@@ -23,6 +23,19 @@ export function unquote(value: string) {
   let quote: "'" | '"' | undefined
   for (let index = 0; index < value.length; index++) {
     const char = value[index]
+    // Bash deletes `\<newline>` line continuations before execution (`ca\<newline>t`
+    // runs `cat`); single quotes keep the backslash, so exclude only those.
+    if (char === "\\" && quote !== "'") {
+      const next = value[index + 1]
+      if (next === "\n") {
+        index++
+        continue
+      }
+      if (next === "\r" && value[index + 2] === "\n") {
+        index += 2
+        continue
+      }
+    }
     if (quote) {
       if (char === quote) {
         quote = undefined
