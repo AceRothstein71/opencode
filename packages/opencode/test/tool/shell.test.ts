@@ -1695,6 +1695,137 @@ describe("tool.shell wave IA classification", () => {
       }),
     30_000,
   )
+
+  it.live(
+    "classifies absolute-path commands instead of bypassing the scan",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        for (const command of ["/usr/bin/cat /etc/hostname", "/bin/cat /etc/hostname", "/usr/bin/env cat /etc/hostname"]) {
+          yield* expectScanned(command, tmp)
+        }
+        const marker = path.join(path.dirname(tmp), `ja-abs-${path.basename(tmp)}.txt`)
+        yield* Effect.promise(() => Bun.write(marker, "M"))
+        yield* expectExternal(`/usr/bin/timeout 5 rm ${marker}`, tmp, true)
+      }),
+    30_000,
+  )
+
+  it.live(
+    "treats unmodelled exec wrappers as conservative",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        for (const command of [
+          "zzz cat /etc/hostname",
+          "parallel cat /etc/hostname",
+          "busybox cat /etc/hostname",
+          "fakeroot cat /etc/hostname",
+          "unshare cat /etc/hostname",
+          "ssh-agent cat /etc/hostname",
+          "dbus-run-session cat /etc/hostname",
+          "systemd-inhibit cat /etc/hostname",
+        ]) {
+          yield* expectScanned(command, tmp)
+        }
+      }),
+    30_000,
+  )
+
+  it.live(
+    "scans redirection targets",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        const marker = path.join(path.dirname(tmp), `ja-redir-${path.basename(tmp)}.txt`)
+        yield* Effect.promise(() => Bun.write(marker, "M"))
+        yield* expectExternal("cat < /etc/hostname", tmp)
+        yield* expectExternal("cat 0< /etc/hostname", tmp)
+        yield* expectExternal(`cat > ${marker}`, tmp)
+        yield* expectExternal(`cat >> ${marker}`, tmp)
+      }),
+    30_000,
+  )
+
+  it.live(
+    "scans adjacent brace concatenations",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        yield* expectScanned("ca{t,} /etc/hostname", tmp)
+        yield* expectScanned("{c,}at /etc/hostname", tmp)
+        const marker = path.join(path.dirname(tmp), `ja-brace-${path.basename(tmp)}.txt`)
+        yield* Effect.promise(() => Bun.write(marker, "M"))
+        yield* expectExternal(`r{m,} ${marker}`, tmp, true)
+      }),
+    30_000,
+  )
+
+  it.live(
+    "scans file args supplied through wrapper options",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        yield* expectExternal("xargs -a /etc/hostname cat", tmp)
+        yield* expectExternal("xargs --arg-file /etc/hostname cat", tmp)
+        yield* expectExternal("parallel -a /etc/hostname cat", tmp)
+      }),
+    30_000,
+  )
+
+  it.live(
+    "classifies read-capable commands against external paths",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        for (const command of [
+          "head /etc/hostname",
+          "tail /etc/hostname",
+          "grep root /etc/hostname",
+          "awk 1 /etc/hostname",
+          "sed -n 1p /etc/hostname",
+          "sort /etc/hostname",
+          "egrep root /etc/hostname",
+          "fgrep root /etc/hostname",
+        ]) {
+          yield* expectExternal(command, tmp)
+        }
+      }),
+    30_000,
+  )
+
+  it.live(
+    "decodes ANSI-C unicode escapes before classifying",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        yield* expectExternal("cat $'\\U0000002Fetc\\U0000002Fhostname'", tmp)
+      }),
+    30_000,
+  )
+
+  it.live(
+    "keeps the new classifier paths prompt-free for in-tree controls",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        yield* Effect.promise(() => Bun.write(path.join(tmp, "notes.txt"), "x"))
+        for (const command of [
+          "head notes.txt",
+          "tail -1 notes.txt",
+          "grep x notes.txt",
+          "awk 1 notes.txt",
+          "sed -n 1p notes.txt",
+          "ca{t,} notes.txt",
+          "xargs -a notes.txt echo",
+          "cat < notes.txt",
+          `cat > ${path.join(tmp, "out.txt")}`,
+        ]) {
+          yield* expectClean(command, tmp)
+        }
+      }),
+    30_000,
+  )
 })
 
 describe("tool.shell abort", () => {

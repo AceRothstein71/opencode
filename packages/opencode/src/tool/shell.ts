@@ -42,6 +42,18 @@ const FILES = new Set([
   "chmod",
   "chown",
   "cat",
+  "head",
+  "tail",
+  "grep",
+  "egrep",
+  "fgrep",
+  "awk",
+  "gawk",
+  "sed",
+  "sort",
+  "uniq",
+  "source",
+  ".",
   // Leave PowerShell aliases out for now. Common ones like cat/cp/mv/rm/mkdir
   // already hit the entries above, and alias normalization should happen in one
   // place later so we do not risk double-prompting.
@@ -169,6 +181,13 @@ function decodeAnsiC(text: string) {
       if (unicode) {
         value += String.fromCodePoint(Number.parseInt(unicode[1], 16))
         scan += unicode[0].length
+        continue
+      }
+      const wide = /^U([0-9A-Fa-f]{1,8})/.exec(rest)
+      if (wide) {
+        const code = Number.parseInt(wide[1], 16)
+        value += String.fromCodePoint(code <= 0x10ffff ? code : 0xfffd)
+        scan += wide[0].length
         continue
       }
       const next = rest[0]
@@ -338,6 +357,21 @@ function flattenBraces(text: string) {
       continue
     }
     found = true
+    let prefixStart = index
+    while (prefixStart > 0 && /[A-Za-z0-9_.\/\\~=+-]/.test(text[prefixStart - 1])) prefixStart--
+    let suffixEnd = end + 1
+    while (suffixEnd < text.length && /[A-Za-z0-9_.\/\\~=+-]/.test(text[suffixEnd])) suffixEnd++
+    const prefix = text.slice(prefixStart, index)
+    const suffix = text.slice(end + 1, suffixEnd)
+    if (prefix.length > 0 || suffix.length > 0) {
+      // Bash concatenates the surrounding word with every expanded option (`ca{t,}` runs
+      // `cat`); emit each candidate word so the real command name and its arguments stay
+      // visible instead of hiding behind a mangled split of the same word.
+      out = out.slice(0, out.length - prefix.length) + " "
+      for (const option of braceOptions(text, index, end)) out += prefix + option + suffix + " "
+      index = suffixEnd
+      continue
+    }
     out += " "
     let depth = 0
     let quote: "'" | '"' | undefined
@@ -367,6 +401,41 @@ function flattenBraces(text: string) {
     index = end + 1
   }
   return { text: out, found }
+}
+
+function braceOptions(text: string, start: number, end: number) {
+  const options: string[] = []
+  let acc = ""
+  let depth = 0
+  let quote: "'" | '"' | undefined
+  for (let index = start + 1; index < end; index++) {
+    const char = text[index]
+    if (char === "\\" && index + 1 < end) {
+      acc += char + text[index + 1]
+      index++
+      continue
+    }
+    if (quote) {
+      acc += char
+      if (char === quote) quote = undefined
+      continue
+    }
+    if (char === "'" || char === '"') {
+      quote = char
+      acc += char
+      continue
+    }
+    if (char === "{") depth++
+    if (char === "}") depth--
+    if (char === "," && depth === 0) {
+      options.push(acc)
+      acc = ""
+      continue
+    }
+    acc += char
+  }
+  options.push(acc)
+  return options
 }
 
 // Classification must see the tokens the shell actually executes. It must use the
@@ -484,6 +553,10 @@ type Wrapper = {
   valueLong: Set<string>
   positionals: number
   shellString?: string
+  // Options that consume an input file path (`xargs -a`, `parallel --arg-file`) must be
+  // scanned: a stored wrapper grant would otherwise absorb that read.
+  pathChars?: string
+  pathLong?: Set<string>
 }
 
 const WRAPPERS: Record<string, Wrapper> = {
@@ -496,6 +569,7 @@ const WRAPPERS: Record<string, Wrapper> = {
   stdbuf: { valueChars: "ioe", valueLong: new Set(["--input", "--output", "--error"]), positionals: 0 },
   xargs: {
     valueChars: "InPsaEdL",
+    pathChars: "a",
     valueLong: new Set([
       "--arg-file",
       "--delimiter",
@@ -507,6 +581,7 @@ const WRAPPERS: Record<string, Wrapper> = {
       "--process-slot-var",
       "--replace",
     ]),
+    pathLong: new Set(["--arg-file"]),
     positionals: 0,
   },
   watch: { valueChars: "n", valueLong: new Set(["--interval"]), positionals: 0 },
@@ -535,6 +610,23 @@ const WRAPPERS: Record<string, Wrapper> = {
   },
   doas: { valueChars: "u", valueLong: new Set(), positionals: 0 },
   script: { valueChars: "", valueLong: new Set(), positionals: 0, shellString: "c" },
+  parallel: {
+    valueChars: "ajNS",
+    pathChars: "a",
+    valueLong: new Set(["--jobs", "--max-args", "--max-lines", "--arg-file", "--files"]),
+    pathLong: new Set(["--arg-file"]),
+    positionals: 0,
+  },
+  busybox: { valueChars: "", valueLong: new Set(), positionals: 0 },
+  fakeroot: { valueChars: "", valueLong: new Set(), positionals: 0 },
+  unshare: { valueChars: "", valueLong: new Set(), positionals: 0 },
+  "ssh-agent": { valueChars: "at", valueLong: new Set(), positionals: 0 },
+  "dbus-run-session": { valueChars: "", valueLong: new Set(), positionals: 0 },
+  "systemd-inhibit": {
+    valueChars: "",
+    valueLong: new Set(["--what", "--who", "--why"]),
+    positionals: 0,
+  },
 }
 
 type Effective = {
@@ -544,6 +636,7 @@ type Effective = {
   evalScript?: string
   wrapped?: boolean
   unresolved?: boolean
+  extraPaths?: string[]
 }
 
 function commandName(text: string) {
@@ -551,10 +644,18 @@ function commandName(text: string) {
   return name.startsWith("\\") ? name.slice(1) : name
 }
 
+// A path-qualified command (`/usr/bin/cat`, `.\bin\type`) runs the same binary as its
+// bare name; lookups must normalize so an absolute path cannot dodge the FILES scan.
+function bareName(text: string) {
+  const slash = Math.max(text.lastIndexOf("/"), text.lastIndexOf("\\"))
+  return slash === -1 ? text : text.slice(slash + 1)
+}
+
 // Strip one wrapper's options and positional prefixes so the next token is the command
 // it runs. An option shape the spec does not model returns `unresolved` instead of
 // guessing: a wrong guess would skip the real file command and hide the read.
 function stripWrapperOptions(parts: Part[], spec: Wrapper) {
+  const paths: string[] = []
   let index = 1
   while (index < parts.length) {
     const text = parts[index].text
@@ -569,14 +670,18 @@ function stripWrapperOptions(parts: Part[], spec: Wrapper) {
         continue
       }
       if (spec.valueLong.has(text)) {
+        if (spec.pathLong?.has(text)) {
+          const value = parts[index + 1]?.text
+          if (value !== undefined) paths.push(unquote(value))
+        }
         index += 2
         continue
       }
       if (spec.shellString && text === "--command") {
         const value = parts[index + 1]?.text
-        return { rest: parts.slice(index + 2), shell: value === undefined ? "" : unquote(value), wrapped: true }
+        return { rest: parts.slice(index + 2), shell: value === undefined ? "" : unquote(value), wrapped: true, paths }
       }
-      return { rest: parts, wrapped: true, unresolved: true }
+      return { rest: parts, wrapped: true, unresolved: true, paths }
     }
     const body = text.slice(1)
     let consumed = false
@@ -589,10 +694,16 @@ function stripWrapperOptions(parts: Part[], spec: Wrapper) {
           rest: parts.slice(attached ? index + 1 : index + 2),
           shell: value === undefined ? "" : unquote(value),
           wrapped: true,
+          paths,
         }
       }
       if (!spec.valueChars.includes(flag)) continue
       consumed = true
+      if (spec.pathChars?.includes(flag)) {
+        const attached = body.slice(position + 1)
+        const value = attached || parts[index + 1]?.text
+        if (value !== undefined) paths.push(unquote(value))
+      }
       index += position === body.length - 1 ? 2 : 1
       break
     }
@@ -600,7 +711,7 @@ function stripWrapperOptions(parts: Part[], spec: Wrapper) {
   }
   let rest = parts.slice(index)
   for (let skip = 0; skip < spec.positionals && rest.length > 0; skip++) rest = rest.slice(1)
-  return { rest, wrapped: true }
+  return { rest, wrapped: true, paths }
 }
 
 function stripEnvOptions(parts: Part[]) {
@@ -670,12 +781,14 @@ function effective(command: Part[]): Effective {
   let cwdTarget: Part | undefined
   let evalScript: string | undefined
   let wrapped = false
+  let extraPaths: string[] = []
   for (let depth = 0; depth < 64 && parts.length > 0; depth++) {
-    const name = commandName(parts[0].text)
+    const name = bareName(commandName(parts[0].text))
     const spec = WRAPPERS[name]
     if (spec) {
       const stripped = stripWrapperOptions(parts, spec)
       wrapped = true
+      if (stripped.paths?.length) extraPaths = extraPaths.concat(stripped.paths)
       if (stripped.unresolved) return { name: undefined, command, wrapped, unresolved: true }
       if (stripped.shell !== undefined) evalScript = stripped.shell
       parts = stripped.rest
@@ -695,14 +808,21 @@ function effective(command: Part[]): Effective {
         .map((item) => Wildcard.unquote(item.text))
         .join(" ")
         .trim()
-      return { name, command: parts, cwdTarget, evalScript: script, wrapped: true }
+      return { name, command: parts, cwdTarget, evalScript: script, wrapped: true, extraPaths }
     }
     break
   }
-  if (parts.length > 0 && WRAPPERS[commandName(parts[0].text)]) {
-    return { name: undefined, command, wrapped, unresolved: true }
+  if (parts.length > 0 && WRAPPERS[bareName(commandName(parts[0].text))]) {
+    return { name: undefined, command, wrapped, unresolved: true, extraPaths }
   }
-  return { name: parts.length > 0 ? commandName(parts[0].text) : undefined, command: parts, cwdTarget, evalScript, wrapped }
+  return {
+    name: parts.length > 0 ? bareName(commandName(parts[0].text)) : undefined,
+    command: parts,
+    cwdTarget,
+    evalScript,
+    wrapped,
+    extraPaths,
+  }
 }
 
 // A dynamic argument cannot be resolved to a real path, but if it still carries a
@@ -990,7 +1110,7 @@ export const ShellTool = Tool.define(
       const classify: (
         command: Part[],
         depth?: number,
-      ) => Effect.Effect<{ name?: string; info: Effective }, never, never> = Effect.fnUntraced(function* (
+      ) => Effect.Effect<{ name?: string; info: Effective; conservative?: boolean }, never, never> = Effect.fnUntraced(function* (
         command: Part[],
         depth = 0,
       ) {
@@ -1007,6 +1127,10 @@ export const ShellTool = Tool.define(
         )
         if (info.cwdTarget && dynamic(unquote(info.cwdTarget.text), ps)) state.dynamic = true
         if (info.cwdTarget) yield* addPath(yield* argPath(info.cwdTarget.text, cwd, ps, shell))
+        if (info.extraPaths?.length) {
+          for (const item of info.extraPaths) yield* addPath(yield* argPath(item, cwd, ps, shell))
+        }
+        let conservative = false
         if (name && (FILES.has(name) || (shellKind === "cmd" && CMD_FILES.has(name)))) {
           for (const arg of pathArgs(info.command, ps, shellKind === "cmd")) {
             yield* addPath(yield* argPath(arg, cwd, ps, shell))
@@ -1018,6 +1142,22 @@ export const ShellTool = Tool.define(
           for (const item of info.command.slice(1)) {
             yield* addPath(yield* argPath(item.text, cwd, ps, shell))
           }
+        } else if (
+          name &&
+          !info.wrapped &&
+          info.command.slice(1).some((item) => {
+            if (item.text.startsWith("-")) return false
+            const inner = bareName(commandName(item.text))
+            return FILES.has(inner) || (shellKind === "cmd" && CMD_FILES.has(inner))
+          })
+        ) {
+          // An unmodelled exec wrapper (`parallel cat x`) runs the file command named in
+          // its arguments; scan every token and suppress `always` so the wrapper name
+          // cannot absorb a future read.
+          for (const item of info.command.slice(1)) {
+            yield* addPath(yield* argPath(item.text, cwd, ps, shell))
+          }
+          conservative = true
         }
         if (info.evalScript && depth < 8) {
           const exit = yield* parse(info.evalScript, ps).pipe(Effect.exit)
@@ -1035,13 +1175,22 @@ export const ShellTool = Tool.define(
             scan.dirs.add(path.parse(cwd).root)
           }
         }
-        return { name, info }
+        return { name, info, conservative }
       })
 
       const entries = commands(root).map((node) => {
         const command = parts(node)
         return { node, command, tokens: command.map((item) => item.text) }
       })
+
+      // Redirection targets (`cat < /etc/hostname`, `cmd > /tmp/out`) are dropped from
+      // the token list, so a stored grant could absorb that read or write; scan each
+      // target path through the same resolution as other arguments.
+      for (const redirect of root.descendantsOfType("file_redirect")) {
+        if (!redirect) continue
+        const destination = redirect.childForFieldName("destination")
+        if (destination) yield* addPath(yield* argPath(destination.text, cwd, ps, shell))
+      }
 
       // A non-empty command the parser could not turn into a `command` node (a bare
       // brace list, any future parse blind spot) must not run unprompted. Anchor the
@@ -1055,7 +1204,7 @@ export const ShellTool = Tool.define(
       // Classify every command before deciding the always-grant, so a dynamic `cd`
       // anywhere in the invocation (including through a wrapper or `eval`) suppresses
       // it for all of them, not just commands that happen to parse after it.
-      const resolved: { name?: string; info: Effective }[] = []
+      const resolved: { name?: string; info: Effective; conservative?: boolean }[] = []
       for (const entry of entries) resolved.push(yield* classify(entry.command))
 
       for (let index = 0; index < entries.length; index++) {
@@ -1074,7 +1223,10 @@ export const ShellTool = Tool.define(
           dynamic:
             entry.command.some((item) => dynamic(item.text, ps)) ||
             result.info.wrapped === true ||
-            result.info.unresolved === true,
+            result.info.unresolved === true ||
+            result.conservative === true ||
+            (result.info.extraPaths?.length ?? 0) > 0 ||
+            /[\\/]/.test(entry.tokens[0] ?? ""),
         })
       }
 
