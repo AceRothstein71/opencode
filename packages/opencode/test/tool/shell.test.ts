@@ -2019,3 +2019,263 @@ describe("tool.shell truncation", () => {
     ),
   )
 })
+
+describe("tool.shell wave KA classification", () => {
+  if (process.platform === "win32") return
+
+  const requests = (command: string, directory: string, stop: boolean) =>
+    Effect.gen(function* () {
+      const list: Array<Omit<PermissionV1.Request, "id" | "sessionID" | "tool">> = []
+      if (stop) {
+        yield* runIn(directory, fail({ command }, capture(list, new Error("stop after permission"))))
+      } else {
+        yield* runIn(directory, run({ command }, capture(list)))
+      }
+      return list
+    })
+
+  const expectExternal = (command: string, directory: string, stop = false) =>
+    Effect.gen(function* () {
+      const list = yield* requests(command, directory, stop)
+      expect({ command, external: list.some((item) => item.permission === "external_directory") }).toEqual({
+        command,
+        external: true,
+      })
+    })
+
+  const expectScanned = (command: string, directory: string) =>
+    Effect.gen(function* () {
+      const list = yield* requests(command, directory, false)
+      const bash = list.find((item) => item.permission === "bash")
+      expect({ command, external: list.some((item) => item.permission === "external_directory") }).toEqual({
+        command,
+        external: true,
+      })
+      expect({ command, always: bash?.always ?? [] }).toEqual({ command, always: [] })
+    })
+
+  const expectClean = (command: string, directory: string) =>
+    Effect.gen(function* () {
+      const list = yield* requests(command, directory, false)
+      expect({ command, external: list.some((item) => item.permission === "external_directory") }).toEqual({
+        command,
+        external: false,
+      })
+    })
+
+  // Classification-only: stop at the first permission request so a command with a slow or
+  // side-effecting execution is never spawned.
+  const expectCleanStopped = (command: string, directory: string) =>
+    Effect.gen(function* () {
+      const list: Array<Omit<PermissionV1.Request, "id" | "sessionID" | "tool">> = []
+      yield* runIn(directory, run({ command }, capture(list, new Error("stop after permission"))).pipe(Effect.exit))
+      expect({ command, external: list.some((item) => item.permission === "external_directory") }).toEqual({
+        command,
+        external: false,
+      })
+    })
+
+  it.live(
+    "scans read-capable commands outside FILES and refuses their always grant",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        for (const command of [
+          "strings /etc/hostname",
+          "base64 /etc/hostname",
+          "nl /etc/hostname",
+          "tac /etc/hostname",
+          "rev /etc/hostname",
+          "stat /etc/hostname",
+          "ls /etc",
+        ]) {
+          yield* expectScanned(command, tmp)
+        }
+        const out = path.join(path.dirname(tmp), `ka-out-${path.basename(tmp)}.txt`)
+        yield* expectScanned(`tar cf ${out} /etc/hostname`, tmp)
+        yield* expectScanned(`dd if=/etc/hostname of=${out}`, tmp)
+        yield* expectScanned("zzz strings /etc/hostname", tmp)
+        yield* expectScanned("nice strings /etc/hostname", tmp)
+        yield* expectScanned("nice zzz cat /etc/hostname", tmp)
+        yield* expectScanned("timeout 5 setarch x86_64 cat /etc/hostname", tmp)
+      }),
+    90_000,
+  )
+
+  it.live(
+    "keeps /dev/null-class redirects prompt-free",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        yield* Effect.promise(() => Bun.write(path.join(tmp, "notes.txt"), "x"))
+        for (const command of [
+          "ls notes.txt 2>/dev/null",
+          "grep root notes.txt 2>/dev/null",
+          "command -v zzz >/dev/null 2>&1",
+          "echo hi > /dev/null",
+          "cat notes.txt 2> /dev/null",
+          "git status 2>/dev/null",
+          "ls 2>/dev/null || true",
+          "diff notes.txt notes.txt > /dev/null 2>&1",
+          "read x < /dev/stdin",
+          "exec 2>/dev/null",
+          "tail -n 1 /dev/null",
+          "echo hi 2> /dev/stderr",
+          "echo hi > /dev/fd/1",
+          "cat notes.txt 2>&1",
+        ]) {
+          yield* expectClean(command, tmp)
+        }
+      }),
+    60_000,
+  )
+
+  it.live(
+    "keeps remote and containerized exec prompt-free",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        for (const command of [
+          "ssh host cat /etc/hostname",
+          "docker run --rm alpine cat /etc/hostname",
+          "kubectl exec pod -- cat /etc/hostname",
+        ]) {
+          yield* expectCleanStopped(command, tmp)
+        }
+      }),
+    60_000,
+  )
+
+  it.live(
+    "keeps echo and printf data arguments prompt-free",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        for (const command of ["echo cat /etc/hostname", "printf cat /etc/hostname"]) {
+          yield* expectClean(command, tmp)
+        }
+      }),
+    30_000,
+  )
+
+  it.live(
+    "scans quote-adjacent and nested brace concatenations",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        for (const command of [
+          "c'a't{,} /etc/hostname",
+          '"ca"{t,} /etc/hostname',
+          "'ca'{t,} /etc/hostname",
+          "$'ca'{t,} /etc/hostname",
+          'ca{"t",} /etc/hostname',
+          "c{a{t,},} /etc/hostname",
+          "{c,d}{at,} /etc/hostname",
+          "c{a,}{t,} /etc/hostname",
+          "ca{t,} /etc/hostname",
+        ]) {
+          yield* expectExternal(command, tmp)
+        }
+      }),
+    60_000,
+  )
+
+  it.live(
+    "scans a quote-adjacent or nested brace rm before an external delete",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        const marker = path.join(path.dirname(tmp), `ka-brace-${path.basename(tmp)}.txt`)
+        yield* Effect.promise(() => Bun.write(marker, "M"))
+        for (const command of [`"r"{m,} ${marker}`, `r{m{,},} ${marker}`, `{r,m}{m,} ${marker}`, `r{m,} ${marker}`]) {
+          yield* expectExternal(command, tmp, true)
+        }
+      }),
+    60_000,
+  )
+
+  it.live(
+    "scans attached --arg-file=<path> wrapper options",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        for (const command of [
+          "xargs --arg-file=/etc/hostname cat",
+          "xargs --arg-file=/etc/hostname -n1 cat",
+          "parallel --arg-file=/etc/hostname cat",
+        ]) {
+          yield* expectExternal(command, tmp)
+        }
+      }),
+    60_000,
+  )
+
+  it.live(
+    "fails closed on an overflowing ANSI-C unicode escape",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        for (const command of ["cat $'\\UFFFFFFFF/etc/hostname'", "cat $'\\U00110000/etc/hostname'"]) {
+          yield* expectScanned(command, tmp)
+        }
+      }),
+    60_000,
+  )
+
+  it.live(
+    "extracts a nested -c shell string after an unmodelled wrapper",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        for (const command of [
+          "busybox sh -c 'cat /etc/hostname'",
+          "bash -c 'cat /etc/hostname'",
+          "sh -c 'cat /etc/hostname'",
+          "busybox sh -lc 'cat /etc/hostname'",
+        ]) {
+          yield* expectExternal(command, tmp)
+        }
+      }),
+    60_000,
+  )
+
+  it.live(
+    "a stored grant cannot absorb a non-FILES or nested-wrapper external read",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        for (const [rule, command] of [
+          ["strings *", "strings /etc/hostname"],
+          ["ls *", "ls /etc"],
+          ["zzz *", "zzz strings /etc/hostname"],
+          ["nice *", "nice zzz cat /etc/hostname"],
+          ["nice *", "nice setarch x86_64 cat /etc/hostname"],
+          ["xargs *", "xargs --arg-file=/etc/hostname cat"],
+        ] as const) {
+          const approved = [{ permission: "bash", pattern: rule }]
+          const seen: Array<Omit<PermissionV1.Request, "id" | "sessionID" | "tool">> = []
+          const next: Tool.Context = {
+            ...ctx,
+            ask: (req) =>
+              Effect.sync(() => {
+                const allowed = req.patterns.every((pattern) =>
+                  approved.some(
+                    (item) =>
+                      Wildcard.matchStrict(req.permission, item.permission) &&
+                      Wildcard.matchStrict(pattern, item.pattern),
+                  ),
+                )
+                if (!allowed) seen.push(req)
+              }),
+          }
+          yield* runIn(tmp, run({ command }, next))
+          expect({ rule, command, external: seen.some((item) => item.permission === "external_directory") }).toEqual({
+            rule,
+            command,
+            external: true,
+          })
+        }
+      }),
+    90_000,
+  )
+})

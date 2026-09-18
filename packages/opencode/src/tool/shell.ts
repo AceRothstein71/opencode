@@ -83,6 +83,18 @@ const CMD_FILES = new Set([
 const FLAGS = new Set(["-destination", "-literalpath", "-path"])
 const SWITCHES = new Set(["-confirm", "-debug", "-force", "-nonewline", "-recurse", "-verbose", "-whatif"])
 
+// Commands whose arguments are broadcast as text, never opened as local files.
+const DATA = new Set(["echo", "printf"])
+
+// Commands whose file arguments are resolved on a remote host or inside a container,
+// so a local path in their argument list is not a local read.
+const REMOTE = new Set(["ssh", "docker", "kubectl"])
+
+// Shells that evaluate a `-c` string as a nested command. They are not option-model
+// wrappers, but the string must be re-parsed or `sh -c 'cat /etc/hostname'` runs a read
+// the classifier never sees.
+const SHELLS = new Set(["sh", "bash", "zsh", "dash", "ksh", "ash"])
+
 // Node types that become classification tokens. Expansions (`$HOME`, `${X}`,
 // `$(...)`) must be kept or a wrapper argument like `env -C $HOME` is dropped and
 // the command after it is misread as the target.
@@ -140,6 +152,11 @@ const ANSI_ESCAPES: Record<string, string> = {
   '"': '"',
 }
 
+// Bash cannot round-trip an out-of-range `\U` code point (it either drops the escape or
+// emits raw UTF-8 bytes), so any word containing one is undecidable. This private-use
+// marker survives into the argument so the path scan can anchor conservatively.
+const UNRESOLVED = "\uE000"
+
 // Bash decodes `$'…'` ANSI-C quoting (octal `\057`, hex `\x2f`, `\n`) before it runs,
 // so `$'\057etc\057hostname'` reads `/etc/hostname`. The raw token must not reach the
 // path scan intact or the file command looks argument-free.
@@ -186,7 +203,7 @@ function decodeAnsiC(text: string) {
       const wide = /^U([0-9A-Fa-f]{1,8})/.exec(rest)
       if (wide) {
         const code = Number.parseInt(wide[1], 16)
-        value += String.fromCodePoint(code <= 0x10ffff ? code : 0xfffd)
+        value += code > 0x10ffff ? UNRESOLVED : String.fromCodePoint(code)
         scan += wide[0].length
         continue
       }
@@ -329,85 +346,77 @@ function topComma(text: string, start: number, end: number) {
   return false
 }
 
-// tree-sitter emits no `command` node for a bare brace list `{cat,/etc/hostname}`, so
-// the whole classifier is skipped and the command runs unprompted. Bash brace-expands
-// the list before execution; replacing the brace/comma characters with spaces keeps the
-// effective words visible to the scan. `always` is suppressed by the caller because the
-// offered pattern no longer matches the raw command.
-function flattenBraces(text: string) {
-  let out = ""
-  let found = false
-  let index = 0
-  while (index < text.length) {
-    const char = text[index]
-    if (char === "\\" && index + 1 < text.length) {
-      out += char + text[index + 1]
-      index += 2
+const BRACE_WORD = /[A-Za-z0-9_.\/\\~=+,'"{}@%:-]/
+
+// The word a brace group is concatenated with. Quotes are part of the word
+// (`c'a't{,}` runs `cat`), so a scan that stops at a quote splits the command name and
+// loses the read.
+function braceWordBounds(text: string, index: number) {
+  let start = index
+  while (start > 0) {
+    const char = text[start - 1]
+    if (BRACE_WORD.test(char)) {
+      start--
       continue
     }
-    if (char !== "{" || (index > 0 && text[index - 1] === "$")) {
-      out += char
-      index++
+    if (char === "'" || char === '"') {
+      const open = text.lastIndexOf(char, start - 2)
+      if (open < 0) break
+      start = open
       continue
     }
-    const end = braceEnd(text, index)
-    if (end < 0 || !topComma(text, index, end)) {
-      out += char
-      index++
-      continue
-    }
-    found = true
-    let prefixStart = index
-    while (prefixStart > 0 && /[A-Za-z0-9_.\/\\~=+-]/.test(text[prefixStart - 1])) prefixStart--
-    let suffixEnd = end + 1
-    while (suffixEnd < text.length && /[A-Za-z0-9_.\/\\~=+-]/.test(text[suffixEnd])) suffixEnd++
-    const prefix = text.slice(prefixStart, index)
-    const suffix = text.slice(end + 1, suffixEnd)
-    if (prefix.length > 0 || suffix.length > 0) {
-      // Bash concatenates the surrounding word with every expanded option (`ca{t,}` runs
-      // `cat`); emit each candidate word so the real command name and its arguments stay
-      // visible instead of hiding behind a mangled split of the same word.
-      out = out.slice(0, out.length - prefix.length) + " "
-      for (const option of braceOptions(text, index, end)) out += prefix + option + suffix + " "
-      index = suffixEnd
-      continue
-    }
-    out += " "
-    let depth = 0
-    let quote: "'" | '"' | undefined
-    index++
-    for (; index < end; index++) {
-      const inner = text[index]
-      if (inner === "\\" && index + 1 < end) {
-        out += inner + text[index + 1]
-        index++
-        continue
-      }
-      if (quote) {
-        out += inner
-        if (inner === quote) quote = undefined
-        continue
-      }
-      if (inner === "'" || inner === '"') {
-        quote = inner
-        out += inner
-        continue
-      }
-      if (inner === "{") depth++
-      if (inner === "}") depth--
-      out += inner === "{" || inner === "}" || (inner === "," && depth === 0) ? " " : inner
-    }
-    out += " "
-    index = end + 1
+    break
   }
-  return { text: out, found }
+  let end = index
+  let quote: string | undefined
+  while (end < text.length) {
+    const char = text[end]
+    if (char === "\\" && end + 1 < text.length) {
+      end += 2
+      continue
+    }
+    if (quote) {
+      end++
+      if (char === quote) quote = undefined
+      continue
+    }
+    if (char === "'" || char === '"') {
+      quote = char
+      end++
+      continue
+    }
+    if (BRACE_WORD.test(char)) {
+      end++
+      continue
+    }
+    break
+  }
+  return { start, end }
 }
 
-function braceOptions(text: string, start: number, end: number) {
+function firstBrace(text: string) {
+  for (let index = 0; index < text.length; index++) {
+    const char = text[index]
+    if (char === "\\") {
+      index++
+      continue
+    }
+    if (char === "$" && text[index + 1] === "{") {
+      index++
+      continue
+    }
+    if (char !== "{") continue
+    const end = braceEnd(text, index)
+    if (end >= 0 && topComma(text, index, end)) return index
+  }
+  return -1
+}
+
+function splitBraceOptions(text: string, start: number, end: number) {
   const options: string[] = []
   let acc = ""
   let depth = 0
-  let quote: "'" | '"' | undefined
+  let quote: string | undefined
   for (let index = start + 1; index < end; index++) {
     const char = text[index]
     if (char === "\\" && index + 1 < end) {
@@ -436,6 +445,74 @@ function braceOptions(text: string, start: number, end: number) {
   }
   options.push(acc)
   return options
+}
+
+// Bash multiplies out every brace group and concatenates it with the surrounding word,
+// so a group nested inside an option (`c{a{t,},}`) or a second adjacent group
+// (`{c,d}{at,}`) must expand too. A candidate that still contains `{…}` is not a real
+// command or path, so leaving it unexpanded hides the effect from the scan.
+function expandBraces(text: string, depth = 0): string[] {
+  if (depth > 8) return [text]
+  const start = firstBrace(text)
+  if (start < 0) return [text]
+  const end = braceEnd(text, start)
+  if (end < 0) return [text]
+  const heads = expandBraces(text.slice(0, start), depth + 1)
+  const tails = expandBraces(text.slice(end + 1), depth + 1)
+  const out: string[] = []
+  for (const option of splitBraceOptions(text, start, end)) {
+    for (const variant of expandBraces(option, depth + 1)) {
+      for (const head of heads) {
+        for (const tail of tails) out.push(head + variant + tail)
+      }
+    }
+    if (out.length > 64) return [text]
+  }
+  return out.length > 0 ? out : [text]
+}
+
+function flattenBraces(text: string) {
+  let out = ""
+  let found = false
+  let quote: "'" | '"' | undefined
+  let index = 0
+  while (index < text.length) {
+    const char = text[index]
+    if (char === "\\" && index + 1 < text.length) {
+      out += char + text[index + 1]
+      index += 2
+      continue
+    }
+    if (quote) {
+      out += char
+      if (char === quote) quote = undefined
+      index++
+      continue
+    }
+    if (char === "'" || char === '"') {
+      quote = char
+      out += char
+      index++
+      continue
+    }
+    if (char !== "{" || (index > 0 && text[index - 1] === "$")) {
+      out += char
+      index++
+      continue
+    }
+    const end = braceEnd(text, index)
+    if (end < 0 || !topComma(text, index, end)) {
+      out += char
+      index++
+      continue
+    }
+    found = true
+    const bounds = braceWordBounds(text, index)
+    const words = expandBraces(text.slice(bounds.start, bounds.end))
+    out = out.slice(0, out.length - (index - bounds.start)) + words.join(" ") + " "
+    index = bounds.end
+  }
+  return { text: out, found }
 }
 
 // Classification must see the tokens the shell actually executes. It must use the
@@ -629,6 +706,8 @@ const WRAPPERS: Record<string, Wrapper> = {
   },
 }
 
+const SHELL_SPEC: Wrapper = { valueChars: "", valueLong: new Set(), positionals: 0, shellString: "c" }
+
 type Effective = {
   name?: string
   command: Part[]
@@ -665,7 +744,11 @@ function stripWrapperOptions(parts: Part[], spec: Wrapper) {
     }
     if (!text.startsWith("-") || text === "-") break
     if (text.startsWith("--")) {
-      if (text.includes("=")) {
+      const equals = text.indexOf("=")
+      if (equals !== -1) {
+        // An attached `--arg-file=<path>` never reaches the space-separated path branch,
+        // so its value must be scanned here or the read is invisible.
+        if (spec.pathLong?.has(text.slice(0, equals))) paths.push(unquote(text.slice(equals + 1)))
         index++
         continue
       }
@@ -794,6 +877,18 @@ function effective(command: Part[]): Effective {
       parts = stripped.rest
       continue
     }
+    if (SHELLS.has(name)) {
+      const stripped = stripWrapperOptions(parts, SHELL_SPEC)
+      wrapped = true
+      if (stripped.paths?.length) extraPaths = extraPaths.concat(stripped.paths)
+      if (stripped.unresolved) return { name: undefined, command, wrapped, unresolved: true, extraPaths }
+      if (stripped.shell !== undefined) {
+        return { name, command: parts, cwdTarget, evalScript: stripped.shell, wrapped: true, extraPaths }
+      }
+      // `sh script.sh` has no `-c` string but still reads its script argument, so keep the
+      // shell as the effective command and let the conservative scan inspect the arguments.
+      return { name, command: parts, cwdTarget, wrapped: true, extraPaths }
+    }
     if (name === "env") {
       const stripped = stripEnvOptions(parts)
       wrapped = true
@@ -841,6 +936,13 @@ function prefix(text: string) {
   if (!match) return text
   if (match.index === 0) return
   return text.slice(0, match.index)
+}
+
+// `/dev/null`, the standard streams and the fd aliases are sinks/sources, not external
+// files: scanning them turns `cmd 2>/dev/null` — the most common redirect idiom — into a
+// prompt for `/dev/*`.
+function deviceSink(text: string) {
+  return /^\/dev\/(null|zero|stdin|stdout|stderr|tty|fd\/[0-9]+)$/.test(text)
 }
 
 function globAnchor(text: string) {
@@ -1041,8 +1143,12 @@ export const ShellTool = Tool.define(
     })
 
     const argPath = Effect.fn("ShellTool.argPath")(function* (arg: string, cwd: string, ps: boolean, shell: string) {
+      // A word carrying an unresolvable ANSI-C escape still runs as a bash-decoded path.
+      // Anchor the scan conservatively instead of letting mangled text look contained.
+      if (!ps && arg.includes(UNRESOLVED)) return { external: true as const }
       const text = expand(arg, cwd, shell)
       if (!text) return
+      if (!ps && deviceSink(text)) return
       const file = prefix(text)
       // A glob at position 0 has no literal prefix, but the shell still expands it
       // relative to cwd and it can traverse out of the worktree (`*/../../etc`).
@@ -1079,19 +1185,20 @@ export const ShellTool = Tool.define(
       const pending: { tokens: string[]; dynamic: boolean }[] = []
 
       const addPath = Effect.fnUntraced(function* (resolved: string | { external: true } | undefined) {
-        if (!resolved) return
+        if (!resolved) return false
         // An unresolvable expansion or `~name` leaves the worktree; anchor the scan at
         // the filesystem root so the external_directory prompt still fires.
         if (typeof resolved !== "string") {
           scan.dirs.add(path.parse(cwd).root)
-          return
+          return true
         }
         // Lexical containment is not enough: a symlink inside the worktree can point
         // outside it. Require both the lexical path and its resolved target.
         const real = FSUtil.resolveExistingFrom(cwd, resolved)
-        if (containsPath(resolved, instance) && containsPath(real, instance)) return
+        if (containsPath(resolved, instance) && containsPath(real, instance)) return false
         const dir = (yield* fs.isDir(real)) ? real : path.dirname(real)
         scan.dirs.add(dir)
+        return true
       })
 
       // A `cd`/`pushd`/`popd` whose destination is not a plain literal moves the shell
@@ -1130,7 +1237,7 @@ export const ShellTool = Tool.define(
         if (info.extraPaths?.length) {
           for (const item of info.extraPaths) yield* addPath(yield* argPath(item, cwd, ps, shell))
         }
-        let conservative = false
+        let conservative = info.command.some((item) => item.text.includes(UNRESOLVED))
         if (name && (FILES.has(name) || (shellKind === "cmd" && CMD_FILES.has(name)))) {
           for (const arg of pathArgs(info.command, ps, shellKind === "cmd")) {
             yield* addPath(yield* argPath(arg, cwd, ps, shell))
@@ -1142,22 +1249,26 @@ export const ShellTool = Tool.define(
           for (const item of info.command.slice(1)) {
             yield* addPath(yield* argPath(item.text, cwd, ps, shell))
           }
-        } else if (
-          name &&
-          !info.wrapped &&
-          info.command.slice(1).some((item) => {
-            if (item.text.startsWith("-")) return false
-            const inner = bareName(commandName(item.text))
-            return FILES.has(inner) || (shellKind === "cmd" && CMD_FILES.has(inner))
-          })
-        ) {
-          // An unmodelled exec wrapper (`parallel cat x`) runs the file command named in
-          // its arguments; scan every token and suppress `always` so the wrapper name
-          // cannot absorb a future read.
+        } else if (name && DATA.has(name)) {
+          // Arguments are broadcast as text (`echo cat /etc/hostname`), never opened.
+        } else if (name && REMOTE.has(name)) {
+          // The inner command runs on another host or inside a container; its file
+          // arguments are not local paths.
+        } else {
+          // Any command the classifier cannot model fails closed. Scan every argument
+          // — including the value of an `if=`/`of=` style operand — and withdraw `always`
+          // when an external path is present, so neither the offered grant nor a stored
+          // `<cmd> *` rule can absorb a future external effect. This is the class close
+          // for read-capable commands that are not in `FILES`.
+          let external = false
           for (const item of info.command.slice(1)) {
-            yield* addPath(yield* argPath(item.text, cwd, ps, shell))
+            if (item.text.startsWith("-") && item.text !== "-") continue
+            const operand = /^[A-Za-z_][A-Za-z0-9_]*=(.*)$/.exec(item.text)
+            for (const target of operand ? [item.text, operand[1]] : [item.text]) {
+              if (yield* addPath(yield* argPath(target, cwd, ps, shell))) external = true
+            }
           }
-          conservative = true
+          conservative = conservative || external
         }
         if (info.evalScript && depth < 8) {
           const exit = yield* parse(info.evalScript, ps).pipe(Effect.exit)
