@@ -291,7 +291,7 @@ function boundSchema(
   value: unknown,
   depth = 0,
   seen = new WeakSet<object>(),
-  counter = { nodes: 0 },
+  counter = { nodes: 0, anchors: new Set<string>() },
   kind: SchemaKind = "schema",
 ): unknown | Bounded {
   if (value === null || typeof value !== "object") return value
@@ -404,7 +404,12 @@ function boundSchema(
         continue
       }
       if (key === "$anchor" || key === "$dynamicAnchor") {
-        if (typeof bounded === "string" && ANCHOR_PATTERN.test(bounded)) out[key] = bounded
+        // `$anchor` and `$dynamicAnchor` share one plain-name namespace; ajv refuses a document
+        // with a duplicate ("resolves to more than one schema"), so first-wins and strip the rest.
+        if (typeof bounded === "string" && ANCHOR_PATTERN.test(bounded) && !counter.anchors.has(bounded)) {
+          counter.anchors.add(bounded)
+          out[key] = bounded
+        }
         continue
       }
       if (key === "$id") {

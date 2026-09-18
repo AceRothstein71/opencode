@@ -644,4 +644,20 @@ describe("McpCatalog.convertTool bounds untrusted server input", () => {
     expect(props.goodPointer.$ref).toBe("#/properties/kept")
     expect(() => new Ajv2020({ strict: false }).compile(schema)).not.toThrow()
   })
+
+  test("strips duplicate anchors so the document still compiles", () => {
+    const schema = emitted({
+      type: "object",
+      $anchor: "root_1",
+      $defs: { A: { $anchor: "dup_1", type: "string" }, B: { $dynamicAnchor: "dup_1", type: "string" } },
+      properties: { p: { $anchor: "dup_1", type: "number" } },
+    })
+    const defs = schema.$defs as Record<string, Record<string, unknown>>
+    const props = schema.properties as Record<string, Record<string, unknown>>
+
+    expect(defs.A.$anchor).toBe("dup_1")
+    expect(defs.B.$dynamicAnchor).toBeUndefined()
+    expect(props.p.$anchor).toBeUndefined()
+    expect(() => new Ajv2020({ strict: false }).compile(schema)).not.toThrow()
+  })
 })
