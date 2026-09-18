@@ -14,9 +14,18 @@ import { disposeAllInstancesAndEmitGlobalDisposed } from "@/server/global-lifecy
 
 Heap.start()
 
-const onUnhandledRejection = (_error: unknown) => {}
+const onUnhandledRejection = (error: unknown) => {
+  process.stderr.write(`[opencode worker] unhandledRejection: ${formatWorkerError(error)}\n`)
+}
 
-const onUncaughtException = (_error: Error) => {}
+const onUncaughtException = (error: Error) => {
+  process.stderr.write(`[opencode worker] uncaughtException: ${formatWorkerError(error)}\n`)
+}
+
+function formatWorkerError(error: unknown) {
+  if (error instanceof Error) return error.stack ?? error.message
+  return String(error)
+}
 
 process.on("unhandledRejection", onUnhandledRejection)
 process.on("uncaughtException", onUncaughtException)

@@ -314,7 +314,7 @@ export type GlobalListInput = {
   directory?: string
   roots?: boolean
   start?: number
-  cursor?: number
+  cursor?: { time: number; id?: string } | number
   search?: string
   limit?: number
   archived?: boolean
@@ -563,7 +563,17 @@ const layer: Layer.Layer<
       if (input?.directory) conditions.push(eq(SessionTable.directory, input.directory))
       if (input?.roots) conditions.push(isNull(SessionTable.parent_id))
       if (input?.start) conditions.push(gte(SessionTable.time_updated, input.start))
-      if (input?.cursor) conditions.push(lt(SessionTable.time_updated, input.cursor))
+      if (input?.cursor) {
+        const cursor = typeof input.cursor === "number" ? { time: input.cursor } : input.cursor
+        const condition =
+          cursor.id === undefined
+            ? lt(SessionTable.time_updated, cursor.time)
+            : or(
+                lt(SessionTable.time_updated, cursor.time),
+                and(eq(SessionTable.time_updated, cursor.time), lt(SessionTable.id, SessionID.make(cursor.id))),
+              )
+        if (condition) conditions.push(condition)
+      }
       if (input?.search) conditions.push(like(SessionTable.title, `%${input.search}%`))
       if (!input?.archived) conditions.push(isNull(SessionTable.time_archived))
 

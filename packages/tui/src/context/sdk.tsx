@@ -88,9 +88,13 @@ export const { use: useSDK, provider: SDKProvider } = createSimpleContext({
         while (true) {
           if (abort.signal.aborted || ctrl.signal.aborted) break
 
+          let sseError: unknown
           const events = await sdk.global.event({
             signal: ctrl.signal,
             sseMaxRetryAttempts: 0,
+            onSseError: (error) => {
+              sseError = error
+            },
           })
 
           if (Flag.OPENCODE_EXPERIMENTAL_WORKSPACES) {
@@ -109,6 +113,14 @@ export const { use: useSDK, provider: SDKProvider } = createSimpleContext({
           attempt += 1
           if (abort.signal.aborted || ctrl.signal.aborted) break
 
+          // Auth/not-found rejections never recover on retry; stop instead of
+          // reconnecting silently forever.
+          const status = /SSE failed:\s*(\d{3})/.exec(sseError instanceof Error ? sseError.message : "")?.[1]
+          if (status === "400" || status === "401" || status === "403" || status === "404") {
+            console.error(`[tui] global event stream rejected with HTTP ${status}; giving up`)
+            break
+          }
+
           // Exponential backoff
           const backoff = Math.min(retryDelay * 2 ** (attempt - 1), maxRetryDelay)
           await new Promise((resolve) => setTimeout(resolve, backoff))
@@ -118,8 +130,20 @@ export const { use: useSDK, provider: SDKProvider } = createSimpleContext({
 
     onMount(async () => {
       if (props.events) {
+        // Register the cleanup before the awaiting subscribe so an unmount that
+        // races the subscribe still tears the handler down.
+        let unsubscribe: (() => void) | undefined
+        let disposed = false
+        onCleanup(() => {
+          disposed = true
+          unsubscribe?.()
+        })
         const unsub = await props.events.subscribe(handleEvent)
-        onCleanup(unsub)
+        if (disposed) {
+          unsub()
+          return
+        }
+        unsubscribe = unsub
 
         if (Flag.OPENCODE_EXPERIMENTAL_WORKSPACES) {
           // Start syncing workspaces, it's important to do this after

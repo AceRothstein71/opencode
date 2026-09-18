@@ -74,9 +74,11 @@ const SUPPORTED_MCP_RESOURCE_ATTACHMENT_MIMES = new Set([
 // User-run session shell commands stream output into the tool part metadata,
 // and every publish deep-clones the part. Cap the preview and throttle the
 // publishes so per-chunk cost stays bounded instead of growing with the whole
-// accumulated output. The completed part still carries the full output.
+// accumulated output. The accumulator and completed output are bounded too;
+// beyond the cap only the tail is retained with a truncation marker.
 const SHELL_METADATA_THROTTLE_MS = 200
 const SHELL_METADATA_MAX_LENGTH = 30_000
+const SHELL_OUTPUT_MAX_LENGTH = 200_000
 
 const shellMetadataPreview = (text: string) =>
   text.length <= SHELL_METADATA_MAX_LENGTH ? text : "...\n\n" + text.slice(-SHELL_METADATA_MAX_LENGTH)
@@ -231,7 +233,9 @@ const layer = Layer.effect(
           (yield* provider.getModel(input.providerID, input.modelID)))
       const msgs = onlySubtasks
         ? [{ role: "user" as const, content: subtasks.map((p) => p.prompt).join("\n") }]
-        : yield* MessageV2.toModelMessagesEffect(context, mdl)
+        : yield* MessageV2.toModelMessagesEffect(context, mdl, {
+            toolOutputMaxChars: (yield* truncate.limits()).maxBytes,
+          })
       const text = yield* llm
         .stream({
           agent: ag,
@@ -533,14 +537,23 @@ const layer = Layer.effect(
           const sh = Shell.preferred(cfg.shell)
           const args = Shell.args(sh, input.command, cwd)
           let output = ""
+          let outputTruncated = false
           let aborted = false
           let lastMetadataFlush = 0
           let metadataDirty = false
 
+          const appendOutput = (text: string) => {
+            output += text
+            if (output.length <= SHELL_OUTPUT_MAX_LENGTH) return
+            output = output.slice(-SHELL_OUTPUT_MAX_LENGTH)
+            outputTruncated = true
+          }
+          const boundedOutput = () => (outputTruncated ? "...\n\n" : "") + output
+
           const finish = Effect.uninterruptible(
             Effect.gen(function* () {
               if (aborted) {
-                output += "\n\n" + ["<metadata>", "User aborted the command", "</metadata>"].join("\n")
+                appendOutput("\n\n" + ["<metadata>", "User aborted the command", "</metadata>"].join("\n"))
               }
               const completed = Date.now()
               if (!msg.time.completed) {
@@ -548,14 +561,22 @@ const layer = Layer.effect(
                 yield* sessions.updateMessage(msg)
               }
               if (part.state.status === "running") {
-                part.state = {
-                  status: "completed",
-                  time: { ...part.state.time, end: completed },
-                  input: part.state.input,
-                  title: "",
-                  metadata: { output },
-                  output,
-                }
+                part.state = aborted
+                  ? {
+                      status: "error",
+                      time: { ...part.state.time, end: completed },
+                      input: part.state.input,
+                      error: "User aborted the command",
+                      metadata: { output: shellMetadataPreview(boundedOutput()), interrupted: true },
+                    }
+                  : {
+                      status: "completed",
+                      time: { ...part.state.time, end: completed },
+                      input: part.state.input,
+                      title: "",
+                      metadata: { output: shellMetadataPreview(boundedOutput()) },
+                      output: boundedOutput(),
+                    }
                 yield* sessions.updatePart(part)
               }
             }),
@@ -581,13 +602,13 @@ const layer = Layer.effect(
                   if (!metadataDirty || part.state.status !== "running") return
                   metadataDirty = false
                   lastMetadataFlush = Date.now()
-                  part.state.metadata = { output: shellMetadataPreview(output) }
+                  part.state.metadata = { output: shellMetadataPreview(boundedOutput()) }
                   yield* sessions.updatePart(part)
                 }).pipe(Effect.repeat(Schedule.spaced(`${SHELL_METADATA_THROTTLE_MS} millis`))),
               )
               yield* Stream.runForEach(Stream.decodeText(handle.all), (chunk) =>
                 Effect.gen(function* () {
-                  output += chunk
+                  appendOutput(chunk)
                   if (part.state.status === "running") {
                     const now = Date.now()
                     if (now - lastMetadataFlush < SHELL_METADATA_THROTTLE_MS) {
@@ -596,7 +617,7 @@ const layer = Layer.effect(
                     }
                     lastMetadataFlush = now
                     metadataDirty = false
-                    part.state.metadata = { output: shellMetadataPreview(output) }
+                    part.state.metadata = { output: shellMetadataPreview(boundedOutput()) }
                     yield* sessions.updatePart(part)
                   }
                 }),
@@ -1109,19 +1130,35 @@ const layer = Layer.effect(
         const ctx = yield* InstanceState.context
         let structured: unknown
         let step = 0
+        let truncationCompacted = false
         const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
 
         while (true) {
           yield* status.set(sessionID, { type: "busy" })
           yield* Effect.logInfo("loop", { "session.id": sessionID, step })
 
-          let msgs = yield* MessageV2.filterCompactedEffect(sessionID).pipe(
+          const filtered = yield* MessageV2.filterCompactedEffect(sessionID).pipe(
             Effect.provideService(Database.Service, database),
           )
+          let msgs = filtered.messages
 
           const { user: lastUser, assistant: lastAssistant, finished: lastFinished, tasks } = MessageV2.latest(msgs)
 
           if (!lastUser) throw new Error("No user message found in stream. This should never happen.")
+
+          if (filtered.truncated && !truncationCompacted) {
+            truncationCompacted = true
+            yield* Effect.logWarning("compacted page walk truncated; triggering compaction", {
+              "session.id": sessionID,
+            })
+            yield* compaction.create({
+              sessionID,
+              agent: lastUser.agent,
+              model: lastUser.model,
+              auto: true,
+            })
+            continue
+          }
 
           const lastAssistantMsg = msgs.findLast(
             (msg) => msg.info.role === "assistant" && msg.info.id === lastAssistant?.id,
@@ -1280,12 +1317,13 @@ const layer = Layer.effect(
 
             yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
 
+            const toolOutput = yield* truncate.limits()
             const [skills, env, instructions, mcpInstructions, modelMsgs] = yield* Effect.all([
               sys.skills(agent),
               sys.environment(model),
               instruction.system().pipe(Effect.orDie),
               sys.mcp(agent, session.permission),
-              MessageV2.toModelMessagesEffect(msgs, model),
+              MessageV2.toModelMessagesEffect(msgs, model, { toolOutputMaxChars: toolOutput.maxBytes }),
             ])
             const system = [
               ...env,

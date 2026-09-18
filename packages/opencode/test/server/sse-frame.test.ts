@@ -24,6 +24,20 @@ describe("SSE frame encoding", () => {
     )
   })
 
+  test("does not cache transient frames minted with a unique id", () => {
+    const payload = { id: "evt_connected_1", type: "server.connected", properties: {} }
+    const first = frame("evt_connected_1", "evt_connected_1", payload, false)
+    const second = frame("evt_connected_1", "evt_connected_1", payload, false)
+    expect(second).not.toBe(first)
+    expect(Array.from(second)).toEqual(Array.from(first))
+  })
+
+  test("keeps caching durable frames that repeat across clients", () => {
+    const payload = { id: "evt_durable_1", type: "message.part.updated", properties: {} }
+    const first = frame("evt_durable_1", "evt_durable_1", payload)
+    expect(frame("evt_durable_1", "evt_durable_1", payload)).toBe(first)
+  })
+
   test("joins a batch into one buffer without changing the wire bytes", () => {
     const one = frame("evt_batch_1", "evt_batch_1", { id: "evt_batch_1", type: "a", properties: {} })
     const two = frame("evt_batch_2", "evt_batch_2", { id: "evt_batch_2", type: "b", properties: {} })
@@ -31,5 +45,22 @@ describe("SSE frame encoding", () => {
     expect(merged.byteLength).toBe(one.byteLength + two.byteLength)
     expect(Array.from(merged)).toEqual([...one, ...two])
     expect(join([one])).toBe(one)
+  })
+
+  test("does not cache frames over the per-frame byte cap", () => {
+    const payload = { id: "evt_huge", type: "message.part.updated", properties: { text: "x".repeat(300 * 1024) } }
+    const first = frame("evt_huge", "evt_huge", payload)
+    expect(first.byteLength).toBeGreaterThan(256 * 1024)
+    const second = frame("evt_huge", "evt_huge", payload)
+    expect(second).not.toBe(first)
+  })
+
+  test("evicts by total byte budget, not just entry count", () => {
+    const payload = () => ({ type: "message.part.updated", properties: { text: "y".repeat(200 * 1024) } })
+    const original = frame("evt_bulk_first", "evt_bulk_first", payload())
+    for (let index = 0; index < 50; index++) {
+      frame(`evt_bulk_${index}`, `evt_bulk_${index}`, payload())
+    }
+    expect(frame("evt_bulk_first", "evt_bulk_first", payload())).not.toBe(original)
   })
 })

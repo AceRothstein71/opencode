@@ -27,6 +27,41 @@ const disabled = process.env["OPENCODE_DISABLE_SHARE"] === "true" || process.env
 const MAX_FLUSH_ATTEMPTS = 3
 const FLUSH_RETRY_DELAY = 1000
 
+// A share sync POST must fit the enterprise server's 2000-item `data` cap, and a
+// stalled endpoint must not grow the per-session queue without bound (O-16/O-28).
+const SHARE_REQUEST_TIMEOUT = "15 seconds"
+const MAX_QUEUE_ITEMS = 2_000
+const FULL_PAGE_SIZE = 50
+
+export function trimQueue<T>(queue: Map<string, T>) {
+  const over = queue.size - MAX_QUEUE_ITEMS
+  if (over <= 0) return 0
+  // `full()` inserts pages newest-first, so insertion order is not chronological. Order
+  // part keys by their message id (ascending for both live and full syncs) and drop the
+  // oldest; the insertion index breaks ties within one message.
+  const parts: Array<{ key: string; message: string; index: number }> = []
+  let index = 0
+  for (const key of queue.keys()) {
+    if (key.startsWith("part/")) parts.push({ key, message: key.split("/")[1] ?? "", index })
+    index++
+  }
+  parts.sort((a, b) => (a.message === b.message ? a.index - b.index : a.message < b.message ? -1 : 1))
+  let dropped = 0
+  for (const part of parts) {
+    if (dropped >= over) break
+    queue.delete(part.key)
+    dropped++
+  }
+  // Fewer part keys than the overflow: fall back to the oldest remaining keys, while
+  // session/message/diff/model keys (which self-overwrite) are kept whenever possible.
+  for (const key of queue.keys()) {
+    if (dropped >= over) break
+    queue.delete(key)
+    dropped++
+  }
+  return dropped
+}
+
 // A negative share lookup is cached only briefly: another process can create a share
 // out-of-band, and a permanent null would hide it forever (F-119).
 const NEGATIVE_CACHE_TTL = 30_000
@@ -164,6 +199,12 @@ const layer = Layer.effect(
           }
         } else {
           s.queue.set(sessionID, new Map(data.map((item) => [key(item), item])))
+        }
+
+        const queued = s.queue.get(sessionID)
+        if (queued) {
+          const dropped = trimQueue(queued)
+          if (dropped > 0) yield* Effect.logWarning("share queue capped", { sessionID: sessionID, dropped: dropped })
         }
 
         // One delayed flush per session; while one is scheduled or in flight the batch
@@ -367,13 +408,21 @@ const layer = Layer.effect(
             HttpClientRequest.setHeaders(req.headers),
             HttpClientRequest.bodyJson({ secret: share.secret, data: sent.map((entry) => entry[1]) }),
             Effect.flatMap((r) => http.execute(r)),
+            Effect.timeout(SHARE_REQUEST_TIMEOUT),
+            Effect.catchCause((cause) =>
+              Effect.logWarning("share sync request failed", {
+                sessionID: sessionID,
+                attempt: attempt + 1,
+                cause,
+              }).pipe(Effect.as(undefined)),
+            ),
           )
 
-          if (res.status >= 400) {
+          if (!res || res.status >= 400) {
             yield* Effect.logWarning("failed to sync share", {
               sessionID: sessionID,
               shareID: share.id,
-              status: res.status,
+              status: res?.status,
               attempt: attempt + 1,
             })
             if (attempt + 1 < MAX_FLUSH_ATTEMPTS) yield* Effect.sleep(FLUSH_RETRY_DELAY * (attempt + 1))
@@ -409,27 +458,39 @@ const layer = Layer.effect(
       yield* Effect.logInfo("full sync", { sessionID: sessionID })
       const info = yield* session.get(sessionID)
       const diffs = yield* session.diff(sessionID)
-      const messages = yield* session.messages({ sessionID })
-      const models = yield* Effect.forEach(
-        Array.from(
-          new Map(
-            messages
-              .filter((msg) => msg.info.role === "user")
-              .map((msg) => (msg.info as SDK.UserMessage).model)
-              .map((item) => [`${item.providerID}/${item.modelID}`, item] as const),
-          ).values(),
-        ),
-        (item) => provider.getModel(ProviderV2.ID.make(item.providerID), ModelV2.ID.make(item.modelID)),
-        { concurrency: 8 },
-      )
-
       yield* sync(sessionID, [
         { type: "session", data: info },
-        ...messages.map((item) => ({ type: "message" as const, data: item.info })),
-        ...messages.flatMap((item) => item.parts.map((part) => ({ type: "part" as const, data: part }))),
         { type: "session_diff", data: diffs },
-        { type: "model", data: models },
       ])
+
+      // Page newest-first so the queue cap retains the most recent history; the
+      // remote merge is keyed and order-independent (D-20).
+      let before: string | undefined
+      while (true) {
+        const page = yield* MessageV2.page({ sessionID, limit: FULL_PAGE_SIZE, before }).pipe(
+          Effect.provideService(Database.Service, database),
+        )
+        if (page.items.length === 0) break
+        const models = yield* Effect.forEach(
+          Array.from(
+            new Map(
+              page.items
+                .filter((msg) => msg.info.role === "user")
+                .map((msg) => (msg.info as SDK.UserMessage).model)
+                .map((item) => [`${item.providerID}/${item.modelID}`, item] as const),
+            ).values(),
+          ),
+          (item) => provider.getModel(ProviderV2.ID.make(item.providerID), ModelV2.ID.make(item.modelID)),
+          { concurrency: 8 },
+        )
+        yield* sync(sessionID, [
+          ...page.items.map((item) => ({ type: "message" as const, data: item.info })),
+          ...page.items.flatMap((item) => item.parts.map((part) => ({ type: "part" as const, data: part }))),
+          { type: "model", data: models },
+        ])
+        if (!page.more || !page.cursor) break
+        before = page.cursor
+      }
     })
 
     const fullWithRetry = Effect.fnUntraced(function* (sessionID: SessionID) {
@@ -493,24 +554,37 @@ const layer = Layer.effect(
       yield* Effect.logInfo("removing share", { sessionID: sessionID })
       const s = yield* InstanceState.get(state)
       const share = yield* getCached(sessionID)
-      if (!share) {
-        s.shared.delete(sessionID)
-        s.queue.delete(sessionID)
-        s.misses.delete(sessionID)
-        return
-      }
 
-      const req = yield* request()
-      yield* HttpClientRequest.delete(`${req.baseUrl}${req.api.remove(share.id)}`).pipe(
-        HttpClientRequest.setHeaders(req.headers),
-        HttpClientRequest.bodyJson({ secret: share.secret }),
-        Effect.flatMap((r) => httpOk.execute(r)),
+      yield* Effect.gen(function* () {
+        if (!share) return
+        const req = yield* request()
+        yield* HttpClientRequest.delete(`${req.baseUrl}${req.api.remove(share.id)}`).pipe(
+          HttpClientRequest.setHeaders(req.headers),
+          HttpClientRequest.bodyJson({ secret: share.secret }),
+          Effect.flatMap((r) => httpOk.execute(r)),
+          Effect.timeout(SHARE_REQUEST_TIMEOUT),
+        )
+      }).pipe(
+        Effect.catchCause((cause) => Effect.logWarning("failed to remove share", { sessionID: sessionID, cause })),
+        // Local state is dropped whether or not the remote delete succeeded, so a
+        // dead endpoint cannot leave the session marked shared forever (O-16).
+        Effect.ensuring(
+          Effect.gen(function* () {
+            yield* db
+              .delete(SessionShareTable)
+              .where(eq(SessionShareTable.session_id, sessionID))
+              .run()
+              .pipe(Effect.orDie)
+            yield* Effect.sync(() => {
+              s.shared.delete(sessionID)
+              s.queue.delete(sessionID)
+              s.misses.delete(sessionID)
+              s.inflight.delete(sessionID)
+              s.scheduled.delete(sessionID)
+            })
+          }),
+        ),
       )
-
-      yield* db.delete(SessionShareTable).where(eq(SessionShareTable.session_id, sessionID)).run().pipe(Effect.orDie)
-      s.shared.delete(sessionID)
-      s.queue.delete(sessionID)
-      s.misses.delete(sessionID)
     })
 
     return Service.of({ init, url, request, create, remove })

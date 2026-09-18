@@ -105,6 +105,13 @@ describe("v2 location HttpApi", () => {
     }
   })
 
+  test("ignores a malformed location workspace instead of failing", async () => {
+    await using tmp = await tmpdir({ git: true })
+
+    const response = await request("/api/command?location[workspace]=garbage", tmp.path)
+    expect(response.status).toBe(200)
+  })
+
   test("streams native EventV2 payloads across locations", async () => {
     await using subscriber = await tmpdir({ git: true })
     await using publisher = await tmpdir({ git: true })

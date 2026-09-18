@@ -340,7 +340,9 @@ export const TaskTool = Tool.define(
           Effect.gen(function* () {
             const result = yield* Effect.raceFirst(
               background.wait({ id: nextSession.id }).pipe(Effect.map((waited) => waited.info)),
-              background.waitForPromotion(nextSession.id),
+              background
+                .waitForPromotion(nextSession.id)
+                .pipe(Effect.catchTag("BackgroundJob.NotFound", () => Effect.succeed(undefined))),
             )
             if (result?.metadata?.background === true) return backgroundResult()
             if (result?.status === "error") return yield* Effect.fail(new Error(result.error ?? "Task failed"))

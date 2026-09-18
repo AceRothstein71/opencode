@@ -33,4 +33,20 @@ describe("Wildcard.match", () => {
     expect(second).toBe(first)
     expect(mismatch).toBe(false)
   })
+
+  test("matchStrict refuses flag-bearing trailing arguments", () => {
+    expect(Wildcard.matchStrict("rm -rf /", "rm *")).toBe(false)
+    expect(Wildcard.matchStrict("ls -la", "ls *")).toBe(false)
+    expect(Wildcard.matchStrict("rm file.txt", "rm *")).toBe(true)
+    expect(Wildcard.matchStrict("rm", "rm *")).toBe(true)
+    expect(Wildcard.matchStrict("src/foo.ts", "src/*")).toBe(true)
+  })
+
+  test("matchStrict refuses flags in any argument position", () => {
+    expect(Wildcard.matchStrict("rm x -rf /", "rm *")).toBe(false)
+    expect(Wildcard.matchStrict("git push origin --force", "git push *")).toBe(false)
+    expect(Wildcard.matchStrict("chmod 777 /etc -R", "chmod *")).toBe(false)
+    expect(Wildcard.matchStrict("git push origin main", "git push *")).toBe(true)
+    expect(Wildcard.matchStrict("chmod 777 /etc", "chmod *")).toBe(true)
+  })
 })

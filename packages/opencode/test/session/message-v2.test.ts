@@ -11,6 +11,7 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
+import { MessageTable } from "@opencode-ai/core/session/sql"
 import { Database } from "@opencode-ai/core/database/database"
 import { Effect } from "effect"
 import { Session as SessionNs } from "@/session/session"
@@ -994,6 +995,67 @@ describe("session.message-v2.toModelMessage", () => {
     expect(await MessageV2.toModelMessages(input, model)).toStrictEqual([])
   })
 
+  test("keeps completed tool output on an errored assistant turn", async () => {
+    const assistantID = "m-assistant"
+
+    const input: SessionV1.WithParts[] = [
+      {
+        info: assistantInfo(
+          assistantID,
+          "m-parent",
+          new SessionV1.APIError({ message: "boom", isRetryable: true }).toObject() as SessionV1.APIError,
+        ),
+        parts: [
+          {
+            ...basePart(assistantID, "a1"),
+            type: "text",
+            text: "should not render",
+          },
+          {
+            ...basePart(assistantID, "a2"),
+            type: "tool",
+            tool: "bash",
+            callID: "call-1",
+            state: {
+              status: "completed",
+              input: { command: "echo hi" },
+              output: "hi",
+              title: "bash",
+              metadata: {},
+              time: { start: 0, end: 1 },
+            },
+          },
+        ] as SessionV1.Part[],
+      },
+    ]
+
+    expect(await MessageV2.toModelMessages(input, model)).toStrictEqual([
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "tool-call",
+            toolCallId: "call-1",
+            toolName: "bash",
+            input: { command: "echo hi" },
+            providerExecuted: undefined,
+          },
+        ],
+      },
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "call-1",
+            toolName: "bash",
+            output: { type: "text", value: "hi" },
+          },
+        ],
+      },
+    ])
+  })
+
   test("includes aborted assistant messages only when they have non-step-start/reasoning content", async () => {
     const assistantID1 = "m-assistant-1"
     const assistantID2 = "m-assistant-2"
@@ -1821,8 +1883,9 @@ const expectEquivalent = (sessionID: SessionID) =>
   Effect.gen(function* () {
     const eager = MessageV2.filterCompacted(yield* MessageV2.stream(sessionID))
     const streamed = yield* MessageV2.filterCompactedEffect(sessionID)
-    expect(streamed).toEqual(eager)
-    return streamed
+    expect(streamed.messages).toEqual(eager)
+    expect(streamed.truncated).toBe(false)
+    return streamed.messages
   })
 
 describe("session.message-v2.filterCompactedEffect differential", () => {
@@ -1910,7 +1973,8 @@ describe("session.message-v2.filterCompactedEffect differential", () => {
         )
         const streamedSelects = count.selects
 
-        expect(streamed).toEqual(eager)
+        expect(streamed.messages).toEqual(eager)
+        expect(streamed.truncated).toBe(false)
         expect(streamedSelects).toBe(3)
         expect(eagerSelects).toBe(9)
         expect(streamedSelects).toBeLessThan(eagerSelects)
@@ -2033,6 +2097,40 @@ describe("session.message-v2.filterCompactedEffect differential", () => {
 
         yield* session.removeMessage({ sessionID, messageID: assistant })
         yield* expectEquivalent(sessionID)
+      }),
+    ),
+  )
+})
+
+describe("session.message-v2.filterCompactedEffect bound", () => {
+  it.instance("caps the page walk on an uncompacted session", () =>
+    withSession(({ sessionID }) =>
+      Effect.gen(function* () {
+        const { db } = yield* Database.Service
+        const base = Date.now()
+        const rows = Array.from({ length: 5100 }, (_, index) => ({
+          id: MessageID.make(`msg_cap_${String(index).padStart(5, "0")}`),
+          session_id: sessionID,
+          time_created: base + index,
+          time_updated: base + index,
+          data: {
+            role: "user",
+            time: { created: base + index },
+            agent: "test",
+            model: { providerID: "test", modelID: "test" },
+          } as unknown as (typeof MessageTable.$inferInsert)["data"],
+        }))
+        for (let index = 0; index < rows.length; index += 500) {
+          yield* db
+            .insert(MessageTable)
+            .values(rows.slice(index, index + 500))
+            .run()
+            .pipe(Effect.orDie)
+        }
+
+        const result = yield* MessageV2.filterCompactedEffect(sessionID)
+        expect(result.messages).toHaveLength(5000)
+        expect(result.truncated).toBe(true)
       }),
     ),
   )

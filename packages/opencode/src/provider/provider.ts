@@ -35,7 +35,7 @@ import { ProviderError } from "./error"
 
 const OPENAI_HEADER_TIMEOUT_DEFAULT = 300_000
 
-function wrapSSE(res: Response, ms: number, ctl: AbortController) {
+export function wrapSSE(res: Response, ms: number, ctl: AbortController) {
   if (typeof ms !== "number" || ms <= 0) return res
   if (!res.body) return res
   if (!res.headers.get("content-type")?.includes("text/event-stream")) return res
@@ -46,42 +46,55 @@ function wrapSSE(res: Response, ms: number, ctl: AbortController) {
   let timedOut = false
   let lastReadAt = Date.now()
 
+  const fail = () => {
+    if (timedOut) return
+    timedOut = true
+    timer = undefined
+    const err = new ProviderError.ResponseStreamError("SSE read timed out")
+    ctl.abort(err)
+    reader.cancel(err).catch(() => {})
+    controller?.error(err)
+  }
   const stopTimer = () => {
     if (timer === undefined) return
     clearTimeout(timer)
     timer = undefined
   }
-  reader.closed.catch(() => {}).finally(stopTimer)
-
-  // Perf: a single idle watchdog instead of a Promise + timer per SSE chunk. It is
-  // re-armed only when it fires before the idle window elapsed, so per-chunk work
-  // is just a timestamp update.
+  // The watchdog is armed only while an upstream read is outstanding: measuring from
+  // `start` made downstream backpressure look like a provider stall. It fires at most
+  // once and always terminates the stream through `fail()`.
   const onIdle = () => {
     const idle = Date.now() - lastReadAt
     if (idle >= ms) {
-      timer = undefined
-      timedOut = true
-      const err = new ProviderError.ResponseStreamError("SSE read timed out")
-      ctl.abort(err)
-      reader.cancel(err).catch(() => {})
-      controller?.error(err)
+      fail()
       return
     }
     timer = setTimeout(onIdle, ms - idle)
   }
+  reader.closed.catch(() => {}).finally(stopTimer)
 
   const body = new ReadableStream<Uint8Array>({
     start(ctrl) {
       controller = ctrl
-      timer = setTimeout(onIdle, ms)
     },
     async pull(ctrl) {
-      const part = await reader.read()
+      if (timedOut) return
+      lastReadAt = Date.now()
+      stopTimer()
+      timer = setTimeout(onIdle, ms)
+
+      let part: Awaited<ReturnType<typeof reader.read>>
+      try {
+        part = await reader.read()
+      } catch (error) {
+        if (timedOut) return
+        throw error
+      }
+      stopTimer()
       lastReadAt = Date.now()
       if (timedOut) return
 
       if (part.done) {
-        stopTimer()
         ctrl.close()
         return
       }

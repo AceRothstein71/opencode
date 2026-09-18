@@ -90,7 +90,15 @@ export namespace Storage {
     throw new Error("No storage adapter configured")
   })
 
+  // Object keys are string-interpolated into the request URL, and `fetch`/`new URL`
+  // normalize `..` segments. Reject anything outside the intended charset so an
+  // attacker-controlled id cannot escape its storage prefix.
+  const KEY_SEGMENT = /^[A-Za-z0-9_-]+$/
+
   function resolve(key: string[]) {
+    for (const segment of key) {
+      if (!KEY_SEGMENT.test(segment)) throw new Error(`Invalid storage key segment: ${segment}`)
+    }
     return key.join("/") + ".json"
   }
 

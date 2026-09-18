@@ -18,6 +18,9 @@ export function createDurableParentCache(capacity = DEFAULT_CAPACITY) {
       const oldest = entries.keys().next().value
       if (oldest !== undefined) entries.delete(oldest)
     },
+    delete(key: string) {
+      entries.delete(key)
+    },
     get size() {
       return entries.size
     },

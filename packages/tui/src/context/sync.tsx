@@ -28,7 +28,7 @@ import { useTuiStartup } from "./runtime"
 import { createSimpleContext } from "./helper"
 import { useExit } from "./exit"
 import { useArgs } from "./args"
-import { batch, onMount } from "solid-js"
+import { batch, onCleanup, onMount } from "solid-js"
 import path from "path"
 import { useKV } from "./kv"
 import { usePermission } from "./permission"
@@ -180,7 +180,7 @@ export const {
         .then((x) => (x.data ?? []).toSorted((a, b) => a.id.localeCompare(b.id)))
     }
 
-    event.subscribe((event, { directory, workspace }) => {
+    const unsubscribeSyncEvent = event.subscribe((event, { directory, workspace }) => {
       if (event.type === "message.diff.updated") {
         const messages = store.message[event.properties.sessionID]
         const index = messages?.findIndex((message) => message.id === event.properties.messageID) ?? -1
@@ -525,6 +525,7 @@ export const {
         }
       }
     })
+    onCleanup(unsubscribeSyncEvent)
 
     const exit = useExit()
     const args = useArgs()

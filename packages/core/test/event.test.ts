@@ -1157,4 +1157,101 @@ describe("EventV2", () => {
       expect(received[0]?.data).toEqual(durableData(aggregateID, "replayed"))
     }),
   )
+
+  it.effect("runs every live-only listener and the pubsub fan-out before re-raising the defect", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const received = new Array<string>()
+      const defect = new Error("listener defect")
+      yield* events.listen(() => Effect.die(defect))
+      yield* events.listen((event) => Effect.sync(() => received.push(event.type)))
+      const typed = yield* events.subscribe(GlobalMessage).pipe(Stream.take(1), Stream.runCollect, Effect.forkScoped)
+      yield* Effect.yieldNow
+
+      const result = yield* events.publish(GlobalMessage, { text: "hello" }).pipe(Effect.catchDefect(Effect.succeed))
+
+      expect(result).toBe(defect)
+      expect(received).toEqual([GlobalMessage.type])
+      expect(Array.from(yield* Fiber.join(typed)).map((event) => event.type)).toEqual([GlobalMessage.type])
+    }),
+  )
+
+  it.effect("replays the original payload after a tombstone digest is recorded", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const { db } = yield* Database.Service
+      const aggregateID = Session.ID.create()
+      const published = yield* events.publish(DurableMessage, durableData(aggregateID, "original"))
+      const row = yield* db.select().from(EventTable).where(eq(EventTable.id, published.id)).get().pipe(Effect.orDie)
+      if (!row) return yield* Effect.die("expected committed event row")
+
+      yield* db
+        .update(EventTable)
+        .set({
+          data: { sessionID: aggregateID, messageID: "msg_tombstone" },
+          tombstone_digest: EventV2.eventDigest(row.data),
+        })
+        .where(eq(EventTable.id, published.id))
+        .run()
+        .pipe(Effect.orDie)
+
+      const replay = (data: (typeof published)["data"]) =>
+        events.replay({
+          id: published.id,
+          type: EventV2.versionedType(DurableMessage.type, 1),
+          seq: published.durable?.seq ?? -1,
+          aggregateID,
+          data,
+        })
+
+      yield* replay(published.data)
+      const exit = yield* replay(durableData(aggregateID, "divergent")).pipe(Effect.exit)
+
+      expect(String(exit)).toContain("Replay diverged")
+    }),
+  )
+
+  it.effect("skips rows the manifest cannot decode instead of failing the read", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const { db } = yield* Database.Service
+      const Row = EventV2.define({
+        type: "test.row",
+        durable: { version: 1, aggregate: "id" },
+        schema: { id: Schema.String, text: Schema.String },
+      })
+      const manifest = { definitions: Event.durable([Row]), schema: Row }
+      const aggregateID = EventV2.ID.create()
+      yield* events.publish(Row, { id: aggregateID, text: "good" })
+      const corrupt = yield* events.publish(Row, { id: aggregateID, text: "corrupt" })
+      yield* db
+        .update(EventTable)
+        .set({ data: { id: aggregateID, text: 7 } })
+        .where(eq(EventTable.id, corrupt.id))
+        .run()
+        .pipe(Effect.orDie)
+
+      const result = yield* EventV2.readAggregate(db, { aggregateID, limit: 10, manifest })
+
+      expect(result.events.map((event) => event.data)).toEqual([{ id: aggregateID, text: "good" }])
+      expect(result.hasMore).toBe(false)
+    }),
+  )
+
+  it.effect("pages durable backfill past the per-read limit", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const aggregateID = Session.ID.create()
+      const count = 600
+      for (let index = 0; index < count; index++) {
+        yield* events.publish(DurableMessage, durableData(aggregateID, String(index)))
+      }
+
+      const received = Array.from(yield* events.durable({ aggregateID }).pipe(Stream.take(count), Stream.runCollect))
+
+      expect(received).toHaveLength(count)
+      expect(received[0]?.durable?.seq).toBe(0)
+      expect(received.at(-1)?.durable?.seq).toBe(count - 1)
+    }),
+  )
 })

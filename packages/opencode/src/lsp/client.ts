@@ -573,6 +573,9 @@ export async function create(input: {
     get connection() {
       return connection
     },
+    get process() {
+      return input.server.process
+    },
     notify: {
       async open(request: { path: string }) {
         request.path = Filesystem.normalizePath(

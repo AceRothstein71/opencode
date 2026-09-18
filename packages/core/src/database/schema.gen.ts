@@ -83,6 +83,7 @@ export default {
           \`seq\` integer NOT NULL,
           \`type\` text NOT NULL,
           \`data\` text NOT NULL,
+          \`tombstone_digest\` text,
           CONSTRAINT \`fk_event_aggregate_id_event_sequence_aggregate_id_fk\` FOREIGN KEY (\`aggregate_id\`) REFERENCES \`event_sequence\`(\`aggregate_id\`) ON DELETE CASCADE
         );
       `)
@@ -274,6 +275,9 @@ export default {
       )
       yield* tx.run(
         `CREATE INDEX \`session_message_session_time_created_id_idx\` ON \`session_message\` (\`session_id\`,\`time_created\`,\`id\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`session_message_session_call_id_seq_idx\` ON \`session_message\` (\`session_id\`,json_extract("data", '$.callID'),\`seq\`);`,
       )
       yield* tx.run(`CREATE INDEX \`session_project_idx\` ON \`session\` (\`project_id\`);`)
       yield* tx.run(`CREATE INDEX \`session_workspace_idx\` ON \`session\` (\`workspace_id\`);`)

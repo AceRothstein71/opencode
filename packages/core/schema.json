@@ -1,8 +1,8 @@
 {
   "version": "7",
   "dialect": "sqlite",
-  "id": "9f5f9a05-d53b-40e9-abd3-67e93c5f9829",
-  "prevIds": ["f3e4e554-6717-4c4c-87e3-4cda84056492"],
+  "id": "1c58c2e1-5cbe-4c41-b1b9-62b6e04da763",
+  "prevIds": ["9f5f9a05-d53b-40e9-abd3-67e93c5f9829"],
   "ddl": [
     {
       "name": "workspace",
@@ -541,6 +541,16 @@
       "default": null,
       "generated": null,
       "name": "data",
+      "entityType": "columns",
+      "table": "event"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "tombstone_digest",
       "entityType": "columns",
       "table": "event"
     },
@@ -2084,6 +2094,28 @@
       "where": null,
       "origin": "manual",
       "name": "session_message_session_time_created_id_idx",
+      "entityType": "indexes",
+      "table": "session_message"
+    },
+    {
+      "columns": [
+        {
+          "value": "session_id",
+          "isExpression": false
+        },
+        {
+          "value": "json_extract(\"data\", '$.callID')",
+          "isExpression": true
+        },
+        {
+          "value": "seq",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "session_message_session_call_id_seq_idx",
       "entityType": "indexes",
       "table": "session_message"
     },

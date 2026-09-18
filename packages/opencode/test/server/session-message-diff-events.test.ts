@@ -167,6 +167,7 @@ describe("session message diff events", () => {
         // payload (rows stay so replay seqs stay contiguous) while replay converges.
         expect(diffEvents).toHaveLength(2)
         expect(diffEvents[0]?.data).toMatchObject({ messageID, diffs: [] })
+        expect(diffEvents[0]?.tombstone_digest).toBeString()
         expect(JSON.stringify(diffEvents[1]?.data)).toContain("changed turn patch")
         expect(JSON.stringify(diffEvents[1]?.data).length).toBeGreaterThan(250_000)
 

@@ -10,6 +10,12 @@ import { Effect } from "effect"
 
 const DEFAULT_TIMEOUT = 30_000
 const MAX_LIST_PAGES = 1_000
+// A hostile MCP server controls its own tool description and input schema, both of
+// which are injected verbatim into the model's tool manifest. Bound them so a server
+// cannot dominate the prompt or force pathological serialization work.
+const MAX_DESCRIPTION_LENGTH = 4_000
+const MAX_SCHEMA_DEPTH = 8
+const MAX_SCHEMA_NODES = 500
 
 const TolerantListToolsResultSchema = ListToolsResultSchema.extend({
   tools: ToolSchema.omit({ outputSchema: true }).array(),
@@ -39,16 +45,17 @@ export function defs(client: Client, timeout?: number) {
   return listTools(client, timeout ?? DEFAULT_TIMEOUT).pipe(Effect.catch(() => Effect.void))
 }
 
-export function convertTool(mcpTool: MCPToolDef, client: Client, timeout?: number): Tool {
+export function convertTool(mcpTool: MCPToolDef, client: Client, timeout?: number, server?: string): Tool {
+  const bounded = boundSchema(mcpTool.inputSchema) as JSONSchema7
   const inputSchema: JSONSchema7 = {
-    ...(mcpTool.inputSchema as JSONSchema7),
+    ...bounded,
     type: "object",
-    properties: (mcpTool.inputSchema.properties ?? {}) as JSONSchema7["properties"],
+    properties: (bounded.properties ?? {}) as JSONSchema7["properties"],
     additionalProperties: false,
   }
 
   return dynamicTool({
-    description: mcpTool.description ?? "",
+    description: describeTool(mcpTool.description, server),
     inputSchema: jsonSchema(inputSchema),
     execute: async (args: unknown, options) => {
       const result = await client.callTool(
@@ -117,6 +124,54 @@ export function fetch<T extends { name: string }>(
 export const sanitize = (value: string) => value.replace(/[^a-zA-Z0-9_-]/g, "_")
 
 export const toolName = (clientName: string, name: string) => sanitize(clientName) + "_" + sanitize(name)
+
+// `sanitize` collapses distinct raw names (`a.b`, `a_b`, `a b`) to one string, so a
+// registry keyed by `toolName` silently overwrites the earlier server's tool. Assign
+// names for a whole batch so later claimants get a stable hash suffix instead.
+export function assignToolNames(entries: { clientName: string; name: string }[]) {
+  const used = new Set<string>()
+  const assigned = new Map<string, Map<string, string>>()
+
+  for (const entry of entries) {
+    const base = toolName(entry.clientName, entry.name)
+    let candidate = base
+    for (let attempt = 0; used.has(candidate); attempt++) {
+      candidate = `${base}_${hashSuffix(`${entry.clientName}\u0000${entry.name}\u0000${attempt}`)}`
+    }
+    used.add(candidate)
+    const perServer = assigned.get(entry.clientName) ?? new Map<string, string>()
+    perServer.set(entry.name, candidate)
+    assigned.set(entry.clientName, perServer)
+  }
+
+  return assigned
+}
+
+function hashSuffix(value: string) {
+  let hash = 2166136261
+  for (let index = 0; index < value.length; index++) {
+    hash ^= value.charCodeAt(index)
+    hash = Math.imul(hash, 16777619)
+  }
+  return (hash >>> 0).toString(36)
+}
+
+function describeTool(description: string | undefined, server: string | undefined) {
+  const text = description ?? ""
+  const capped = text.length > MAX_DESCRIPTION_LENGTH ? `${text.slice(0, MAX_DESCRIPTION_LENGTH)}...` : text
+  return server ? `[${server}] ${capped}` : capped
+}
+
+function boundSchema(value: unknown, depth = 0, seen = new WeakSet<object>(), counter = { nodes: 0 }): unknown {
+  if (value === null || typeof value !== "object") return value
+  if (depth > MAX_SCHEMA_DEPTH || counter.nodes >= MAX_SCHEMA_NODES || seen.has(value)) return {}
+  seen.add(value)
+  counter.nodes++
+  if (Array.isArray(value)) return value.map((item) => boundSchema(item, depth + 1, seen, counter))
+  return Object.fromEntries(
+    Object.entries(value).map(([key, item]) => [key, boundSchema(item, depth + 1, seen, counter)]),
+  )
+}
 
 export function prompts(client: Client, timeout?: number) {
   if (!client.getServerCapabilities()?.prompts) return Promise.resolve([])

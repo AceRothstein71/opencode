@@ -28,7 +28,7 @@ export const Event = SessionCompactionEvent
 
 export const PRUNE_MINIMUM = 20_000
 export const PRUNE_PROTECT = 40_000
-const TOOL_OUTPUT_MAX_CHARS = 2_000
+export const TOOL_OUTPUT_MAX_CHARS = 2_000
 const PRUNE_PROTECTED_TOOLS = ["skill"]
 const MIN_PRESERVE_RECENT_TOKENS = 2_000
 const MAX_PRESERVE_RECENT_TOKENS = 15_000
@@ -218,7 +218,9 @@ const layer = Layer.effect(
       messages: SessionV1.WithParts[]
       model: Provider.Model
     }) {
-      const msgs = yield* MessageV2.toModelMessagesEffect(input.messages, input.model)
+      const msgs = yield* MessageV2.toModelMessagesEffect(input.messages, input.model, {
+        toolOutputMaxChars: TOOL_OUTPUT_MAX_CHARS,
+      })
       return Token.estimate(JSON.stringify(msgs))
     })
 

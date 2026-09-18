@@ -16,6 +16,15 @@ describe("util.process", () => {
     expect(out.stderr.toString()).toBe("err")
   })
 
+  test("caps oversized stdout with a truncation marker", async () => {
+    const size = Process.MAX_OUTPUT_BYTES + 1024
+    const out = await Process.run(node(`process.stdout.write("x".repeat(${size}))`))
+    expect(out.code).toBe(0)
+    expect(out.stdout.length).toBeGreaterThanOrEqual(Process.MAX_OUTPUT_BYTES)
+    expect(out.stdout.length).toBeLessThanOrEqual(Process.MAX_OUTPUT_BYTES + 64)
+    expect(out.stdout.toString().endsWith("[output truncated]")).toBe(true)
+  }, 10_000)
+
   test("returns code when nothrow is enabled", async () => {
     const out = await Process.run(node("process.exit(7)"), { nothrow: true })
     expect(out.code).toBe(7)

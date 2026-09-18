@@ -37,3 +37,14 @@ test("bounds the production default capacity and evicts the oldest identity", ()
   expect(cache.has("ses:0")).toBe(false)
   expect(cache.has("ses:4999")).toBe(true)
 })
+
+test("delete drops a cached identity after its parent is removed", () => {
+  const cache = createDurableParentCache()
+  cache.add("ses:a")
+  expect(cache.has("ses:a")).toBe(true)
+
+  cache.delete("ses:a")
+
+  expect(cache.has("ses:a")).toBe(false)
+  expect(cache.size).toBe(0)
+})

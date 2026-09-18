@@ -6,6 +6,7 @@ import path from "path"
 import { containsPath, type InstanceContext } from "../project/instance-context"
 import { InstanceState } from "@/effect/instance-state"
 import { lazy } from "@/util/lazy"
+import { sanitizePluginEnv } from "@/util/plugin-env"
 import { Language, type Node } from "web-tree-sitter"
 
 import { FSUtil } from "@opencode-ai/core/fs-util"
@@ -28,6 +29,7 @@ const MAX_METADATA_LENGTH = 30_000
 
 // Bound per-chunk preview writes: every metadata call durably rewrites the full part.
 const METADATA_THROTTLE_MS = 200
+
 const CWD = new Set(["cd", "chdir", "popd", "pushd", "push-location", "set-location"])
 const FILES = new Set([
   ...CWD,
@@ -400,9 +402,12 @@ export const ShellTool = Tool.define(
         if (cmd && (FILES.has(cmd) || (shellKind === "cmd" && CMD_FILES.has(cmd)))) {
           for (const arg of pathArgs(command, ps, shellKind === "cmd")) {
             const resolved = yield* argPath(arg, cwd, ps, shell)
-            yield* Effect.logInfo("resolved path", { arg, resolved })
-            if (!resolved || containsPath(resolved, instance)) continue
-            const dir = (yield* fs.isDir(resolved)) ? resolved : path.dirname(resolved)
+            if (!resolved) continue
+            // Lexical containment is not enough: a symlink inside the worktree can
+            // point outside it. Require both the lexical path and its resolved target.
+            const real = FSUtil.resolveExisting(resolved)
+            if (containsPath(resolved, instance) && containsPath(real, instance)) continue
+            const dir = (yield* fs.isDir(real)) ? real : path.dirname(real)
             scan.dirs.add(dir)
           }
         }
@@ -424,7 +429,7 @@ export const ShellTool = Tool.define(
       )
       return {
         ...process.env,
-        ...extra.env,
+        ...sanitizePluginEnv(extra.env),
       }
     })
 
@@ -660,7 +665,7 @@ export const ShellTool = Tool.define(
             Effect.gen(function* () {
               const instanceCtx = yield* InstanceState.context
               const cwd = params.workdir
-                ? yield* resolvePath(params.workdir, instanceCtx.directory, shell)
+                ? FSUtil.resolveExisting(yield* resolvePath(params.workdir, instanceCtx.directory, shell))
                 : instanceCtx.directory
               if (params.timeout !== undefined && params.timeout < 0) {
                 throw new Error(`Invalid timeout value: ${params.timeout}. Timeout must be a positive number.`)

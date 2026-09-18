@@ -2,6 +2,8 @@ import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { describe, expect } from "bun:test"
 import path from "path"
+import os from "os"
+import { symlink } from "fs/promises"
 import { Effect } from "effect"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import type { Tool } from "@/tool/tool"
@@ -92,6 +94,32 @@ describe("tool.assertExternalDirectory", () => {
       expect(req).toBeDefined()
       expect(req!.patterns).toEqual([expected])
       expect(req!.always).toEqual([expected])
+    }),
+  )
+
+  it.instance("asks when a symlink inside the directory escapes it", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const { requests, ctx } = makeCtx()
+      const link = path.join(test.directory, "vendor")
+      yield* Effect.promise(() => symlink(os.tmpdir(), link))
+
+      yield* assertExternalDirectoryEffect(ctx, path.join(link, "escape.txt"))
+
+      expect(requests.some((r) => r.permission === "external_directory")).toBe(true)
+    }),
+  )
+
+  it.instance("asks for a non-existent target under an escaping symlinked parent", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const { requests, ctx } = makeCtx()
+      const link = path.join(test.directory, "vendor")
+      yield* Effect.promise(() => symlink(os.tmpdir(), link))
+
+      yield* assertExternalDirectoryEffect(ctx, path.join(link, "created", "new-file.txt"))
+
+      expect(requests.some((r) => r.permission === "external_directory")).toBe(true)
     }),
   )
 

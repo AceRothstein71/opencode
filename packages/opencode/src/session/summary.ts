@@ -95,6 +95,15 @@ const layer = Layer.effect(
     // A message with a durable baseline is remembered so later changed summarizes skip the
     // historical-event scan; the bounded cache evicts least-recently-used identities.
     const durableParents = createDurableParentCache()
+    // A removed message destroys its durable baseline, so drop the positive entry or a later
+    // re-summarize would publish a diff without its parent (O2-18).
+    const unsubscribe = yield* events.listen((event) => {
+      if (event.type !== "message.removed") return Effect.void
+      const { sessionID, messageID } = event.data as { sessionID: SessionID; messageID: MessageID }
+      durableParents.delete(`${sessionID}:${messageID}`)
+      return Effect.void
+    })
+    yield* Effect.addFinalizer(() => unsubscribe)
     // Bounded memo of the last computed (from, to) diff per message so repeated summarizes skip diffFull.
     const diffCache = createLruCache<string, { from: string; to: string; diffs: Snapshot.FileDiff[] }>()
     const summariesInflight = new Set<string>()
@@ -172,7 +181,9 @@ const layer = Layer.effect(
       const diffs = yield* snapshot.diffFull(from, to, previous)
       // A failed or disabled snapshot read returns undefined instead of an empty diff.
       if (diffs === undefined) return undefined
-      if (cacheKey && diffs.length) diffCache.set(cacheKey, { from, to, diffs })
+      // Cache empty diffs too: a turn with from !== to but no file changes would otherwise
+      // re-run diffFull on every step (O2-34).
+      if (cacheKey) diffCache.set(cacheKey, { from, to, diffs })
       return diffs.map((item) => ({ ...item }))
     })
 
@@ -248,16 +259,22 @@ const layer = Layer.effect(
         summariesRerun.add(key)
         return
       }
-      yield* Effect.ensuring(
-        Effect.gen(function* () {
-          summariesInflight.add(key)
+      yield* Effect.gen(function* () {
+        summariesInflight.add(key)
+        while (true) {
           yield* runSummarize(input)
-          while (summariesRerun.delete(key)) yield* runSummarize(input)
-        }),
-        Effect.sync(() => {
+          if (summariesRerun.delete(key)) continue
+          // The clear and the re-check must stay adjacent (no yield between) so a
+          // concurrent caller either sets `rerun` before the clear or observes a
+          // cleared `inflight` and becomes the new runner.
           summariesInflight.delete(key)
-          summariesRerun.delete(key)
-        }),
+          if (!summariesRerun.delete(key)) return
+          summariesInflight.add(key)
+        }
+      }).pipe(
+        // A failed run must still release the latch, but only the latch: a concurrent
+        // rerun signal stays set and is consumed by the next caller.
+        Effect.ensuring(Effect.sync(() => summariesInflight.delete(key))),
       )
     })
 

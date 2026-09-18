@@ -668,6 +668,12 @@ export function createSubagentData(): SubagentData {
   }
 }
 
+export function removeSubagentData(data: SubagentData, sessionID: string) {
+  const removedTab = data.tabs.delete(sessionID)
+  const removedDetail = data.details.delete(sessionID)
+  return removedTab || removedDetail
+}
+
 function snapshotDetail(detail: DetailState) {
   return {
     sessionID: detail.sessionID,
@@ -808,6 +814,10 @@ export function reduceSubagentData(input: {
   limits: Record<string, number>
 }) {
   const event = input.event
+
+  if (event.type === "session.deleted") {
+    return removeSubagentData(input.data, event.properties.info.id)
+  }
 
   if (event.type === "message.part.updated") {
     const part = event.properties.part

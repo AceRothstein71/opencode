@@ -257,15 +257,15 @@ export const toModelMessagesEffect = Effect.fnUntraced(function* (
       const differentModel = `${model.providerID}/${model.id}` !== `${msg.info.providerID}/${msg.info.modelID}`
       const media: Array<{ mime: string; url: string; filename?: string }> = []
 
-      if (
-        msg.info.error &&
+      // An errored turn is dropped so partial text/reasoning never reach the model, but
+      // completed tool results are different: their side effects already ran, so keep the
+      // tool parts and skip only the discarded text/reasoning (O2-14).
+      const skipErrorContent =
+        !!msg.info.error &&
         !(
           AbortedError.isInstance(msg.info.error) &&
           msg.parts.some((part) => part.type !== "step-start" && part.type !== "reasoning")
         )
-      ) {
-        continue
-      }
       const assistantMessage: UIMessage = {
         id: msg.info.id,
         role: "assistant",
@@ -287,6 +287,7 @@ export const toModelMessagesEffect = Effect.fnUntraced(function* (
         return part.metadata?.anthropic?.signature != null
       })
       for (const part of msg.parts) {
+        if (skipErrorContent && (part.type === "text" || part.type === "reasoning")) continue
         if (part.type === "text") {
           const text = part.text === "" && hasSignedReasoning ? " " : part.text
           assistantMessage.parts.push({
@@ -618,6 +619,11 @@ export const findInfo = Effect.fn("MessageV2.findInfo")(function* (
   return Option.none<Info>()
 })
 
+// Hard ceiling on the newest-first page walk. Compacted sessions stop far earlier
+// at the compaction boundary; this only bounds a session with no compaction marker,
+// which would otherwise rehydrate its entire transcript on every provider turn (O-25).
+const MAX_COMPACTED_PAGES = 100
+
 type CompactedState = {
   result: WithParts[]
   completed: Set<string>
@@ -696,22 +702,35 @@ export const filterCompactedEffect = Effect.fnUntraced(function* (sessionID: Ses
   const size = 50
   const state: CompactedState = { result: [], completed: new Set(), retain: undefined, stop: false }
   let before: string | undefined
-  while (!state.stop) {
+  let pages = 0
+  let exhausted = false
+  while (!state.stop && pages < MAX_COMPACTED_PAGES) {
+    pages++
     const next = yield* page({ sessionID, limit: size, before }).pipe(
       Effect.catchIf(NotFoundError.isInstance, () =>
         Effect.succeed({ items: [] as WithParts[], more: false, cursor: undefined }),
       ),
     )
-    if (next.items.length === 0) break
+    if (next.items.length === 0) {
+      exhausted = true
+      break
+    }
     for (let i = next.items.length - 1; i >= 0; i--) {
       const item = next.items[i]
       if (item) compactedStep(state, item)
       if (state.stop) break
     }
-    if (!next.more || !next.cursor) break
+    if (state.stop) break
+    if (!next.more || !next.cursor) {
+      exhausted = true
+      break
+    }
     before = next.cursor
   }
-  return reorderCompacted(state.result)
+  // The caller must not treat a cap-hit walk as the complete transcript (O2-16).
+  const truncated = !state.stop && !exhausted
+  if (truncated) yield* Effect.logWarning("compacted page walk hit cap", { sessionID, pages })
+  return { messages: reorderCompacted(state.result), truncated }
 })
 
 // filterCompacted reorders messages for model consumption

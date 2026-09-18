@@ -1,6 +1,6 @@
 export * as BackgroundJob from "./background-job"
 
-import { Cause, Clock, Context, Deferred, Effect, Exit, Layer, Scope, SynchronizedRef } from "effect"
+import { Cause, Clock, Context, Deferred, Effect, Exit, Layer, Scope, Schema, SynchronizedRef } from "effect"
 import { Identifier } from "./id/id"
 import { makeGlobalNode } from "./effect/app-node"
 
@@ -87,13 +87,18 @@ export type WaitResult = {
   timedOut: boolean
 }
 
+/** A promoted-result waiter raced a job that is no longer retained (missing or pruned). */
+export class NotFoundError extends Schema.TaggedErrorClass<NotFoundError>()("BackgroundJob.NotFound", {
+  id: Schema.String,
+}) {}
+
 export interface Interface {
   readonly list: () => Effect.Effect<Info[]>
   readonly get: (id: string) => Effect.Effect<Info | undefined>
   readonly start: (input: StartInput) => Effect.Effect<Info>
   readonly extend: (input: ExtendInput) => Effect.Effect<boolean>
   readonly wait: (input: WaitInput) => Effect.Effect<WaitResult>
-  readonly waitForPromotion: (id: string) => Effect.Effect<Info>
+  readonly waitForPromotion: (id: string) => Effect.Effect<Info | undefined, NotFoundError>
   readonly promote: (id: string) => Effect.Effect<Info | undefined>
   readonly cancel: (id: string) => Effect.Effect<Info | undefined>
 }
@@ -336,8 +341,11 @@ export const make = Effect.gen(function* () {
 
   const waitForPromotion: Interface["waitForPromotion"] = Effect.fn("BackgroundJob.waitForPromotion")(function* (id) {
     const job = (yield* SynchronizedRef.get(state.jobs)).get(id)
-    if (!job || job.info.status !== "running" || !job.promoted) return yield* Effect.never
+    if (!job) return yield* new NotFoundError({ id })
     if (job.info.metadata?.background === true) return snapshot(job)
+    // A settled job can never be promoted; resolving its terminal snapshot avoids a waiter hang.
+    if (job.info.status !== "running") return snapshot(job)
+    if (!job.promoted) return yield* Effect.never
     return yield* Deferred.await(job.promoted)
   })
 

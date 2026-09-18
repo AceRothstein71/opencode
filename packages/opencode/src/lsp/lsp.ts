@@ -109,11 +109,26 @@ const filterExperimentalServers = (servers: Record<string, LSPServer.Info>, flag
 
 type LocInput = { file: string; line: number; character: number }
 
+// A server that crashed once is quarantined, not disabled for the process lifetime.
+const BROKEN_TTL_MS = 5 * 60_000
+
 interface State {
   clients: LSPClient.Info[]
   servers: Record<string, LSPServer.Info>
-  broken: Set<string>
+  broken: Map<string, number>
   spawning: Map<string, Promise<LSPClient.Info | undefined>>
+}
+
+function markBroken(state: State, key: string) {
+  state.broken.set(key, Date.now())
+}
+
+function isBroken(state: State, key: string) {
+  const at = state.broken.get(key)
+  if (at === undefined) return false
+  if (Date.now() - at < BROKEN_TTL_MS) return true
+  state.broken.delete(key)
+  return false
 }
 
 export interface Interface {
@@ -192,7 +207,7 @@ const layer = Layer.effect(
         const s: State = {
           clients: [],
           servers,
-          broken: new Set(),
+          broken: new Map(),
           spawning: new Map(),
         }
 
@@ -219,11 +234,11 @@ const layer = Layer.effect(
           const handle = await server
             .spawn(root, ctx, flags)
             .then((value) => {
-              if (!value) s.broken.add(key)
+              if (!value) markBroken(s, key)
               return value
             })
             .catch(() => {
-              s.broken.add(key)
+              markBroken(s, key)
               return undefined
             })
 
@@ -235,7 +250,7 @@ const layer = Layer.effect(
             directory: ctx.directory,
             instance: ctx,
           }).catch(async () => {
-            s.broken.add(key)
+            markBroken(s, key)
             await Process.stop(handle.process)
             return undefined
           })
@@ -249,6 +264,11 @@ const layer = Layer.effect(
           }
 
           s.clients.push(client)
+          client.process.once("exit", () => {
+            markBroken(s, key)
+            const index = s.clients.indexOf(client)
+            if (index !== -1) s.clients.splice(index, 1)
+          })
           return client
         }
 
@@ -257,7 +277,7 @@ const layer = Layer.effect(
 
           const root = await server.root(file, ctx)
           if (!root) continue
-          if (s.broken.has(root + server.id)) continue
+          if (isBroken(s, root + server.id)) continue
 
           const match = s.clients.find((x) => x.root === root && x.serverID === server.id)
           if (match) {
@@ -335,7 +355,7 @@ const layer = Layer.effect(
           if (server.extensions.length && !server.extensions.includes(extension)) continue
           const root = await server.root(file, ctx)
           if (!root) continue
-          if (s.broken.has(root + server.id)) continue
+          if (isBroken(s, root + server.id)) continue
           return true
         }
         return false

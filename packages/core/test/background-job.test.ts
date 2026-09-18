@@ -1,7 +1,7 @@
 import { describe, expect } from "bun:test"
 import { BackgroundJob } from "@opencode-ai/core/background-job"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { Deferred, Effect, Exit, Scope } from "effect"
+import { Deferred, Effect, Exit, Option, Scope } from "effect"
 import { it } from "./lib/effect"
 
 const jobsLayer = LayerNode.compile(BackgroundJob.node)
@@ -145,5 +145,19 @@ describe("BackgroundJob", () => {
       // The abandoned in-memory registry is not a durable observation channel.
       expect((yield* jobs.get(job.id))?.status).toBe("running")
     }),
+  )
+
+  it.live("resolves promotion waiters instead of hanging on missing or settled jobs", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+
+      const missing = yield* jobs.waitForPromotion("job_missing").pipe(Effect.exit)
+      expect(Exit.findErrorOption(missing).pipe(Option.getOrUndefined)).toBeInstanceOf(BackgroundJob.NotFoundError)
+
+      const job = yield* jobs.start({ id: "job_settled", type: "test", run: Effect.succeed("done") })
+      yield* jobs.wait({ id: job.id })
+
+      expect(yield* jobs.waitForPromotion(job.id)).toMatchObject({ status: "completed" })
+    }).pipe(Effect.provide(jobsLayer)),
   )
 })

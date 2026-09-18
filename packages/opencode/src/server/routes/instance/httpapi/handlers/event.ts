@@ -7,7 +7,8 @@ import * as Stream from "effect/Stream"
 import { HttpServerResponse } from "effect/unstable/http"
 import { HttpApiBuilder } from "effect/unstable/httpapi"
 import { EventApi } from "../groups/event"
-import { frame, join } from "./sse-frame"
+import { makeDesyncLatch } from "./event-desync"
+import { frame, isTransientEvent, join } from "./sse-frame"
 
 const EVENT_BUFFER = 8192
 
@@ -24,7 +25,7 @@ function eventResponse(events: EventV2.Interface) {
     // The buffer is bounded: a slow consumer drops the oldest events instead of
     // growing memory for every event in the process.
     const queue = yield* Queue.sliding<{ id: string; type: string; properties: unknown }>(EVENT_BUFFER)
-    let desynced = false
+    const desync = makeDesyncLatch({ capacity: EVENT_BUFFER })
     const unsubscribe = yield* events.listen((event) =>
       Effect.sync(() => {
         // Foreign directories and workspaces are rejected before enqueue. Events
@@ -32,9 +33,10 @@ function eventResponse(events: EventV2.Interface) {
         // every workspace connection on this directory (F-098).
         if (event.location?.directory !== instance.directory) return
         if (event.location.workspaceID !== undefined && event.location.workspaceID !== workspaceID) return
-        // Sliding eviction is silent; signal the gap once so the client can refetch.
-        if (!desynced && Queue.sizeUnsafe(queue) >= EVENT_BUFFER) {
-          desynced = true
+        // Sliding eviction is silent. Signal the gap on a cool-down while the
+        // buffer stays full so sustained overflow keeps telling the consumer it
+        // is behind, and re-arm immediately once the queue drains.
+        if (desync.shouldSignal(Queue.sizeUnsafe(queue))) {
           Queue.offerUnsafe(queue, { id: eventID(), type: "server.desync", properties: {} })
         }
         Queue.offerUnsafe(queue, { id: event.id, type: event.type, properties: event.data })
@@ -72,7 +74,7 @@ function eventResponse(events: EventV2.Interface) {
     return HttpServerResponse.stream(
       Stream.make({ id: eventID(), type: "server.connected", properties: {} }).pipe(
         Stream.concat(output.pipe(Stream.merge(heartbeat, { haltStrategy: "left" }))),
-        Stream.map((event) => frame(event.id, event.id, event)),
+        Stream.map((event) => frame(event.id, event.id, event, !isTransientEvent(event.type))),
         Stream.mapArray((batch) => (batch.length <= 1 ? batch : [join(batch)])),
         Stream.ensuring(Effect.logInfo("event disconnected")),
       ),

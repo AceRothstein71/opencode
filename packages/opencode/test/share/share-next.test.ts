@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect } from "bun:test"
+import { beforeEach, describe, expect, test } from "bun:test"
 import { Effect, Exit, Layer, Option } from "effect"
 import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/unstable/http"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
@@ -15,7 +15,7 @@ import type { SessionID } from "../../src/session/schema"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
-import { ShareNext } from "@/share/share-next"
+import { ShareNext, trimQueue } from "@/share/share-next"
 import { SessionShareTable } from "@opencode-ai/core/share/sql"
 import { Database } from "@opencode-ai/core/database/database"
 import { eq } from "drizzle-orm"
@@ -383,6 +383,86 @@ describe("ShareNext", () => {
     ),
   )
 
+  it.live("remove clears the local share even when the DELETE fails", () =>
+    provideTmpdirInstance(
+      () => {
+        const client = HttpClient.make((req) => {
+          if (req.method === "POST") {
+            return Effect.succeed(
+              json(req, {
+                id: "shr_abc",
+                url: "https://legacy-share.example.com/share/abc",
+                secret: "sec_123",
+              }),
+            )
+          }
+          return Effect.succeed(json(req, { error: "boom" }, 500))
+        })
+        return Effect.gen(function* () {
+          const session = yield* (yield* Session.Service).create({ title: "test" })
+          const service = yield* ShareNext.Service
+
+          yield* service.create(session.id)
+          yield* service.remove(session.id)
+
+          expect(yield* share(session.id)).toBeUndefined()
+        }).pipe(Effect.provide(integrationLayer(client)))
+      },
+      { config: { enterprise: { url: "https://legacy-share.example.com" } } },
+    ),
+  )
+
+  it.live("create pages a large session into bounded sync payloads", () =>
+    provideTmpdirInstance(
+      () => {
+        const syncBodies: string[] = []
+        const client = HttpClient.make((req) => {
+          if (req.method === "POST" && req.url.endsWith("/sync")) {
+            if (req.body._tag === "Uint8Array") syncBodies.push(new TextDecoder().decode(req.body.body))
+            return Effect.succeed(json(req, { ok: true }))
+          }
+          if (req.method === "POST") {
+            return Effect.succeed(
+              json(req, {
+                id: "shr_big",
+                url: "https://legacy-share.example.com/share/big",
+                secret: "sec_big",
+              }),
+            )
+          }
+          return Effect.succeed(json(req, { ok: true }))
+        })
+        return Effect.gen(function* () {
+          const sessions = yield* Session.Service
+          const session = yield* sessions.create({ title: "big" })
+          for (let index = 0; index < 60; index++) {
+            yield* sessions.updateMessage({
+              id: MessageID.ascending(),
+              sessionID: session.id,
+              role: "user",
+              time: { created: Date.now() },
+              agent: "build",
+              model: { providerID: ProviderV2.ID.make("test"), modelID: ModelV2.ID.make("model") },
+            } satisfies SessionV1.User)
+          }
+
+          yield* (yield* ShareNext.Service).create(session.id)
+          yield* pollWithTimeout(
+            Effect.sync(() => (syncBodies.length >= 2 ? true : undefined)),
+            "timed out waiting for paged full sync",
+            "10 seconds",
+          )
+
+          for (const body of syncBodies) {
+            const parsed = JSON.parse(body) as { data: unknown[] }
+            expect(parsed.data.length).toBeLessThanOrEqual(2000)
+          }
+        }).pipe(Effect.provide(integrationLayer(client)))
+      },
+      { config: { enterprise: { url: "https://legacy-share.example.com" } } },
+    ),
+  )
+
   it.live("ShareNext requeues a failed sync batch and retries it", () =>
     provideTmpdirInstance(
       () => {
@@ -435,4 +515,44 @@ describe("ShareNext", () => {
       { config: { enterprise: { url: "https://legacy-share.example.com" } } },
     ),
   )
+})
+
+describe("ShareNext.trimQueue", () => {
+  test("caps the queue and drops the oldest part entries first", () => {
+    const queue = new Map<string, { type: string }>()
+    queue.set("session", { type: "session" })
+    queue.set("session_diff", { type: "session_diff" })
+    for (let index = 0; index < 2100; index++) queue.set(`part/message/p${index}`, { type: "part" })
+
+    expect(trimQueue(queue)).toBe(102)
+    expect(queue.size).toBe(2000)
+    expect(queue.has("session")).toBe(true)
+    expect(queue.has("session_diff")).toBe(true)
+    expect(queue.has("part/message/p101")).toBe(false)
+    expect(queue.has("part/message/p102")).toBe(true)
+    expect(queue.has("part/message/p2099")).toBe(true)
+  })
+
+  test("leaves a queue at or below the cap untouched", () => {
+    const queue = new Map<string, { type: string }>([["session", { type: "session" }]])
+    expect(trimQueue(queue)).toBe(0)
+    expect(queue.size).toBe(1)
+  })
+
+  test("drops the oldest message parts when full() inserts pages newest-first", () => {
+    const queue = new Map<string, { type: string }>()
+    queue.set("session", { type: "session" })
+    // ShareNext.full() inserts the newest page first, so the oldest message ids land last.
+    for (let message = 20; message >= 0; message--) {
+      for (let part = 0; part < 100; part++) {
+        queue.set(`part/msg_${String(message).padStart(4, "0")}/p${part}`, { type: "part" })
+      }
+    }
+
+    expect(trimQueue(queue)).toBe(101)
+    expect(queue.size).toBe(2000)
+    expect(queue.has("session")).toBe(true)
+    expect(queue.has("part/msg_0000/p0")).toBe(false)
+    expect(queue.has("part/msg_0020/p99")).toBe(true)
+  })
 })

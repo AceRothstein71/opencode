@@ -92,9 +92,9 @@ export async function createOpencodeServer(options?: ServerOptions) {
 
   return {
     url,
-    close() {
+    async close() {
       clear()
-      stop(proc)
+      await stop(proc)
     },
   }
 }
@@ -126,9 +126,9 @@ export function createOpencodeTui(options?: TuiOptions) {
   const clear = bindAbort(proc, options?.signal)
 
   return {
-    close() {
+    async close() {
       clear()
-      stop(proc)
+      await stop(proc)
     },
   }
 }

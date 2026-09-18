@@ -18,6 +18,9 @@ export const EventTable = sqliteTable(
     seq: integer().notNull(),
     type: text().notNull(),
     data: text({ mode: "json" }).$type<Record<string, unknown>>().notNull(),
+    // Non-null once the payload was superseded by a newer diff event. The digest of the
+    // original payload keeps replay idempotent after `data` shrinks to a tombstone.
+    tombstone_digest: text(),
   },
   (table) => [
     uniqueIndex("event_aggregate_seq_idx").on(table.aggregate_id, table.seq),

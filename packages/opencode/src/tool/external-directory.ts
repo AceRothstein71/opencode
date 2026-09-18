@@ -23,7 +23,10 @@ export const assertExternalDirectoryEffect = Effect.fn("Tool.assertExternalDirec
 
   const ins = yield* InstanceState.context
   const full = process.platform === "win32" ? FSUtil.normalizePath(target) : target
-  if (containsPath(full, ins)) return false
+  // Lexical containment is not enough: a symlink inside the worktree can point
+  // outside it (e.g. `vendor/x -> /etc`). Require both the lexical path and its
+  // symlink-resolved target to stay inside before skipping the prompt.
+  if (containsPath(full, ins) && containsPath(FSUtil.resolveExisting(full), ins)) return false
 
   const kind = options?.kind ?? "file"
   const dir = kind === "directory" ? full : path.dirname(full)

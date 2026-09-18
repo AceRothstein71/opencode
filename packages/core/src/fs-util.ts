@@ -1,5 +1,5 @@
 import { NodeFileSystem } from "@effect/platform-node"
-import { dirname, isAbsolute, join, relative, resolve as pathResolve, sep } from "path"
+import { basename, dirname, isAbsolute, join, relative, resolve as pathResolve, sep } from "path"
 import { realpathSync } from "fs"
 import * as NFS from "fs/promises"
 import { lookup } from "mime-types"
@@ -251,6 +251,31 @@ export namespace FSUtil {
     } catch (e: any) {
       if (e?.code === "ENOENT") return normalizePath(resolved)
       throw e
+    }
+  }
+
+  /**
+   * Resolve a path through symlinks, following the nearest existing ancestor and
+   * re-appending the non-existent tail. `resolve()` alone falls back to the
+   * lexical path on ENOENT, so `write link/new.txt` where `link -> /etc` would
+   * look contained while the write lands outside. Containment checks must use
+   * this instead.
+   */
+  export function resolveExisting(p: string): string {
+    const resolved = pathResolve(windowsPath(p))
+    const trailing: string[] = []
+    let current = resolved
+    while (true) {
+      try {
+        return normalizePath(join(realpathSync.native(current), ...trailing.reverse()))
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException | undefined)?.code
+        if (code !== "ENOENT" && code !== "ENOTDIR") return normalizePath(resolved)
+        const parent = dirname(current)
+        if (parent === current) return normalizePath(resolved)
+        trailing.push(basename(current))
+        current = parent
+      }
     }
   }
 

@@ -1,4 +1,5 @@
 import { sqliteTable, text, integer, index, primaryKey, real, uniqueIndex } from "drizzle-orm/sqlite-core"
+import { sql } from "drizzle-orm"
 import * as DatabasePath from "../database/path"
 import { ProjectTable } from "../project/sql"
 import type { SessionMessage } from "./message"
@@ -149,6 +150,13 @@ export const SessionMessageTable = sqliteTable(
     uniqueIndex("session_message_session_seq_idx").on(table.session_id, table.seq),
     index("session_message_session_type_seq_idx").on(table.session_id, table.type, table.seq),
     index("session_message_session_time_created_id_idx").on(table.session_id, table.time_created, table.id),
+    // Shell projection seeks a single row by callID; without this the predicate JSON-parses
+    // every shell row in the session per `shell.ended`.
+    index("session_message_session_call_id_seq_idx").on(
+      table.session_id,
+      sql`json_extract(${table.data}, '$.callID')`,
+      table.seq,
+    ),
   ],
 )
 

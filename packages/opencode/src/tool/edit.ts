@@ -36,8 +36,7 @@ type LockEntry = { semaphore: Semaphore.Semaphore; holders: number }
 
 const locks = new Map<string, LockEntry>()
 
-function withLock<A, E, R>(filePath: string, effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> {
-  const key = FSUtil.resolve(filePath)
+function withLockKey<A, E, R>(key: string, effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> {
   const entry = locks.get(key) ?? { semaphore: Semaphore.makeUnsafe(1), holders: 0 }
   entry.holders++
   locks.set(key, entry)
@@ -52,6 +51,27 @@ function withLock<A, E, R>(filePath: string, effect: Effect.Effect<A, E, R>): Ef
         }),
       ),
     )
+}
+
+export function withLock<A, E, R>(filePath: string, effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> {
+  // Key by the symlink-resolved path: `resolve` falls back to the lexical path for
+  // a not-yet-existing file, so two aliases of a symlinked parent would take
+  // different locks and serialize nothing.
+  return withLockKey(FSUtil.resolveExisting(filePath), effect)
+}
+
+export function withLocks<A, E, R>(
+  filePaths: ReadonlyArray<string>,
+  effect: Effect.Effect<A, E, R>,
+): Effect.Effect<A, E, R> {
+  const keys = [...new Set(filePaths.map((filePath) => FSUtil.resolveExisting(filePath)))].sort()
+  return keys.reduceRight<Effect.Effect<A, E, R>>((acc, key) => withLockKey(key, acc), effect)
+}
+
+// Fail closed if a symlink is swapped between the containment check and the
+// write, closing the O-01 check-vs-use window.
+export function assertPathStable(filePath: string, guard: string) {
+  if (FSUtil.resolveExisting(filePath) !== guard) throw new Error(`Path changed during the operation: ${filePath}`)
 }
 
 export const Parameters = Schema.Struct({
@@ -90,7 +110,6 @@ export const EditTool = Tool.define(
           const filePath = path.isAbsolute(params.filePath)
             ? params.filePath
             : path.join(instance.directory, params.filePath)
-          yield* assertExternalDirectoryEffect(ctx, filePath)
 
           let diff = ""
           let contentOld = ""
@@ -98,6 +117,8 @@ export const EditTool = Tool.define(
           yield* withLock(
             filePath,
             Effect.gen(function* () {
+              yield* assertExternalDirectoryEffect(ctx, filePath)
+              const guard = FSUtil.resolveExisting(filePath)
               if (params.oldString === "") {
                 const existed = yield* afs.existsSafe(filePath)
                 if (existed) {
@@ -119,6 +140,7 @@ export const EditTool = Tool.define(
                     diff,
                   },
                 })
+                assertPathStable(filePath, guard)
                 yield* afs.writeWithDirs(filePath, Bom.join(contentNew, desiredBom))
                 if (yield* format.file(filePath)) {
                   contentNew = yield* Bom.syncFile(afs, filePath, desiredBom)
@@ -163,6 +185,7 @@ export const EditTool = Tool.define(
                 },
               })
 
+              assertPathStable(filePath, guard)
               yield* afs.writeWithDirs(filePath, Bom.join(contentNew, desiredBom))
               if (yield* format.file(filePath)) {
                 contentNew = yield* Bom.syncFile(afs, filePath, desiredBom)

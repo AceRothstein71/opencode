@@ -1,5 +1,5 @@
 import { FSUtil } from "@opencode-ai/core/fs-util"
-import { Effect, Stream } from "effect"
+import { Cause, Effect, Stream } from "effect"
 import { HttpBody, HttpClient, HttpClientRequest, HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
 import { createHash } from "node:crypto"
 import { ProxyUtil } from "../proxy-util"
@@ -118,9 +118,18 @@ export function serveUIEffect(
     }
 
     headers.set("Content-Security-Policy", csp())
-    return HttpServerResponse.stream(response.stream.pipe(Stream.catchCause(() => Stream.empty)), {
-      status: response.status,
-      headers,
-    })
+    return HttpServerResponse.stream(
+      response.stream.pipe(
+        Stream.catchCause((cause) =>
+          Stream.fromEffect(
+            Effect.logWarning("ui proxy stream interrupted", { path, cause: Cause.pretty(cause) }),
+          ).pipe(Stream.drain, Stream.concat(Stream.failCause(cause))),
+        ),
+      ),
+      {
+        status: response.status,
+        headers,
+      },
+    )
   })
 }

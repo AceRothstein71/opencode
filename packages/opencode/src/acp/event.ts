@@ -40,6 +40,7 @@ export class Subscription {
   private readonly abort = new AbortController()
   private readonly shellSnapshots = new Map<string, string>()
   private readonly toolStarts = new Set<string>()
+  private readonly toolSessions = new Map<string, string>()
   private readonly connectionWaiters = new Set<() => void>()
   private readonly idleWaiters = new Map<string, Set<ReturnType<typeof signal>>>()
   private readonly permission: ACPPermission.Handler
@@ -69,8 +70,16 @@ export class Subscription {
     this.disconnected()
     this.toolStarts.clear()
     this.shellSnapshots.clear()
+    this.toolSessions.clear()
     for (const resolve of this.connectionWaiters) resolve()
     this.connectionWaiters.clear()
+  }
+
+  clearSession(sessionId: string) {
+    for (const [toolCallId, session] of this.toolSessions) {
+      if (session !== sessionId) continue
+      this.clearTool(toolCallId)
+    }
   }
 
   async runUntilIdle<A>(sessionId: string, request: () => Promise<A>) {
@@ -398,6 +407,7 @@ export class Subscription {
   private async toolStart(sessionId: string, part: ToolPart, cwd: string) {
     if (this.toolStarts.has(part.callID)) return
     this.toolStarts.add(part.callID)
+    this.toolSessions.set(part.callID, sessionId)
     await this.input.connection.sessionUpdate({
       sessionId,
       update: {
@@ -415,6 +425,7 @@ export class Subscription {
   private clearTool(toolCallId: string) {
     this.toolStarts.delete(toolCallId)
     this.shellSnapshots.delete(toolCallId)
+    this.toolSessions.delete(toolCallId)
   }
 }
 

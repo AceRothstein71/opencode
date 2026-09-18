@@ -4,6 +4,7 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Cause, Effect, Exit, Layer } from "effect"
 import type * as Scope from "effect/Scope"
 import os from "os"
+import { symlink } from "node:fs/promises"
 import path from "path"
 import { Config } from "@/config/config"
 import { Shell } from "@opencode-ai/core/shell"
@@ -776,6 +777,50 @@ describe("tool.shell permissions", () => {
           const extDirReq = requests.find((r) => r.permission === "external_directory")
           expect(extDirReq).toBeDefined()
           expect(extDirReq!.patterns).toContain(glob(path.join(os.tmpdir(), "*")))
+        }),
+      )
+    }),
+  )
+
+  each("asks for external_directory permission when workdir is a symlink escaping the project", () =>
+    Effect.gen(function* () {
+      const tmp = yield* tmpdirScoped()
+      const outside = yield* tmpdirScoped()
+      yield* Effect.promise(() => symlink(outside, path.join(tmp, "link"), "dir"))
+      yield* runIn(
+        tmp,
+        Effect.gen(function* () {
+          const err = new Error("stop after permission")
+          const requests: Array<Omit<PermissionV1.Request, "id" | "sessionID" | "tool">> = []
+          expect(
+            yield* fail(
+              {
+                command: "echo ok",
+                workdir: path.join(tmp, "link"),
+              },
+              capture(requests, err),
+            ),
+          ).toMatchObject({ message: err.message })
+          expect(requests.find((r) => r.permission === "external_directory")).toBeDefined()
+        }),
+      )
+    }),
+  )
+
+  each("asks for external_directory permission when a file arg is under a symlink escaping the project", () =>
+    Effect.gen(function* () {
+      const tmp = yield* tmpdirScoped()
+      const outside = yield* tmpdirScoped()
+      yield* Effect.promise(() => symlink(outside, path.join(tmp, "link"), "dir"))
+      yield* runIn(
+        tmp,
+        Effect.gen(function* () {
+          const err = new Error("stop after permission")
+          const requests: Array<Omit<PermissionV1.Request, "id" | "sessionID" | "tool">> = []
+          expect(yield* fail({ command: "rm link/f" }, capture(requests, err))).toMatchObject({
+            message: err.message,
+          })
+          expect(requests.find((r) => r.permission === "external_directory")).toBeDefined()
         }),
       )
     }),

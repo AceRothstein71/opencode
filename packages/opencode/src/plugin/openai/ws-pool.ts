@@ -10,11 +10,13 @@ export interface CreateWebSocketFetchOptions {
   url?: string
   connectTimeout?: number
   idleTimeout?: number
+  fallbackTimeout?: number
   maxConnectionAge?: number
   streamRetries?: number
 }
 
 interface PoolEntry {
+  sessionID: string
   socket?: WebSocket
   connectedAt?: number
   lastUsedAt: number
@@ -25,14 +27,17 @@ interface PoolEntry {
 
 const DEFAULT_CONNECT_TIMEOUT = 15_000
 const DEFAULT_IDLE_TIMEOUT = 5 * 60 * 1000
+const DEFAULT_FALLBACK_TIMEOUT = 10 * 60 * 1000
 const DEFAULT_MAX_CONNECTION_AGE = 55 * 60 * 1000
 const CONNECTION_LIMIT_REACHED_CODE = "websocket_connection_limit_reached"
+const MAX_POOL_SIZE = 32
 
 export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
   const httpFetch = options?.httpFetch ?? globalThis.fetch
   const pool = new Map<string, PoolEntry>()
   const connectTimeout = options?.connectTimeout ?? DEFAULT_CONNECT_TIMEOUT
   const idleTimeout = options?.idleTimeout ?? DEFAULT_IDLE_TIMEOUT
+  const fallbackTimeout = options?.fallbackTimeout ?? DEFAULT_FALLBACK_TIMEOUT
   const maxConnectionAge = options?.maxConnectionAge ?? DEFAULT_MAX_CONNECTION_AGE
   const streamRetries = options?.streamRetries ?? 5
   const pruneTimer = setInterval(() => prune(), Math.min(idleTimeout, 60_000))
@@ -67,9 +72,19 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
     if (!sessionID) {
       return httpFetch(input, httpInit)
     }
-    const key = `${sessionID}:conversation`
+    const socketURL = options?.url ?? url
+    const authHeaders = OpenAIWebSocket.normalizeHeaders(httpInit?.headers)
+    const key = `${sessionID}:${fingerprint(socketURL, authHeaders)}`
 
-    const entry = pool.get(key) ?? { lastUsedAt: Date.now(), busy: false, fallback: false, streamFailures: 0 }
+    const existing = pool.get(key)
+    if (!existing && !admit()) return httpFetch(input, httpInit)
+    const entry = existing ?? {
+      sessionID,
+      lastUsedAt: Date.now(),
+      busy: false,
+      fallback: false,
+      streamFailures: 0,
+    }
     pool.set(key, entry)
 
     if (entry.fallback) {
@@ -82,14 +97,7 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
     entry.busy = true
     entry.lastUsedAt = Date.now()
     try {
-      entry.socket = await socket(
-        entry,
-        options?.url ?? url,
-        OpenAIWebSocket.normalizeHeaders(httpInit?.headers),
-        connectTimeout,
-        maxConnectionAge,
-        init?.signal,
-      )
+      entry.socket = await socket(entry, socketURL, authHeaders, connectTimeout, maxConnectionAge, init?.signal)
       let resolveFirstEvent: (event: boolean | OpenAIWebSocket.WrappedError) => void = () => {}
       let rejectFirstEvent: (error: Error) => void = () => {}
       const firstEvent = new Promise<boolean | OpenAIWebSocket.WrappedError>((resolve, reject) => {
@@ -167,12 +175,25 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
     if (entry.streamFailures > streamRetries) entry.fallback = true
   }
 
+  // Bound total entries, not just idle ones: when every slot is busy the caller
+  // falls back to HTTP instead of growing the pool without limit.
+  function admit() {
+    while (pool.size >= MAX_POOL_SIZE) {
+      const candidate = [...pool]
+        .filter(([, entry]) => !entry.busy)
+        .sort((a, b) => a[1].lastUsedAt - b[1].lastUsedAt)[0]
+      if (!candidate) return false
+      invalidate(candidate[1])
+      pool.delete(candidate[0])
+    }
+    return true
+  }
+
   function prune() {
     const now = Date.now()
     for (const [key, entry] of pool) {
       if (entry.busy) continue
-      if (entry.fallback) continue
-      if (now - entry.lastUsedAt < idleTimeout) continue
+      if (now - entry.lastUsedAt < (entry.fallback ? fallbackTimeout : idleTimeout)) continue
       invalidate(entry)
       pool.delete(key)
     }
@@ -185,14 +206,27 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
   }
 
   function remove(sessionID: string) {
-    const key = `${sessionID}:conversation`
-    const entry = pool.get(key)
-    if (!entry) return
-    invalidate(entry)
-    pool.delete(key)
+    for (const [key, entry] of pool) {
+      if (entry.sessionID !== sessionID) continue
+      invalidate(entry)
+      pool.delete(key)
+    }
   }
 
   return Object.assign(websocketFetch, { close, remove })
+}
+
+function fingerprint(url: string, headers: Record<string, string>) {
+  let hash = 2166136261
+  const feed = (text: string) => {
+    for (let index = 0; index < text.length; index++) {
+      hash ^= text.charCodeAt(index)
+      hash = Math.imul(hash, 16777619)
+    }
+  }
+  feed(url)
+  for (const key of Object.keys(headers).sort()) feed(`\u0000${key}:${headers[key]}`)
+  return (hash >>> 0).toString(36)
 }
 
 function connectionLimitError(event: Record<string, unknown>) {

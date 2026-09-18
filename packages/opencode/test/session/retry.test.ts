@@ -82,17 +82,17 @@ describe("session.retry.delay", () => {
     expect(SessionRetry.delay(1, error, 0)).toBe(1000)
   })
 
-  test("uses retry-after values even when exceeding 10 minutes with headers", () => {
+  test("clamps header retry-after values to the 30s ceiling", () => {
     const error = apiError({ "retry-after": "50" })
-    expect(SessionRetry.delay(1, error)).toBe(50000)
+    expect(SessionRetry.delay(1, error)).toBe(SessionRetry.RETRY_MAX_DELAY_NO_HEADERS)
 
     const longError = apiError({ "retry-after-ms": "700000" })
-    expect(SessionRetry.delay(1, longError)).toBe(700000)
+    expect(SessionRetry.delay(1, longError)).toBe(SessionRetry.RETRY_MAX_DELAY_NO_HEADERS)
   })
 
-  test("caps oversized header delays to the runtime timer limit", () => {
+  test("caps hostile header delays to the 30s ceiling", () => {
     const error = apiError({ "retry-after-ms": "999999999999" })
-    expect(SessionRetry.delay(1, error)).toBe(SessionRetry.RETRY_MAX_DELAY)
+    expect(SessionRetry.delay(1, error)).toBe(SessionRetry.RETRY_MAX_DELAY_NO_HEADERS)
   })
 
   it.instance("policy updates retry status and increments attempts", () =>

@@ -1,6 +1,6 @@
 export * as EventV2 from "./event"
 
-import { Cause, Context, Effect, Layer, Option, PubSub, Queue, Schema, Stream } from "effect"
+import { Cause, Context, Effect, Layer, Option, PubSub, Queue, Schedule, Schema, Stream } from "effect"
 import { Event } from "@opencode-ai/schema/event"
 import type { Data, Definition, Payload } from "@opencode-ai/schema/event"
 import { and, asc, eq, gt, inArray } from "drizzle-orm"
@@ -9,6 +9,9 @@ import { EventSequenceTable, EventTable } from "./event/sql"
 import { Location } from "./location"
 import { makeGlobalNode } from "./effect/app-node"
 import { isDeepStrictEqual } from "node:util"
+import { createHash } from "node:crypto"
+import { isSqlError, type SqlError } from "effect/unstable/sql/SqlError"
+import { EffectDrizzleQueryError } from "drizzle-orm/effect-core/errors"
 import { Durable } from "@opencode-ai/schema/durable-event-manifest"
 
 export const ID = Event.ID
@@ -21,19 +24,22 @@ export type Unsubscribe = Effect.Effect<void>
 const EMPTY_SUBSCRIBERS: ReadonlyArray<Subscriber> = []
 /** Sliding live fan-out: a stalled subscriber drops its oldest events instead of retaining them unbounded. */
 const EVENT_PUBSUB_CAPACITY = 8192
+/** Bounds each durable backfill query; the stream pages until it has drained the aggregate tail. */
+const DURABLE_READ_LIMIT = 512
+/** Bounded retries for a lock-contention (`SQLITE_BUSY`/`SQLITE_LOCKED`) write transaction. */
+const DURABLE_BUSY_RETRIES = 3
 
-export const latestSequence = Effect.fn("EventV2.latestSequence")(function* (
-  db: Database.Interface["db"],
-  aggregateID: string,
-) {
-  const row = yield* db
-    .select({ seq: EventSequenceTable.seq })
-    .from(EventSequenceTable)
-    .where(eq(EventSequenceTable.aggregate_id, aggregateID))
-    .get()
-    .pipe(Effect.orDie)
-  return row?.seq ?? -1
-})
+/** Stable content digest used to keep tombstoned diff rows replay-idempotent without weakening divergence checks. */
+export const eventDigest = (data: unknown) =>
+  createHash("sha256")
+    .update(JSON.stringify(data) ?? "")
+    .digest("hex")
+
+const isRetryableSqlError = (error: unknown): error is SqlError => isSqlError(error) && error.isRetryable
+const retryDurableBusy = Schedule.exponential("25 millis", 2).pipe(
+  Schedule.either(Schedule.spaced("250 millis")),
+  Schedule.jittered,
+)
 
 export type SerializedEvent = {
   readonly id: ID
@@ -50,6 +56,62 @@ export class InvalidDurableEventError extends Schema.TaggedErrorClass<InvalidDur
     message: Schema.String,
   },
 ) {}
+
+/** Lock contention outlasted every bounded retry; the durable write never committed. */
+export class DatabaseBusyError extends Schema.TaggedErrorClass<DatabaseBusyError>()("EventV2.DatabaseBusy", {
+  operation: Schema.String,
+  attempts: Schema.Int,
+  message: Schema.String,
+}) {}
+
+// Drizzle wraps a query failure in EffectDrizzleQueryError whose `cause` carries the typed
+// SqlError, so a lock-contention error has to be unwrapped before retryability can be judged.
+const retryableSqlError = (error: unknown): SqlError | undefined => {
+  if (isRetryableSqlError(error)) return error
+  if (!(error instanceof EffectDrizzleQueryError)) return undefined
+  const inner = Cause.findErrorOption(error.cause as Cause.Cause<unknown>)
+  return Option.isSome(inner) && isRetryableSqlError(inner.value) ? inner.value : undefined
+}
+
+/**
+ * Bounded retry for a single lock-contending statement. `orDie` on an inner statement would turn a
+ * transient `SQLITE_BUSY` into a defect the outer transaction retry cannot observe, so every write
+ * statement that can contend for the lock is wrapped here before it is defected.
+ */
+const retryDurableWrite =
+  (operation: string) =>
+  <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+    effect.pipe(
+      Effect.retry({
+        while: (error: E) => retryableSqlError(error) !== undefined,
+        schedule: retryDurableBusy,
+        times: DURABLE_BUSY_RETRIES,
+      }),
+      Effect.catchIf(
+        (error: E) => retryableSqlError(error) !== undefined,
+        (error: E) =>
+          Effect.die(
+            new DatabaseBusyError({
+              operation,
+              attempts: DURABLE_BUSY_RETRIES + 1,
+              message: retryableSqlError(error)?.message ?? String(error),
+            }),
+          ),
+      ),
+    )
+
+export const latestSequence = Effect.fn("EventV2.latestSequence")(function* (
+  db: Database.Interface["db"],
+  aggregateID: string,
+) {
+  const row = yield* db
+    .select({ seq: EventSequenceTable.seq })
+    .from(EventSequenceTable)
+    .where(eq(EventSequenceTable.aggregate_id, aggregateID))
+    .get()
+    .pipe(retryDurableWrite("event.latestSequence"), Effect.orDie)
+  return row?.seq ?? -1
+})
 
 // The durable read path must never die on a row it cannot decode (newer/older
 // build, removed type); `replay()` keeps the strict die for authoritative streams.
@@ -97,9 +159,9 @@ export const readAggregate = Effect.fn("EventV2.readAggregate")(function* <A>(
     .all()
     .pipe(Effect.orDie)
   const page = rows.slice(0, input.limit)
-  const decode = Schema.decodeUnknownSync(input.manifest.schema)
-  const events = page.map((event) =>
-    decode({
+  const decode = Schema.decodeUnknownOption(input.manifest.schema)
+  const events = page.flatMap((event) => {
+    const decoded = decode({
       id: event.id,
       type: input.manifest.definitions.get(event.type)?.type ?? event.type,
       durable: {
@@ -108,8 +170,15 @@ export const readAggregate = Effect.fn("EventV2.readAggregate")(function* <A>(
         version: input.manifest.definitions.get(event.type)?.durable?.version,
       },
       data: event.data,
-    }),
-  )
+    })
+    return Option.isSome(decoded) ? [decoded.value] : []
+  })
+  const skipped = page.length - events.length
+  if (skipped > 0)
+    yield* Effect.logWarning("EventV2.readAggregate skipped undecodable events", {
+      aggregateID: input.aggregateID,
+      skipped,
+    })
   return {
     events,
     hasMore: rows.length > input.limit,
@@ -128,7 +197,13 @@ export interface PublishOptions {
   readonly id?: ID
   readonly metadata?: Record<string, unknown>
   readonly location?: Location.Ref
-  /** Local operational projection committed atomically with a new durable event. Not replayed or serialized. */
+  /**
+   * Local operational projection committed atomically with a new durable event. Not replayed or serialized.
+   *
+   * Runs inside the same `BEGIN IMMEDIATE` transaction as the event log write, so it must be a
+   * synchronous database-only effect: no network, filesystem, or other external I/O, and no
+   * nested transactions. Anything that can block here holds the process-wide writer lock.
+   */
   readonly commit?: (seq: number) => Effect.Effect<void>
 }
 
@@ -254,7 +329,7 @@ export const layerWith = (options?: LayerOptions) =>
                             .from(EventSequenceTable)
                             .where(eq(EventSequenceTable.aggregate_id, aggregateID))
                             .get()
-                            .pipe(Effect.orDie)
+                            .pipe(retryDurableWrite("durableEvent.readSequence"), Effect.orDie)
                           const latest = row?.seq ?? -1
                           const encoded = Schema.encodeUnknownSync(definition.data)(event.data) as Record<
                             string,
@@ -274,11 +349,12 @@ export const layerWith = (options?: LayerOptions) =>
                               .from(EventTable)
                               .where(and(eq(EventTable.aggregate_id, aggregateID), eq(EventTable.seq, input.seq)))
                               .get()
-                              .pipe(Effect.orDie)
+                              .pipe(retryDurableWrite("durableEvent.readReplay"), Effect.orDie)
                             if (
                               stored?.id === event.id &&
                               stored.type === versionedType(definition.type, durable.version) &&
-                              isDeepStrictEqual(stored.data, encoded)
+                              (isDeepStrictEqual(stored.data, encoded) ||
+                                (stored.tombstone_digest != null && stored.tombstone_digest === eventDigest(encoded)))
                             ) {
                               if (input.ownerID && row?.ownerID == null) {
                                 yield* db
@@ -286,7 +362,7 @@ export const layerWith = (options?: LayerOptions) =>
                                   .set({ owner_id: input.ownerID })
                                   .where(eq(EventSequenceTable.aggregate_id, aggregateID))
                                   .run()
-                                  .pipe(Effect.orDie)
+                                  .pipe(retryDurableWrite("durableEvent.claimOwner"), Effect.orDie)
                               }
                               return
                             }
@@ -314,7 +390,7 @@ export const layerWith = (options?: LayerOptions) =>
                             .from(EventTable)
                             .where(eq(EventTable.id, event.id))
                             .get()
-                            .pipe(Effect.orDie)
+                            .pipe(retryDurableWrite("durableEvent.readExisting"), Effect.orDie)
                           if (stored)
                             yield* Effect.die(
                               new InvalidDurableEventError({
@@ -341,7 +417,7 @@ export const layerWith = (options?: LayerOptions) =>
                               },
                             })
                             .run()
-                            .pipe(Effect.orDie)
+                            .pipe(retryDurableWrite("durableEvent.upsertSequence"), Effect.orDie)
                           yield* db
                             .insert(EventTable)
                             .values([
@@ -354,12 +430,12 @@ export const layerWith = (options?: LayerOptions) =>
                               },
                             ])
                             .run()
-                            .pipe(Effect.orDie)
+                            .pipe(retryDurableWrite("durableEvent.insertEvent"), Effect.orDie)
                           return { aggregateID, seq }
                         }),
                       { behavior: "immediate" },
                     )
-                    .pipe(Effect.orDie)
+                    .pipe(retryDurableWrite("durableEvent.commit"), Effect.orDie)
                   if (committed) {
                     const wakes = pubsub.durable.get(committed.aggregateID)
                     if (wakes) {
@@ -418,14 +494,35 @@ export const layerWith = (options?: LayerOptions) =>
       function notify(event: Payload, isolateListeners: boolean) {
         return Effect.gen(function* () {
           // Snapshot so an unsubscribe mid-dispatch cannot shift and skip a listener.
+          const snapshot = listeners.slice()
+          const publishPubSub = Effect.gen(function* () {
+            const typed = pubsub.typed.get(event.type)
+            if (typed) yield* PubSub.publish(typed, event)
+            yield* PubSub.publish(pubsub.all, event)
+          })
+          if (isolateListeners) {
+            yield* Effect.forEach(snapshot, (listener) => observe(event, listener), { discard: true })
+            yield* publishPubSub
+            return
+          }
+          // Live-only publishes stay fail-fast, but each listener is isolated so one defect
+          // cannot skip the remaining listeners or the pubsub fan-out. Interrupts still
+          // short-circuit; the first non-interrupt defect is re-raised after fan-out.
+          const failures: Cause.Cause<never>[] = []
           yield* Effect.forEach(
-            listeners.slice(),
-            (listener) => (isolateListeners ? observe(event, listener) : listener(event)),
+            snapshot,
+            (listener) =>
+              Effect.suspend(() => listener(event)).pipe(
+                Effect.catchCauseIf(
+                  (cause) => !Cause.hasInterrupts(cause),
+                  (cause) => Effect.sync(() => failures.push(cause)),
+                ),
+              ),
             { discard: true },
           )
-          const typed = pubsub.typed.get(event.type)
-          if (typed) yield* PubSub.publish(typed, event)
-          yield* PubSub.publish(pubsub.all, event)
+          yield* publishPubSub
+          const firstFailure = failures[0]
+          if (firstFailure) return yield* Effect.failCause(firstFailure)
         })
       }
 
@@ -527,13 +624,23 @@ export const layerWith = (options?: LayerOptions) =>
       function remove(aggregateID: string) {
         return Effect.gen(function* () {
           yield* db
-            .transaction(() =>
-              Effect.gen(function* () {
-                yield* db.delete(EventSequenceTable).where(eq(EventSequenceTable.aggregate_id, aggregateID)).run()
-                yield* db.delete(EventTable).where(eq(EventTable.aggregate_id, aggregateID)).run()
-              }),
+            .transaction(
+              () =>
+                Effect.gen(function* () {
+                  yield* db
+                    .delete(EventSequenceTable)
+                    .where(eq(EventSequenceTable.aggregate_id, aggregateID))
+                    .run()
+                    .pipe(retryDurableWrite("event.remove"), Effect.orDie)
+                  yield* db
+                    .delete(EventTable)
+                    .where(eq(EventTable.aggregate_id, aggregateID))
+                    .run()
+                    .pipe(retryDurableWrite("event.remove"), Effect.orDie)
+                }),
+              { behavior: "immediate" },
             )
-            .pipe(Effect.orDie)
+            .pipe(retryDurableWrite("event.remove"), Effect.orDie)
           // Terminal null marker ends durable streams against a deleted log.
           const wakes = pubsub.durable.get(aggregateID)
           if (wakes) yield* Effect.forEach(wakes, (wake) => PubSub.publish(wake, null), { discard: true })
@@ -546,7 +653,7 @@ export const layerWith = (options?: LayerOptions) =>
           .set({ owner_id: ownerID })
           .where(eq(EventSequenceTable.aggregate_id, aggregateID))
           .run()
-          .pipe(Effect.orDie)
+          .pipe(retryDurableWrite("event.claim"), Effect.orDie)
       }
 
       const subscribe = <D extends Definition>(definition: D): Stream.Stream<Payload<D>> =>
@@ -556,7 +663,7 @@ export const layerWith = (options?: LayerOptions) =>
 
       const streamAll = (): Stream.Stream<Payload> => Stream.fromPubSub(pubsub.all)
 
-      const readAfter = (aggregateID: string, after: number) =>
+      const readPage = (aggregateID: string, after: number) =>
         (options?.beforeAggregateRead?.(aggregateID) ?? Effect.void).pipe(
           Effect.andThen(
             db
@@ -564,11 +671,14 @@ export const layerWith = (options?: LayerOptions) =>
               .from(EventTable)
               .where(and(eq(EventTable.aggregate_id, aggregateID), gt(EventTable.seq, after)))
               .orderBy(asc(EventTable.seq))
+              .limit(DURABLE_READ_LIMIT)
               .all(),
           ),
           Effect.orDie,
-          Effect.map((rows) =>
-            rows.map((event) =>
+          Effect.map((rows) => ({
+            lastSeq: rows.at(-1)?.seq,
+            full: rows.length === DURABLE_READ_LIMIT,
+            decoded: rows.map((event) =>
               decodeSerializedEvent({
                 id: event.id,
                 aggregateID: event.aggregate_id,
@@ -577,17 +687,36 @@ export const layerWith = (options?: LayerOptions) =>
                 data: event.data,
               }),
             ),
-          ),
-          Effect.tap((decoded) =>
-            decoded.some(Option.isNone)
+          })),
+          Effect.tap((page) =>
+            page.decoded.some(Option.isNone)
               ? Effect.logWarning("EventV2.durable skipped undecodable events", {
                   aggregateID,
-                  skipped: decoded.filter(Option.isNone).length,
+                  skipped: page.decoded.filter(Option.isNone).length,
                 })
               : Effect.void,
           ),
-          Effect.map((decoded) => decoded.flatMap((event) => (Option.isSome(event) ? [event.value] : []))),
+          Effect.map((page) => ({
+            lastSeq: page.lastSeq,
+            full: page.full,
+            events: page.decoded.flatMap((event) => (Option.isSome(event) ? [event.value] : [])),
+          })),
         )
+
+      const readAllAfter = (
+        aggregateID: string,
+        after: number,
+      ): Effect.Effect<{ events: Payload[]; lastSeq: number }> =>
+        Effect.gen(function* () {
+          const events: Payload[] = []
+          let cursor = after
+          while (true) {
+            const page = yield* readPage(aggregateID, cursor)
+            events.push(...page.events)
+            if (!page.full || page.lastSeq === undefined) return { events, lastSeq: page.lastSeq ?? cursor }
+            cursor = page.lastSeq
+          }
+        })
 
       const subscribeDurable = (aggregateID: string) =>
         Effect.gen(function* () {
@@ -614,12 +743,13 @@ export const layerWith = (options?: LayerOptions) =>
           Effect.gen(function* () {
             const wakes = yield* subscribeDurable(input.aggregateID)
             let sequence = input.after ?? -1
-            const read = Effect.suspend(() => readAfter(input.aggregateID, sequence)).pipe(
-              Effect.tap((events) =>
+            const read = Effect.suspend(() => readAllAfter(input.aggregateID, sequence)).pipe(
+              Effect.tap((page) =>
                 Effect.sync(() => {
-                  sequence = events.at(-1)?.durable?.seq ?? sequence
+                  sequence = page.lastSeq
                 }),
               ),
+              Effect.map((page) => page.events),
             )
             const historical = yield* read
             const live = Stream.fromSubscription(wakes).pipe(

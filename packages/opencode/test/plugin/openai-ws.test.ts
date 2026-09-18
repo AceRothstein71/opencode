@@ -769,6 +769,32 @@ describe("plugin.openai.ws-pool", () => {
     fetch.close()
   })
 
+  test("falls back to HTTP instead of growing the pool past the limit when all entries are busy", async () => {
+    await using server = await createWebSocketServer(() => {})
+    let httpRequests = 0
+    const fetch = OpenAIWebSocketPool.createWebSocketFetch({
+      url: server.url,
+      httpFetch: stubHttpFetch(() => {
+        httpRequests += 1
+      }),
+    })
+
+    const attempts = Array.from({ length: 33 }, (_, index) => {
+      const controller = new AbortController()
+      return {
+        controller,
+        response: fetch(server.url, streamRequest({ "x-session-affinity": `session-${index}` }, controller.signal)),
+      }
+    })
+
+    expect(await (await attempts[32].response).text()).toBe("http")
+    expect(httpRequests).toBe(1)
+
+    for (const attempt of attempts) attempt.controller.abort(new Error("cleanup"))
+    await Promise.allSettled(attempts.map((attempt) => attempt.response))
+    fetch.close()
+  })
+
   test("releases the websocket lane when the response body is cancelled", async () => {
     let connections = 0
     await using server = await createWebSocketServer((socket) => {
@@ -809,6 +835,16 @@ function streamRequest(headers?: Record<string, string>, signal?: AbortSignal): 
     body: JSON.stringify({ stream: true, input: "hi" }),
     signal,
   }
+}
+
+function stubHttpFetch(onRequest: () => void): typeof globalThis.fetch {
+  return Object.assign(
+    () => {
+      onRequest()
+      return Promise.resolve(new Response("http"))
+    },
+    { preconnect: globalThis.fetch.preconnect },
+  )
 }
 
 async function readTextError(promise: Promise<string>) {

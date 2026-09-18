@@ -11,7 +11,7 @@ import { HttpServerResponse } from "effect/unstable/http"
 import { HttpApiBuilder } from "effect/unstable/httpapi"
 import { RootHttpApi } from "../api"
 import { GlobalUpgradeInput } from "../groups/global"
-import { frame, join } from "./sse-frame"
+import { frame, isTransientEvent, join } from "./sse-frame"
 
 function eventResponse() {
   return Effect.gen(function* () {
@@ -43,7 +43,8 @@ function eventResponse() {
           const id = event.payload?.id
           // A durable event and its `sync` mirror share an id but carry different
           // bodies, so the type is part of the frame cache key.
-          return frame(`${id ?? ""}\0${event.payload?.type ?? ""}`, id, event)
+          const type = event.payload?.type ?? ""
+          return frame(`${id ?? ""}\0${type}`, id, event, !isTransientEvent(type))
         }),
         Stream.mapArray((batch) => (batch.length <= 1 ? batch : [join(batch)])),
         Stream.ensuring(Effect.logInfo("global event disconnected")),

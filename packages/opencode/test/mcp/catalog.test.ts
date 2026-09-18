@@ -105,3 +105,53 @@ test("preserves output schema validation across paginated tool discovery", async
     await Promise.all([client.close(), server.close()])
   }
 })
+
+describe("McpCatalog.assignToolNames", () => {
+  test("gives colliding sanitized names distinct keys", () => {
+    const names = McpCatalog.assignToolNames([
+      { clientName: "a.b", name: "x" },
+      { clientName: "a_b", name: "x" },
+      { clientName: "a b", name: "x" },
+    ])
+
+    const assigned = [...names.values()].map((perServer) => perServer.get("x"))
+    expect(new Set(assigned).size).toBe(3)
+    expect(assigned[0]).toBe("a_b_x")
+  })
+
+  test("keeps distinct raw names distinct within one server", () => {
+    const names = McpCatalog.assignToolNames([
+      { clientName: "srv", name: "a.b" },
+      { clientName: "srv", name: "a_b" },
+    ])
+
+    const byName = names.get("srv")!
+    expect(byName.get("a.b")).toBe("srv_a_b")
+    expect(byName.get("a_b")).toBeDefined()
+    expect(byName.get("a_b")).not.toBe("srv_a_b")
+  })
+})
+
+describe("McpCatalog.convertTool bounds untrusted server input", () => {
+  test("prefixes the description with the server name and caps its length", () => {
+    const tool = McpCatalog.convertTool(
+      { ...mcpTool(), description: "x".repeat(10_000) },
+      clientReturning({ content: [], structuredContent: {} }),
+      undefined,
+      "my-server",
+    )
+
+    expect(tool.description?.startsWith("[my-server] ")).toBe(true)
+    expect(tool.description?.length).toBeLessThan(5_000)
+  })
+
+  test("does not recurse forever on a deeply nested input schema", () => {
+    let schema: Record<string, unknown> = { type: "string" }
+    for (let index = 0; index < 200; index++) schema = { type: "object", properties: { nested: schema } }
+
+    const deep = mcpTool()
+    deep.inputSchema = schema
+
+    expect(() => McpCatalog.convertTool(deep, clientReturning({ content: [], structuredContent: {} }))).not.toThrow()
+  })
+})

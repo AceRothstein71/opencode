@@ -1,6 +1,6 @@
 export * as SessionProjector from "./projector"
 
-import { and, desc, eq, gt, or, sql } from "drizzle-orm"
+import { and, desc, eq, gt, inArray, or, sql } from "drizzle-orm"
 import { DateTime, Effect, Layer, Schema } from "effect"
 import { Database } from "../database/database"
 import { EventV2, versionedType } from "../event"
@@ -252,15 +252,37 @@ function diffEventScope(sessionID: string, messageID: string) {
 }
 
 // Shrinks superseded diff payloads to tombstones. Rows stay so per-aggregate seqs
-// remain contiguous for sync replay; replay still converges because the latest event
-// (applied last) carries the full diffs.
+// remain contiguous for sync replay; the original payload digest is retained on the row so
+// replaying a pre-tombstone payload still matches instead of dying "Replay diverged".
+const TOMBSTONE_BATCH_SIZE = 200
+
 function tombstoneDiffEvents(db: DatabaseService, sessionID: string, messageID: string) {
-  return db
-    .update(EventTable)
-    .set({ data: { sessionID, messageID, diffs: [] } })
-    .where(diffEventScope(sessionID, messageID))
-    .run()
-    .pipe(Effect.orDie)
+  return Effect.gen(function* () {
+    const rows = yield* db
+      .select({ id: EventTable.id, data: EventTable.data })
+      .from(EventTable)
+      .where(diffEventScope(sessionID, messageID))
+      .all()
+      .pipe(Effect.orDie)
+    for (let start = 0; start < rows.length; start += TOMBSTONE_BATCH_SIZE) {
+      const batch = rows.slice(start, start + TOMBSTONE_BATCH_SIZE)
+      const digest = sql`case ${sql.join(
+        batch.map((row) => sql`when ${EventTable.id} = ${row.id} then ${EventV2.eventDigest(row.data)}`),
+        sql` `,
+      )} end`
+      yield* db
+        .update(EventTable)
+        .set({ data: { sessionID, messageID, diffs: [] }, tombstone_digest: digest })
+        .where(
+          inArray(
+            EventTable.id,
+            batch.map((row) => row.id),
+          ),
+        )
+        .run()
+        .pipe(Effect.orDie)
+    }
+  })
 }
 
 const layer = Layer.effectDiscard(

@@ -7,18 +7,39 @@ import * as Sse from "effect/unstable/encoding/Sse"
 const encoder = new TextEncoder()
 const frames = new Map<string, Uint8Array>()
 const FRAME_CACHE_LIMIT = 512
+// A frame holds a full serialized event (tool output, base64 attachment), so
+// bounding entry count alone still allows hundreds of megabytes to be retained.
+const FRAME_CACHE_MAX_BYTES = 8 * 1024 * 1024
+// Frames larger than this are unique-enough payloads that caching them only
+// evicts frames which genuinely repeat across clients.
+const FRAME_CACHE_MAX_FRAME_BYTES = 256 * 1024
+let framesBytes = 0
+// Per-connection frames carry a freshly minted id, so caching them only churns
+// the FIFO and evicts frames that genuinely repeat across clients.
+const TRANSIENT_EVENT_TYPES = new Set(["server.connected", "server.heartbeat", "server.desync"])
 
-export function frame(key: string, id: string | undefined, payload: unknown): Uint8Array {
-  const cached = frames.get(key)
-  if (cached) return cached
+export function isTransientEvent(type: string) {
+  return TRANSIENT_EVENT_TYPES.has(type)
+}
+
+export function frame(key: string, id: string | undefined, payload: unknown, cache = true): Uint8Array {
+  if (cache) {
+    const cached = frames.get(key)
+    if (cached) return cached
+  }
   const bytes = encoder.encode(
     Sse.encoder.write({ _tag: "Event", event: "message", id, data: JSON.stringify(payload) }),
   )
-  if (frames.size >= FRAME_CACHE_LIMIT) {
-    const oldest = frames.keys().next()
-    if (!oldest.done) frames.delete(oldest.value)
+  if (cache && bytes.byteLength <= FRAME_CACHE_MAX_FRAME_BYTES) {
+    while (frames.size >= FRAME_CACHE_LIMIT || framesBytes + bytes.byteLength > FRAME_CACHE_MAX_BYTES) {
+      const oldest = frames.keys().next()
+      if (oldest.done) break
+      framesBytes -= frames.get(oldest.value)?.byteLength ?? 0
+      frames.delete(oldest.value)
+    }
+    frames.set(key, bytes)
+    framesBytes += bytes.byteLength
   }
-  frames.set(key, bytes)
   return bytes
 }
 
