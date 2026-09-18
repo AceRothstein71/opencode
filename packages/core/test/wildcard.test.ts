@@ -81,6 +81,14 @@ describe("Wildcard.match", () => {
     expect(Wildcard.matchStrict("cat foo.txt", "cat *")).toBe(true)
   })
 
+  test("matchStrict refuses backslash-escaped traversal", () => {
+    expect(Wildcard.matchStrict("cat \\.\\./etc/passwd", "cat *")).toBe(false)
+    expect(Wildcard.matchStrict("cat \\.\\./\\.\\./etc/passwd", "cat *")).toBe(false)
+    expect(Wildcard.matchStrict("cat \\../etc/passwd", "cat *")).toBe(false)
+    // An escaped dot that does not form `..` is an ordinary hidden path.
+    expect(Wildcard.matchStrict("cat \\.hidden", "cat *")).toBe(true)
+  })
+
   test("matchStrict leaves file-path grants unaffected by traversal guards", () => {
     expect(Wildcard.matchStrict("../sibling/file.txt", "../sibling/*")).toBe(true)
     expect(Wildcard.matchStrict("./nested/file.txt", "./nested/*")).toBe(true)

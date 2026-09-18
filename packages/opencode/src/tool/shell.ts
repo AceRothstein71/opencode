@@ -129,17 +129,38 @@ function commands(node: Node) {
   return node.descendantsOfType("command").filter((child): child is Node => Boolean(child))
 }
 
+// The shell removes quoting and backslash escapes before it opens a path, so
+// `\.\./etc` really reads `../etc`. Classification and the external-directory scan must
+// see the unescaped form or an escaped traversal is never scanned. On Windows the
+// backslash is a path separator and must be preserved.
+function shellUnescape(text: string) {
+  if (process.platform === "win32") return text
+  let out = ""
+  for (let index = 0; index < text.length; index++) {
+    const char = text[index]
+    if (char === "\\" && index + 1 < text.length) {
+      out += text[++index]
+      continue
+    }
+    out += char
+  }
+  return out
+}
+
 function unquote(text: string) {
   if (text.length < 2) return text
   const first = text[0]
   const last = text[text.length - 1]
-  if ((first === '"' || first === "'") && first === last) return text.slice(1, -1)
-  return text
+  const inner = (first === '"' || first === "'") && first === last ? text.slice(1, -1) : text
+  return shellUnescape(inner)
 }
 
 function home(text: string) {
   if (text === "~") return os.homedir()
-  if (text.startsWith("~/") || text.startsWith("~\\")) return path.join(os.homedir(), text.slice(2))
+  if (text.startsWith("~/") || text.startsWith("~\\")) {
+    const rest = text.slice(1)
+    return process.platform === "win32" ? path.join(os.homedir(), rest) : os.homedir() + rest
+  }
   return text
 }
 
@@ -176,11 +197,15 @@ function expandTilde(text: string, cwd: string): string | true | undefined {
   if (!match) return
   const name = match[1]
   const rest = match[2] ?? ""
-  if (name === "+") return path.join(cwd, rest)
+  // Join without normalizing. `path.join` collapses `link/..` lexically before the
+  // symlink is followed, so `~+/linkroot/../etc` would look contained while the shell
+  // reads `/etc`; `rawPath` keeps the components for `resolveExistingFrom`. `~N` is a
+  // directory-stack entry (normally the worktree itself, like `~+`), not a username.
+  if (name === "+" || /^[0-9]+$/.test(name)) return cwd + rest
   const base = name === "-" ? process.env.OLDPWD : userHome(name)
   // `true` means the target is a real expansion whose home could not be resolved;
   // the caller forces an external-directory prompt rather than treating it as relative.
-  return base ? path.join(base, rest) : true
+  return base ? base + rest : true
 }
 
 function envValue(key: string) {
@@ -226,6 +251,17 @@ function dynamic(text: string, ps: boolean) {
   if (!ps && tildeUser(text)) return true
   if (ps) return /\$(?!env:)/i.test(text)
   return text.includes("$")
+}
+
+// A `cd`/`pushd`/`popd` whose destination is not a plain literal moves the shell
+// somewhere the scan cannot resolve (`cd $X`, `cd -`, bare `cd`, `popd` with no
+// argument). Treat that as dynamic so the caller anchors the scan at the filesystem
+// root; otherwise a relative read later in the same command string escapes the
+// worktree with no `external_directory` request (deepseek NEW-V10-01).
+function cwdTargetDynamic(command: Part[], ps: boolean) {
+  const positional = command.slice(1).filter((item) => !item.text.startsWith("-"))
+  if (positional.length === 0) return true
+  return positional.some((item) => dynamic(ps ? item.text : unquote(item.text), ps))
 }
 
 function prefix(text: string) {
@@ -464,11 +500,21 @@ export const ShellTool = Tool.define(
         always: new Set<string>(),
       }
       const shellKind = ShellID.toKind(Shell.name(shell))
-
-      for (const node of commands(root)) {
+      const entries = commands(root).map((node) => {
         const command = parts(node)
         const tokens = command.map((item) => item.text)
         const cmd = ps || shellKind === "cmd" ? tokens[0]?.toLowerCase() : tokens[0]
+        return { node, command, tokens, cmd }
+      })
+      // Resolve every command against one another so a dynamic `cd` anywhere in the
+      // invocation suppresses the always-grant for all of them, not just commands that
+      // happen to parse after it.
+      const dynamicCwd = entries.some(
+        (entry) => entry.cmd !== undefined && CWD.has(entry.cmd) && cwdTargetDynamic(entry.command, ps),
+      )
+
+      for (const entry of entries) {
+        const { node, command, tokens, cmd } = entry
 
         if (cmd && (FILES.has(cmd) || (shellKind === "cmd" && CMD_FILES.has(cmd)))) {
           for (const arg of pathArgs(command, ps, shellKind === "cmd")) {
@@ -495,10 +541,12 @@ export const ShellTool = Tool.define(
           // by a literal `prefix *` grant: the expansion (a variable path, a command
           // substitution) can resolve to a different path or flag on every run. Offer
           // only a one-shot prompt, never an "always" pattern, for those commands.
-          const expandable = command.some((item) => dynamic(item.text, ps))
+          const expandable = dynamicCwd || command.some((item) => dynamic(item.text, ps))
           if (!expandable) scan.always.add(BashArity.prefix(tokens).join(" ") + " *")
         }
       }
+
+      if (dynamicCwd) scan.dirs.add(path.parse(cwd).root)
 
       return scan
     })

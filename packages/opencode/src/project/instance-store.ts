@@ -126,19 +126,25 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
 
     const disposeEntry = Effect.fnUntraced(function* (directory: string, entry: Entry, ctx: InstanceContext) {
       if (cache.get(directory) !== entry) return false
-      yield* awaitLease(entry)
-      // Claim the entry in one synchronous step. A `provide` may have leased it after
-      // `awaitLease` observed `uses === 0`; both this claim and `provide`'s check-and-increment
-      // are synchronous critical sections, so whichever runs first is observed by the other.
-      // If a lease landed, leave the entry alive rather than tearing down under it (W5).
+      // Claim the entry in one synchronous step, *before* draining. Setting `disposed` makes
+      // `provide`'s check-and-increment and this claim mutually exclusive: whichever runs first
+      // is observed by the other, so a `provide` that lands after this point sees `disposed`,
+      // waits for `closed`, and reloads rather than leasing the context we are tearing down (W5).
+      // Claiming first also means a late `provide` cannot extend the drain below.
       const claimed = yield* Effect.sync(() => {
         if (cache.get(directory) !== entry) return false
         if (entry.disposed) return false
-        if (entry.uses > 0) return false
         entry.disposed = true
         return true
       })
       if (!claimed) return false
+      // Give an outstanding lease a bounded chance to release, then tear down anyway. The drain
+      // deadline exists precisely for leases that will never release on their own — a pending
+      // permission/question prompt is itself the lease holder, and disposal must reject it — so
+      // an explicit dispose that aborted here would silently strand the prompt (R-V10-01). A
+      // stuck lease can never deadlock disposal (v8 NEW-05); the W5 handshake above keeps a
+      // provide-after-dispose from ever using the disposed context.
+      yield* awaitLease(entry)
       yield* disposeContext(ctx).pipe(
         Effect.ensuring(
           Effect.gen(function* () {

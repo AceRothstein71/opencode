@@ -195,6 +195,9 @@ type Bounded = typeof BOUNDED
 // or be left by pruning; both are dropped at the parent. `required` is deliberately
 // absent because an empty `required` is valid.
 const NON_EMPTY_ARRAY_KEYWORDS = new Set(["anyOf", "oneOf", "allOf", "enum", "type", "prefixItems"])
+// `type` may be a string or an array of strings, but every member must name a real
+// JSON Schema type; a bad member makes the whole document meta-invalid.
+const JSON_TYPES = new Set(["null", "boolean", "object", "array", "number", "string", "integer"])
 // Keywords whose value must be a map of schemas; a non-object value is dropped.
 const SCHEMA_MAP_KEYWORDS = new Set(["properties", "$defs", "definitions", "patternProperties", "dependentSchemas"])
 // Keywords whose value must be a single schema (object or boolean).
@@ -279,12 +282,41 @@ function boundSchema(
               : "instance"
     const bounded = boundSchema(item, depth + 1, seen, counter, childKind)
     if (bounded === BOUNDED) continue
+    if (kind === "map") {
+      // Members of `properties`/`$defs`/`patternProperties`/`dependentSchemas` must
+      // themselves be schemas. A string or array member is meta-invalid and lets a
+      // sloppy server make strict providers reject the whole tool manifest.
+      if (!isSchema(bounded)) continue
+      out[key] = bounded
+      continue
+    }
     if (kind === "schema") {
       // A `required` that is not an array of strings cannot constrain anything and is
       // invalid JSON Schema; keep only the string members, dropping the keyword if none.
       if (key === "required") {
         if (!Array.isArray(bounded)) continue
         out[key] = bounded.filter((entry): entry is string => typeof entry === "string")
+        continue
+      }
+      if (key === "type") {
+        if (typeof bounded === "string") {
+          if (JSON_TYPES.has(bounded)) out[key] = bounded
+          continue
+        }
+        if (!Array.isArray(bounded)) continue
+        const members = bounded.filter((entry): entry is string => typeof entry === "string" && JSON_TYPES.has(entry))
+        if (members.length > 0) out[key] = members
+        continue
+      }
+      if (key === "dependentRequired") {
+        if (!isPlainObject(bounded)) continue
+        const clean: Record<string, string[]> = {}
+        for (const [name, names] of Object.entries(bounded)) {
+          if (!Array.isArray(names)) continue
+          const kept = names.filter((entry): entry is string => typeof entry === "string")
+          if (kept.length > 0) clean[name] = kept
+        }
+        if (Object.keys(clean).length > 0) out[key] = clean
         continue
       }
       if (key === "$ref") {
@@ -319,43 +351,82 @@ function boundSchema(
   return out
 }
 
-function localRefName(ref: unknown) {
-  if (typeof ref !== "string") return
-  return /^#\/(?:\$defs|definitions)\/(.+)$/.exec(ref)?.[1]
+// Only names in the document's *top-level* `$defs`/`definitions` are reachable from a
+// root JSON pointer. A name that exists only in a nested `$defs`, or that came from an
+// `enum` value, must not be treated as resolvable (`#/$defs/X` cannot reach it).
+function topLevelDefs(root: unknown) {
+  const names = new Map<string, Set<string>>([
+    ["$defs", new Set<string>()],
+    ["definitions", new Set<string>()],
+  ])
+  if (!isPlainObject(root)) return names
+  for (const section of ["$defs", "definitions"]) {
+    const map = root[section]
+    if (isPlainObject(map)) for (const name of Object.keys(map)) names.get(section)!.add(name)
+  }
+  return names
 }
 
-function collectDefs(value: unknown, names: Set<string>) {
-  if (Array.isArray(value)) {
-    value.forEach((item) => collectDefs(item, names))
-    return
-  }
-  if (!isPlainObject(value)) return
-  for (const [key, item] of Object.entries(value)) {
-    if ((key === "$defs" || key === "definitions") && isPlainObject(item)) {
-      for (const name of Object.keys(item)) names.add(name)
+function resolvePointer(root: unknown, ref: string) {
+  if (ref === "#" || ref === "#/") return true
+  const fragment = ref.slice(1)
+  if (!fragment.startsWith("/")) return false
+  const tokens = fragment
+    .slice(1)
+    .split("/")
+    .map((token) => token.replace(/~1/g, "/").replace(/~0/g, "~"))
+  let current: unknown = root
+  for (const token of tokens) {
+    if (Array.isArray(current)) {
+      const index = Number(token)
+      if (!Number.isInteger(index) || index < 0 || index >= current.length) return false
+      current = current[index]
+      continue
     }
-    collectDefs(item, names)
+    if (!isPlainObject(current) || !Object.hasOwn(current, token)) return false
+    current = current[token]
   }
+  return true
 }
 
 // A `$defs` entry can be pruned (depth, node budget, or shared identity) while a `$ref`
-// to it survives, leaving an unresolvable local reference that makes providers reject
-// the whole manifest. Drop such refs, leaving the containing schema unconstrained.
-function dropDanglingRefs(value: unknown, defs?: Set<string>) {
-  const names = defs ?? new Set<string>()
-  if (defs === undefined) collectDefs(value, names)
+// to it survives, leaving an unresolvable local reference that makes providers reject the
+// whole manifest. Drop such refs, leaving the containing schema unconstrained. Only
+// schema positions are walked, so a `$ref` inside `enum`/`const` instance data is left
+// alone, and every other local pointer is checked against the emitted document.
+function dropDanglingRefs(
+  value: unknown,
+  root: unknown = value,
+  kind: SchemaKind = "schema",
+  defs: Map<string, Set<string>> = topLevelDefs(root),
+) {
   if (Array.isArray(value)) {
-    value.forEach((item) => dropDanglingRefs(item, names))
+    value.forEach((item) => dropDanglingRefs(item, root, kind, defs))
     return
   }
   if (!isPlainObject(value)) return
   for (const [key, item] of Object.entries(value)) {
-    if (key === "$ref") {
-      const name = localRefName(item)
-      if (name !== undefined && !names.has(name)) delete value[key]
+    if (kind === "schema" && key === "$ref") {
+      if (typeof item !== "string" || !item.startsWith("#")) continue
+      const def = /^#\/(\$defs|definitions)\/([^/]+)$/.exec(item)
+      if (def) {
+        if (!defs.get(def[1])?.has(def[2])) delete value[key]
+        continue
+      }
+      if (!resolvePointer(root, item)) delete value[key]
       continue
     }
-    dropDanglingRefs(item, names)
+    const childKind: SchemaKind =
+      kind === "map"
+        ? "schema"
+        : kind === "instance"
+          ? "instance"
+          : key === "enum" || key === "const" || key === "default" || key === "examples"
+            ? "instance"
+            : SCHEMA_MAP_KEYWORDS.has(key)
+              ? "map"
+              : "schema"
+    dropDanglingRefs(item, root, childKind, defs)
   }
 }
 

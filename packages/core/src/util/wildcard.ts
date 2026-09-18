@@ -31,13 +31,21 @@ function unquote(value: string) {
       quote = char
       continue
     }
-    if (char === "\\" && index + 1 < value.length && SHELL_ESCAPES.has(value[index + 1])) {
+    // `\.` is `..` after the shell strips the escape, so an escaped traversal must
+    // unescape here too or it slips past the TRAVERSAL check below. A backslash is a
+    // Windows separator, not an escape, so only unix honours the dot escape.
+    const escaped = index + 1 < value.length && (SHELL_ESCAPES.has(value[index + 1]) || nextIsDotEscape(value, index))
+    if (char === "\\" && escaped) {
       out += value[++index]
       continue
     }
     out += char
   }
   return out
+}
+
+function nextIsDotEscape(value: string, index: number) {
+  return process.platform !== "win32" && value[index + 1] === "."
 }
 
 function glob(pattern: string, strict: boolean) {

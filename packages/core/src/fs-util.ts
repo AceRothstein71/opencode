@@ -288,7 +288,9 @@ export namespace FSUtil {
     const root = parse(absolute).root || sep
     let current = root
     const remainder: string[] = []
-    const parts = absolute.slice(root.length).split(/[\\/]+/)
+    // On unix a backslash is an ordinary filename character, not a separator, so
+    // splitting on it would hide a literal `..`-looking component from the check below.
+    const parts = absolute.slice(root.length).split(process.platform === "win32" ? /[\\/]+/ : "/")
     for (let index = 0; index < parts.length; index++) {
       const part = parts[index]
       if (part === "" || part === ".") continue
@@ -306,7 +308,14 @@ export namespace FSUtil {
         break
       }
     }
-    return remainder.length > 0 ? normalizePath(join(current, ...remainder)) : normalizePath(current)
+    if (remainder.length === 0) return normalizePath(current)
+    // Once a component does not exist the kernel cannot follow anything after it, so the
+    // real target is unknowable. A `..` in that remainder cannot be collapsed lexically:
+    // `*/../linkroot/../etc` resolves to `<cwd>/etc` that way while a glob-selected
+    // symlink makes bash read `/etc`. Treat any such `..` as escaping and anchor at the
+    // filesystem root so containment fails and the external-directory prompt fires.
+    if (remainder.includes("..")) return normalizePath(root)
+    return normalizePath(join(current, ...remainder))
   }
 
   export function windowsPath(p: string): string {

@@ -444,6 +444,92 @@ describe("tool.shell permissions", () => {
         )
       }),
     )
+
+    each("asks for external_directory when a ~+ expansion traverses a symlink with ..", () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        yield* Effect.promise(() => symlink("/", path.join(tmp, "linkroot"), "dir"))
+        yield* runIn(
+          tmp,
+          Effect.gen(function* () {
+            const requests: Array<Omit<PermissionV1.Request, "id" | "sessionID" | "tool">> = []
+            yield* run({ command: "cat ~+/linkroot/../etc/opencode-missing" }, capture(requests))
+            const ext = requests.find((r) => r.permission === "external_directory")
+            expect(ext).toBeDefined()
+            expect(ext!.patterns).toContain("/etc/*")
+            const bashReq = requests.find((r) => r.permission === "bash")
+            expect(bashReq).toBeDefined()
+            expect(bashReq!.always).not.toContain("cat *")
+          }),
+        )
+      }),
+    )
+
+    each("asks for external_directory when a leading glob traverses a symlink with ..", () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        yield* Effect.promise(() => symlink("/", path.join(tmp, "linkroot"), "dir"))
+        yield* runIn(
+          tmp,
+          Effect.gen(function* () {
+            const requests: Array<Omit<PermissionV1.Request, "id" | "sessionID" | "tool">> = []
+            yield* run({ command: "cat */../linkroot/../etc/opencode-missing" }, capture(requests))
+            expect(requests.find((r) => r.permission === "external_directory")).toBeDefined()
+          }),
+        )
+      }),
+    )
+
+    each("asks for external_directory when a backslash-escaped traversal escapes the project", () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        yield* runIn(
+          tmp,
+          Effect.gen(function* () {
+            const requests: Array<Omit<PermissionV1.Request, "id" | "sessionID" | "tool">> = []
+            yield* run({ command: "cat \\../etc/opencode-missing" }, capture(requests))
+            expect(requests.find((r) => r.permission === "external_directory")).toBeDefined()
+
+            const requests2: Array<Omit<PermissionV1.Request, "id" | "sessionID" | "tool">> = []
+            yield* run({ command: "cat \\.\\./etc/opencode-missing" }, capture(requests2))
+            expect(requests2.find((r) => r.permission === "external_directory")).toBeDefined()
+          }),
+        )
+      }),
+    )
+
+    each("asks for external_directory when cd has an unresolvable target", () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        yield* runIn(
+          tmp,
+          Effect.gen(function* () {
+            for (const command of ["cd $HOME && cat secret.txt", "cd - && cat secret.txt", "cd && cat secret.txt"]) {
+              const requests: Array<Omit<PermissionV1.Request, "id" | "sessionID" | "tool">> = []
+              yield* run({ command }, capture(requests))
+              const ext = requests.find((r) => r.permission === "external_directory")
+              expect({ command, ext: ext !== undefined }).toEqual({ command, ext: true })
+              const bashReq = requests.find((r) => r.permission === "bash")
+              expect({ command, always: bashReq?.always ?? [] }).toEqual({ command, always: [] })
+            }
+          }),
+        )
+      }),
+    )
+
+    each("resolves a dirstack tilde to the worktree instead of prompting root", () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        yield* runIn(
+          tmp,
+          Effect.gen(function* () {
+            const requests: Array<Omit<PermissionV1.Request, "id" | "sessionID" | "tool">> = []
+            yield* run({ command: "cat ~0/notes.txt" }, capture(requests))
+            expect(requests.find((r) => r.permission === "external_directory")).toBeUndefined()
+          }),
+        )
+      }),
+    )
   }
 
   if (process.platform === "win32") {

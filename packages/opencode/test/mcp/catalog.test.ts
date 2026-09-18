@@ -363,4 +363,52 @@ describe("McpCatalog.convertTool bounds untrusted server input", () => {
 
     for (const input of cases) expect(() => ajv.compile(emitted(input))).not.toThrow()
   })
+
+  test("drops invalid schema-map members, type members, and dependentRequired entries", () => {
+    const schema = emitted({
+      type: "object",
+      properties: {
+        k: {
+          type: ["string", "notatype", null],
+          properties: { bad: [1, 2], good: { type: "string" }, also: "x" },
+          patternProperties: { "^a": [1] },
+          dependentSchemas: { a: [1] },
+          dependentRequired: { dropped: "notarray", kept: [1, "c"] },
+        },
+      },
+      $defs: { invalid: 7, valid: { type: "string" } },
+    })
+    const k = (schema.properties as Record<string, Record<string, unknown>>).k
+
+    expect(k.type).toEqual(["string"])
+    expect(k.properties).toEqual({ good: { type: "string" } })
+    expect(k.patternProperties).toEqual({})
+    expect(k.dependentSchemas).toEqual({})
+    expect(k.dependentRequired).toEqual({ kept: ["c"] })
+    expect(schema.$defs).toEqual({ valid: { type: "string" } })
+    expect(() => new Ajv2020({ strict: false }).compile(schema)).not.toThrow()
+  })
+
+  test("accepts only refs that resolve from the top-level document", () => {
+    const schema = emitted({
+      type: "object",
+      properties: {
+        nestedDefs: { type: "object", $defs: { Inner: { type: "string" } }, $ref: "#/$defs/Inner" },
+        enumValue: { $ref: "#/$defs/Fake" },
+        badPointer: { $ref: "#/nope/x" },
+        goodPointer: { $ref: "#/properties/kept" },
+        kept: { type: "string" },
+        definitionsMismatch: { $ref: "#/definitions/Only" },
+      },
+      enum: [{ $defs: { Fake: {} } }],
+    })
+    const props = schema.properties as Record<string, Record<string, unknown>>
+
+    expect(props.nestedDefs.$ref).toBeUndefined()
+    expect(props.enumValue.$ref).toBeUndefined()
+    expect(props.badPointer.$ref).toBeUndefined()
+    expect(props.definitionsMismatch.$ref).toBeUndefined()
+    expect(props.goodPointer.$ref).toBe("#/properties/kept")
+    expect(() => new Ajv2020({ strict: false }).compile(schema)).not.toThrow()
+  })
 })

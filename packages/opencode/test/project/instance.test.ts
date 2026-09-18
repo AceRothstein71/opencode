@@ -446,4 +446,82 @@ describe("InstanceStore", () => {
       expect(captured).not.toBe(ctx)
     }),
   )
+
+  it.live(
+    "never uses a disposed context under concurrent provide/dispose (W5/F4a)",
+    () =>
+      Effect.gen(function* () {
+        yield* setBootstrap(Effect.void)
+        const dir = yield* tmpdirScoped()
+        const store = yield* InstanceStore.Service
+        const input = {
+          directory: dir,
+          worktree: dir,
+          project: { id: "concurrency" },
+        } as unknown as InstanceStore.LoadInput
+        const ROUNDS = 80
+        let teardowns = 0
+        let leaseWins = 0
+        let disposeWins = 0
+        let violations = 0
+
+        for (let round = 0; round < ROUNDS; round++) {
+          const base = yield* store.load(input)
+          let disposeCompleted = false
+          const records: Array<{ ctx: unknown; afterDispose: boolean }> = []
+          const startProvides = () =>
+            Effect.forEach(
+              Array.from({ length: 4 }, (_, index) => index),
+              () =>
+                store
+                  .provide(
+                    input,
+                    Effect.gen(function* () {
+                      const ctx = yield* InstanceRef
+                      records.push({ ctx, afterDispose: disposeCompleted })
+                      yield* Effect.sleep("0 millis")
+                    }),
+                  )
+                  .pipe(Effect.forkScoped),
+              { concurrency: "unbounded" },
+            )
+          const startDispose = () =>
+            store.dispose(base).pipe(
+              Effect.tap(() =>
+                Effect.sync(() => {
+                  disposeCompleted = true
+                }),
+              ),
+              Effect.forkScoped,
+            )
+          // Alternate which side gets the head start so both orderings (dispose claims
+          // first → fresh context, lease lands first → same context) are exercised.
+          const leaseFirst = round % 2 === 1
+          const provides = leaseFirst ? yield* startProvides() : undefined
+          if (leaseFirst) yield* Effect.sleep("1 millis")
+          const disposing = yield* startDispose()
+          if (!leaseFirst) yield* Effect.sleep("0 millis")
+          const all = provides ?? (yield* startProvides())
+          yield* Fiber.join(disposing)
+          yield* Effect.forEach(all, Fiber.join, { discard: true })
+          const after = yield* store.load(input)
+          const wasTornDown = after !== base
+          if (wasTornDown) teardowns++
+          for (const record of records) {
+            if (record.ctx !== base) {
+              disposeWins++
+              continue
+            }
+            leaseWins++
+            if (wasTornDown && record.afterDispose) violations++
+          }
+        }
+
+        expect(violations).toBe(0)
+        expect(teardowns).toBe(ROUNDS)
+        expect(leaseWins).toBeGreaterThan(0)
+        expect(disposeWins).toBeGreaterThan(0)
+      }),
+    60_000,
+  )
 })
