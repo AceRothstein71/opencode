@@ -65,4 +65,24 @@ describe("Wildcard.match", () => {
     expect(Wildcard.matchStrict('my"file.txt', "myfile.txt")).toBe(false)
     expect(Wildcard.matchStrict("myfile.txt", "myfile.txt")).toBe(true)
   })
+
+  test("matchStrict refuses tilde-user and traversal expansions", () => {
+    expect(Wildcard.matchStrict("cat ~root/.ssh/id_rsa", "cat *")).toBe(false)
+    expect(Wildcard.matchStrict("cat ~+/etc/passwd", "cat *")).toBe(false)
+    expect(Wildcard.matchStrict("cat ~-/etc/passwd", "cat *")).toBe(false)
+    expect(Wildcard.matchStrict('cat "~root/.ssh/id_rsa"', "cat *")).toBe(false)
+    expect(Wildcard.matchStrict("cat link/../etc/passwd", "cat *")).toBe(false)
+    expect(Wildcard.matchStrict("cat ../sibling/file.txt", "cat *")).toBe(false)
+    expect(Wildcard.matchStrict("cat a/..", "cat *")).toBe(false)
+
+    expect(Wildcard.matchStrict("cat ~/notes.txt", "cat *")).toBe(true)
+    expect(Wildcard.matchStrict("cat ~", "cat *")).toBe(true)
+    expect(Wildcard.matchStrict("cat ..hidden", "cat *")).toBe(true)
+    expect(Wildcard.matchStrict("cat foo.txt", "cat *")).toBe(true)
+  })
+
+  test("matchStrict leaves file-path grants unaffected by traversal guards", () => {
+    expect(Wildcard.matchStrict("../sibling/file.txt", "../sibling/*")).toBe(true)
+    expect(Wildcard.matchStrict("./nested/file.txt", "./nested/*")).toBe(true)
+  })
 })

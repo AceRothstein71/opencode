@@ -65,7 +65,9 @@ export function convertTool(mcpTool: MCPToolDef, client: Client, timeout?: numbe
     additionalProperties: false,
   }
   if (required && required.length > 0) inputSchema.required = required
+  else if (Array.isArray(schema.required) && schema.required.length === 0) inputSchema.required = []
   else delete inputSchema.required
+  dropDanglingRefs(inputSchema)
 
   return dynamicTool({
     description: describeTool(mcpTool.description, server),
@@ -187,11 +189,47 @@ function describeTool(description: string | undefined, server: string | undefine
 const BOUNDED = Symbol("opencode.mcp.boundedSchema")
 type Bounded = typeof BOUNDED
 
+// Keywords that are invalid when emitted as `[]`: `anyOf`/`oneOf`/`allOf`/`enum`/
+// `prefixItems` must be non-empty and a `type` array must name at least one type.
+// An empty array can arrive from the source (the MCP SDK zod schema passes it through)
+// or be left by pruning; both are dropped at the parent. `required` is deliberately
+// absent because an empty `required` is valid.
+const NON_EMPTY_ARRAY_KEYWORDS = new Set(["anyOf", "oneOf", "allOf", "enum", "type", "prefixItems"])
+// Keywords whose value must be a map of schemas; a non-object value is dropped.
+const SCHEMA_MAP_KEYWORDS = new Set(["properties", "$defs", "definitions", "patternProperties", "dependentSchemas"])
+// Keywords whose value must be a single schema (object or boolean).
+const SCHEMA_VALUE_KEYWORDS = new Set([
+  "items",
+  "additionalProperties",
+  "additionalItems",
+  "unevaluatedProperties",
+  "unevaluatedItems",
+  "propertyNames",
+  "contains",
+  "not",
+  "if",
+  "then",
+  "else",
+])
+// Keywords whose value is an array of schemas.
+const SCHEMA_ARRAY_KEYWORDS = new Set(["anyOf", "oneOf", "allOf"])
+
+const isPlainObject = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value)
+const isSchema = (value: unknown) => typeof value === "boolean" || isPlainObject(value)
+
+// Schemas, maps of schemas (`properties`/`$defs`) and instance data (`enum`/`const`)
+// all recurse through `boundSchema`. Only real schema nodes are sanitized; without the
+// distinction a property literally named `required` or an `enum` value would be mistaken
+// for a keyword and silently dropped.
+type SchemaKind = "schema" | "map" | "instance"
+
 function boundSchema(
   value: unknown,
   depth = 0,
   seen = new WeakSet<object>(),
   counter = { nodes: 0 },
+  kind: SchemaKind = "schema",
 ): unknown | Bounded {
   if (value === null || typeof value !== "object") return value
   if (depth > MAX_SCHEMA_DEPTH || counter.nodes >= MAX_SCHEMA_NODES || seen.has(value)) return BOUNDED
@@ -199,28 +237,126 @@ function boundSchema(
   counter.nodes++
   if (Array.isArray(value)) {
     const bounded = value.flatMap((item) => {
-      const child = boundSchema(item, depth + 1, seen, counter)
+      const child = boundSchema(item, depth + 1, seen, counter, kind)
       return child === BOUNDED ? [] : [child]
     })
-    // `anyOf`/`oneOf`/`allOf`/`enum` must be non-empty when present. If every member
-    // of a non-empty source array was pruned, return BOUNDED so the *parent* drops
-    // the keyword instead of emitting `[]`, which ajv 2020-12 rejects (`minItems`)
-    // and providers surface as a whole-manifest rejection. A genuinely empty source
-    // array (e.g. `required: []`) is preserved verbatim.
+    // If every member of a non-empty source array was pruned, return BOUNDED so the
+    // parent drops the keyword instead of emitting `[]`. A source-empty array is
+    // returned as-is and filtered by the parent against NON_EMPTY_ARRAY_KEYWORDS.
     if (value.length > 0 && bounded.length === 0) return BOUNDED
     return bounded
   }
-  return Object.fromEntries(
-    Object.entries(value).flatMap(([key, item]) => {
-      // Draft-07 tuple form (`items: [a, b]`) is invalid under 2020-12, where `items`
-      // must be a single schema. Normalize conservatively to an unconstrained schema
-      // instead of re-expressing positional constraints; the input was already
-      // non-2020-12, and the bounded output must not be.
-      if (key === "items" && Array.isArray(item)) return [[key, {}]]
-      const bounded = boundSchema(item, depth + 1, seen, counter)
-      return bounded === BOUNDED ? [] : [[key, bounded]]
-    }),
-  )
+  const out: Record<string, unknown> = {}
+  for (const [key, item] of Object.entries(value)) {
+    // Draft-07 tuple form (`items: [a, b]`) is invalid under 2020-12, where `items`
+    // must be a single schema. Normalize conservatively to an unconstrained schema
+    // instead of re-expressing positional constraints; the input was already
+    // non-2020-12, and the bounded output must not be.
+    if (kind === "schema" && key === "items" && Array.isArray(item)) {
+      out[key] = {}
+      continue
+    }
+    // `prefixItems` must be a non-empty array of schemas; non-schema entries and an
+    // emptied list are dropped rather than emitted invalid.
+    if (kind === "schema" && key === "prefixItems") {
+      if (!Array.isArray(item)) continue
+      const kept = item.flatMap((entry) => {
+        const bounded = boundSchema(entry, depth + 1, seen, counter, "schema")
+        return bounded === BOUNDED || !isSchema(bounded) ? [] : [bounded]
+      })
+      if (kept.length > 0) out[key] = kept
+      continue
+    }
+    const childKind: SchemaKind =
+      kind === "map"
+        ? "schema"
+        : kind === "instance"
+          ? "instance"
+          : SCHEMA_MAP_KEYWORDS.has(key)
+            ? "map"
+            : SCHEMA_VALUE_KEYWORDS.has(key) || SCHEMA_ARRAY_KEYWORDS.has(key)
+              ? "schema"
+              : "instance"
+    const bounded = boundSchema(item, depth + 1, seen, counter, childKind)
+    if (bounded === BOUNDED) continue
+    if (kind === "schema") {
+      // A `required` that is not an array of strings cannot constrain anything and is
+      // invalid JSON Schema; keep only the string members, dropping the keyword if none.
+      if (key === "required") {
+        if (!Array.isArray(bounded)) continue
+        out[key] = bounded.filter((entry): entry is string => typeof entry === "string")
+        continue
+      }
+      if (key === "$ref") {
+        if (typeof bounded !== "string") continue
+        out[key] = bounded
+        continue
+      }
+      if (NON_EMPTY_ARRAY_KEYWORDS.has(key) && Array.isArray(bounded) && bounded.length === 0) continue
+      if (SCHEMA_MAP_KEYWORDS.has(key)) {
+        if (!isPlainObject(bounded)) continue
+        out[key] = bounded
+        continue
+      }
+      if (SCHEMA_VALUE_KEYWORDS.has(key)) {
+        if (!isSchema(bounded)) continue
+        out[key] = bounded
+        continue
+      }
+    }
+    out[key] = bounded
+  }
+  // Pruning can drop a property while its `required` entry survives. With
+  // `additionalProperties: false` that is an unsatisfiable subschema, silently making
+  // the tool (or one of its branches) uncallable; filter `required` to the emitted
+  // property names at every schema node.
+  if (kind === "schema" && Array.isArray(out.required)) {
+    const properties = isPlainObject(out.properties) ? out.properties : {}
+    const required = out.required.filter((key) => typeof key === "string" && Object.hasOwn(properties, key))
+    if (required.length > 0) out.required = required
+    else if (out.required.length > 0) delete out.required
+  }
+  return out
+}
+
+function localRefName(ref: unknown) {
+  if (typeof ref !== "string") return
+  return /^#\/(?:\$defs|definitions)\/(.+)$/.exec(ref)?.[1]
+}
+
+function collectDefs(value: unknown, names: Set<string>) {
+  if (Array.isArray(value)) {
+    value.forEach((item) => collectDefs(item, names))
+    return
+  }
+  if (!isPlainObject(value)) return
+  for (const [key, item] of Object.entries(value)) {
+    if ((key === "$defs" || key === "definitions") && isPlainObject(item)) {
+      for (const name of Object.keys(item)) names.add(name)
+    }
+    collectDefs(item, names)
+  }
+}
+
+// A `$defs` entry can be pruned (depth, node budget, or shared identity) while a `$ref`
+// to it survives, leaving an unresolvable local reference that makes providers reject
+// the whole manifest. Drop such refs, leaving the containing schema unconstrained.
+function dropDanglingRefs(value: unknown, defs?: Set<string>) {
+  const names = defs ?? new Set<string>()
+  if (defs === undefined) collectDefs(value, names)
+  if (Array.isArray(value)) {
+    value.forEach((item) => dropDanglingRefs(item, names))
+    return
+  }
+  if (!isPlainObject(value)) return
+  for (const [key, item] of Object.entries(value)) {
+    if (key === "$ref") {
+      const name = localRefName(item)
+      if (name !== undefined && !names.has(name)) delete value[key]
+      continue
+    }
+    dropDanglingRefs(item, names)
+  }
 }
 
 export function prompts(client: Client, timeout?: number) {

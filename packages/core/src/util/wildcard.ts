@@ -72,6 +72,13 @@ export function match(input: string, pattern: string) {
   return glob(pattern, false).test(input.replaceAll("\\", "/"))
 }
 
+// A shell expands a leading `~name` (and `~+`/`~-`) to a home directory the matcher
+// never sees, and follows a `..` component across a symlink before collapsing it, so
+// `link/../etc` reads outside while its lexical form looks contained. A persisted
+// literal `cmd *` grant must not auto-approve either shape.
+const TILDE_EXPANSION = /(^|[\s"'`=])~[^/\\]/
+const TRAVERSAL = /(^|[\s"'`/\\:])\.\.($|[/\\])/
+
 /**
  * Like `match`, but the optional trailing argument group of a `"cmd *"`
  * pattern will not match an argument that starts with `-` (in any position) or
@@ -86,5 +93,7 @@ export function matchStrict(input: string, pattern: string) {
   // patterns (external_directory globs, read/write paths) are not shell text, so
   // match them verbatim — unquoting could collapse distinct filenames.
   const shell = pattern.endsWith(" *")
-  return glob(shell ? unquote(pattern) : pattern, true).test((shell ? unquote(input) : input).replaceAll("\\", "/"))
+  const value = (shell ? unquote(input) : input).replaceAll("\\", "/")
+  if (shell && (TILDE_EXPANSION.test(value) || TRAVERSAL.test(value))) return false
+  return glob(shell ? unquote(pattern) : pattern, true).test(value)
 }

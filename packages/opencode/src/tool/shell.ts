@@ -1,6 +1,6 @@
 import { Effect, Schedule, Stream } from "effect"
 import os from "os"
-import { createWriteStream } from "node:fs"
+import { createWriteStream, readFileSync } from "node:fs"
 import * as Tool from "./tool"
 import path from "path"
 import { containsPath, type InstanceContext } from "../project/instance-context"
@@ -143,6 +143,46 @@ function home(text: string) {
   return text
 }
 
+// Bash expands a leading `~name` (and `~+`/`~-`) but `home()` above only rewrites `~`
+// and `~/…`. Left as-is, `~root/.ssh/id_rsa` resolves lexically under the worktree
+// while the shell reads `/root/.ssh/id_rsa`, so these forms are treated as expansions.
+function tildeUser(text: string) {
+  const bare = text.startsWith('"') || text.startsWith("'") ? text.slice(1) : text
+  return /^~[^/\\]/.test(bare)
+}
+
+const passwdHomes = new Map<string, string>()
+
+function userHome(name: string) {
+  if (process.platform === "win32" || !name) return
+  const cached = passwdHomes.get(name)
+  if (cached) return cached
+  try {
+    for (const line of readFileSync("/etc/passwd", "utf8").split("\n")) {
+      const fields = line.split(":")
+      if (fields[0] === name && fields[5]) {
+        passwdHomes.set(name, fields[5])
+        return fields[5]
+      }
+    }
+  } catch {
+    return
+  }
+  return
+}
+
+function expandTilde(text: string, cwd: string): string | true | undefined {
+  const match = /^~([^/\\]*)([/\\].*)?$/.exec(text)
+  if (!match) return
+  const name = match[1]
+  const rest = match[2] ?? ""
+  if (name === "+") return path.join(cwd, rest)
+  const base = name === "-" ? process.env.OLDPWD : userHome(name)
+  // `true` means the target is a real expansion whose home could not be resolved;
+  // the caller forces an external-directory prompt rather than treating it as relative.
+  return base ? path.join(base, rest) : true
+}
+
 function envValue(key: string) {
   if (process.platform !== "win32") return process.env[key]
   const name = Object.keys(process.env).find((item) => item.toLowerCase() === key.toLowerCase())
@@ -183,6 +223,7 @@ function dynamic(text: string, ps: boolean) {
   // (`cat *`) is not the path the shell executes (`cat /etc/passwd`), so a glob
   // must never inherit a literal `always` grant.
   if (/[?*[]/.test(text)) return true
+  if (!ps && tildeUser(text)) return true
   if (ps) return /\$(?!env:)/i.test(text)
   return text.includes("$")
 }
@@ -383,6 +424,14 @@ export const ShellTool = Tool.define(
       return path.resolve(root, text)
     })
 
+    // Unlike `resolvePath`, this keeps `..` components in the joined path so the later
+    // `realpath` follows symlinks before collapsing them (`link/../etc` escapes).
+    const rawPath = Effect.fn("ShellTool.rawPath")(function* (text: string, root: string, shell: string) {
+      if (process.platform === "win32") return yield* resolvePath(text, root, shell)
+      if (path.isAbsolute(text)) return text
+      return root + (root.endsWith(path.sep) ? "" : path.sep) + text
+    })
+
     const argPath = Effect.fn("ShellTool.argPath")(function* (arg: string, cwd: string, ps: boolean, shell: string) {
       const text = ps ? expand(arg, cwd, shell) : home(unquote(arg))
       if (!text) return
@@ -390,11 +439,16 @@ export const ShellTool = Tool.define(
       // A glob at position 0 has no literal prefix, but the shell still expands it
       // relative to cwd and it can traverse out of the worktree (`*/../../etc`).
       // Resolve the reachable directory so the external_directory scan still runs.
-      if (!file) return yield* resolvePath(globAnchor(text), cwd, shell)
+      if (!file) return yield* rawPath(globAnchor(text), cwd, shell)
+      if (!ps) {
+        const tilde = expandTilde(file, cwd)
+        if (tilde === true) return { external: true as const }
+        if (typeof tilde === "string") return yield* rawPath(tilde, cwd, shell)
+      }
       if (dynamic(file, ps)) return
       const next = ps ? provider(file) : file
       if (!next) return
-      return yield* resolvePath(next, cwd, shell)
+      return yield* rawPath(next, cwd, shell)
     })
 
     const collect = Effect.fn("ShellTool.collect")(function* (
@@ -420,9 +474,15 @@ export const ShellTool = Tool.define(
           for (const arg of pathArgs(command, ps, shellKind === "cmd")) {
             const resolved = yield* argPath(arg, cwd, ps, shell)
             if (!resolved) continue
+            // An unresolvable `~name` expands outside the worktree; anchor the scan at
+            // the filesystem root so the external_directory prompt still fires.
+            if (typeof resolved !== "string") {
+              scan.dirs.add(path.parse(cwd).root)
+              continue
+            }
             // Lexical containment is not enough: a symlink inside the worktree can
             // point outside it. Require both the lexical path and its resolved target.
-            const real = FSUtil.resolveExisting(resolved)
+            const real = FSUtil.resolveExistingFrom(cwd, resolved)
             if (containsPath(resolved, instance) && containsPath(real, instance)) continue
             const dir = (yield* fs.isDir(real)) ? real : path.dirname(real)
             scan.dirs.add(dir)
@@ -692,7 +752,9 @@ export const ShellTool = Tool.define(
             Effect.gen(function* () {
               const instanceCtx = yield* InstanceState.context
               const cwd = params.workdir
-                ? FSUtil.resolveExisting(yield* resolvePath(params.workdir, instanceCtx.directory, shell))
+                ? process.platform === "win32"
+                  ? FSUtil.resolveExisting(yield* resolvePath(params.workdir, instanceCtx.directory, shell))
+                  : FSUtil.resolveExistingFrom(instanceCtx.directory, params.workdir)
                 : instanceCtx.directory
               if (params.timeout !== undefined && params.timeout < 0) {
                 throw new Error(`Invalid timeout value: ${params.timeout}. Timeout must be a positive number.`)

@@ -1,5 +1,5 @@
 import { NodeFileSystem } from "@effect/platform-node"
-import { basename, dirname, isAbsolute, join, relative, resolve as pathResolve, sep } from "path"
+import { dirname, isAbsolute, join, parse, relative, resolve as pathResolve, sep } from "path"
 import { realpathSync } from "fs"
 import * as NFS from "fs/promises"
 import { lookup } from "mime-types"
@@ -262,21 +262,51 @@ export namespace FSUtil {
    * this instead.
    */
   export function resolveExisting(p: string): string {
-    const resolved = pathResolve(windowsPath(p))
-    const trailing: string[] = []
-    let current = resolved
-    while (true) {
+    return resolveExistingRaw(pathResolve(windowsPath(p)))
+  }
+
+  /**
+   * Like `resolveExisting`, but keeps the caller's `..` components until after
+   * `realpath` has followed the symlinks. `path.resolve` collapses `link/..`
+   * lexically before the symlink is seen, so `link/../etc` looks contained while
+   * the kernel follows `link` first and reads `/etc`; only containment checks that
+   * resolve symlinks component-wise are safe against that.
+   */
+  export function resolveExistingFrom(root: string, text: string): string {
+    const base = windowsPath(root)
+    const target = windowsPath(text)
+    if (isAbsolute(target)) return resolveExistingRaw(target)
+    const separator = base.endsWith("/") || base.endsWith("\\") ? "" : "/"
+    return resolveExistingRaw(base + separator + target)
+  }
+
+  // Resolve component by component because `realpath` on a whole path containing
+  // `link/..` collapses the `..` lexically in some runtimes (`bun` returns
+  // `<cwd>/etc` for `link/../etc` where `link -> /`), masking the real target.
+  function resolveExistingRaw(path: string): string {
+    const absolute = isAbsolute(path) ? path : pathResolve(path)
+    const root = parse(absolute).root || sep
+    let current = root
+    const remainder: string[] = []
+    const parts = absolute.slice(root.length).split(/[\\/]+/)
+    for (let index = 0; index < parts.length; index++) {
+      const part = parts[index]
+      if (part === "" || part === ".") continue
+      if (part === "..") {
+        current = dirname(current)
+        continue
+      }
+      const candidate = current.endsWith(sep) ? current + part : current + sep + part
       try {
-        return normalizePath(join(realpathSync.native(current), ...trailing.reverse()))
+        current = realpathSync.native(candidate)
       } catch (error) {
         const code = (error as NodeJS.ErrnoException | undefined)?.code
-        if (code !== "ENOENT" && code !== "ENOTDIR") return normalizePath(resolved)
-        const parent = dirname(current)
-        if (parent === current) return normalizePath(resolved)
-        trailing.push(basename(current))
-        current = parent
+        if (code !== "ENOENT" && code !== "ENOTDIR") return normalizePath(absolute)
+        remainder.push(part, ...parts.slice(index + 1))
+        break
       }
     }
+    return remainder.length > 0 ? normalizePath(join(current, ...remainder)) : normalizePath(current)
   }
 
   export function windowsPath(p: string): string {

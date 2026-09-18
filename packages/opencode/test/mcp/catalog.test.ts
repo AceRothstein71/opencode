@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test"
+import Ajv2020 from "ajv/dist/2020"
 import { asSchema } from "ai"
 import { Client } from "@modelcontextprotocol/sdk/client/index.js"
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js"
@@ -165,7 +166,7 @@ describe("McpCatalog.convertTool bounds untrusted server input", () => {
       if ("required" in entries && !Array.isArray(entries.required)) invalid.push(`${path}.required`)
       if ("properties" in entries && (typeof entries.properties !== "object" || Array.isArray(entries.properties)))
         invalid.push(`${path}.properties`)
-      for (const keyword of ["anyOf", "oneOf", "allOf", "enum"]) {
+      for (const keyword of ["anyOf", "oneOf", "allOf", "enum", "type", "prefixItems"]) {
         const members = entries[keyword]
         if (Array.isArray(members) && members.length === 0) invalid.push(`${path}.${keyword}`)
       }
@@ -251,5 +252,115 @@ describe("McpCatalog.convertTool bounds untrusted server input", () => {
     expect(() =>
       McpCatalog.convertTool(tool, clientReturning({ content: [], structuredContent: {} })),
     ).not.toThrow()
+  })
+
+  test("drops source-empty schema keywords at the root and nested regardless of source length", () => {
+    const schema = emitted({
+      type: "object",
+      properties: {
+        k: { anyOf: [], oneOf: [], allOf: [], enum: [], type: [], prefixItems: [] },
+      },
+      anyOf: [],
+      oneOf: [],
+      allOf: [],
+      enum: [],
+      prefixItems: [],
+    })
+
+    expect(invalidSchemaKeywords(schema)).toEqual([])
+    expect(schema).toMatchObject({
+      type: "object",
+      properties: { k: {} },
+      additionalProperties: false,
+    })
+    expect("anyOf" in schema).toBe(false)
+    expect("enum" in schema).toBe(false)
+    expect("prefixItems" in schema).toBe(false)
+  })
+
+  test("preserves a genuinely empty required array", () => {
+    const schema = emitted({ type: "object", properties: { kept: { type: "string" } }, required: [] })
+
+    expect(schema.required).toEqual([])
+    expect(invalidSchemaKeywords(schema)).toEqual([])
+  })
+
+  test("sanitizes nested schema keyword type confusion at every node", () => {
+    const schema = emitted({
+      type: "object",
+      properties: {
+        k: { type: "object", required: { a: 1 }, properties: [1, 2], items: 3, $ref: 42, prefixItems: [1, 2] },
+      },
+    })
+    const k = (schema.properties as Record<string, Record<string, unknown>>).k
+
+    expect(k.required).toBeUndefined()
+    expect(k.properties).toBeUndefined()
+    expect(k.items).toBeUndefined()
+    expect(k.$ref).toBeUndefined()
+    expect(k.prefixItems).toBeUndefined()
+    expect(invalidSchemaKeywords(schema)).toEqual([])
+  })
+
+  test("does not mistake property names or enum values for schema keywords", () => {
+    const schema = emitted({
+      type: "object",
+      properties: {
+        options: {
+          type: "object",
+          properties: { required: { type: "boolean" }, items: { type: "string" } },
+          required: ["required"],
+        },
+        choice: { enum: [{ required: { a: 1 } }, "other"] },
+      },
+    })
+    const properties = schema.properties as Record<string, Record<string, unknown>>
+
+    expect(properties.options.properties).toEqual({ required: { type: "boolean" }, items: { type: "string" } })
+    expect(properties.options.required).toEqual(["required"])
+    expect(properties.choice.enum).toEqual([{ required: { a: 1 } }, "other"])
+  })
+
+  test("filters nested required against emitted properties at every node", () => {
+    const cyclic: Record<string, unknown> = { type: "object", additionalProperties: false }
+    cyclic.properties = { kept: { type: "string" }, self: cyclic }
+    cyclic.required = ["kept", "self"]
+
+    const schema = emitted({ type: "object", properties: { nested: cyclic }, required: ["nested"] })
+    const nested = (schema.properties as Record<string, Record<string, unknown>>).nested
+
+    expect(nested.required).toEqual(["kept"])
+    expect(invalidSchemaKeywords(schema)).toEqual([])
+  })
+
+  test("emits resolvable references when a $defs entry is pruned", () => {
+    const shared = { type: "string" }
+    const schema = emitted({
+      type: "object",
+      properties: { a: shared, b: { $ref: "#/$defs/A" } },
+      $defs: { A: shared },
+    })
+
+    expect((schema.properties as Record<string, unknown>).b).toEqual({})
+    expect(schema.$defs).toEqual({})
+    expect(() => new Ajv2020({ strict: false }).compile(schema)).not.toThrow()
+  })
+
+  test("compiles the sanitized document under ajv 2020-12", () => {
+    const ajv = new Ajv2020({ strict: false })
+    const cases: unknown[] = [
+      {
+        type: "object",
+        properties: { k: { anyOf: [], oneOf: [], allOf: [], enum: [], type: [], prefixItems: [] } },
+        anyOf: [],
+        oneOf: [],
+        allOf: [],
+        enum: [],
+        prefixItems: [],
+      },
+      { type: "object", properties: { k: { type: "object", required: { a: 1 }, properties: [1, 2], items: 3 } } },
+    ]
+
+    for (const input of cases) expect(() => ajv.compile(emitted(input))).not.toThrow()
   })
 })

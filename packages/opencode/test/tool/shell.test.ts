@@ -392,6 +392,60 @@ describe("tool.shell permissions", () => {
     }),
   )
 
+  if (process.platform !== "win32") {
+    each("scans externally and offers no always grant for a tilde-user expansion", () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        yield* runIn(
+          tmp,
+          Effect.gen(function* () {
+            const requests: Array<Omit<PermissionV1.Request, "id" | "sessionID" | "tool">> = []
+            yield* run({ command: "cat ~root/opencode-missing-file" }, capture(requests))
+            expect(requests.find((r) => r.permission === "external_directory")).toBeDefined()
+            const bashReq = requests.find((r) => r.permission === "bash")
+            expect(bashReq).toBeDefined()
+            expect(bashReq!.always).not.toContain("cat *")
+          }),
+        )
+      }),
+    )
+
+    each("scans externally and offers no always grant for a ~+ expansion", () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        yield* runIn(
+          tmp,
+          Effect.gen(function* () {
+            const requests: Array<Omit<PermissionV1.Request, "id" | "sessionID" | "tool">> = []
+            yield* run({ command: "cat ~+/../../../../../etc/opencode-missing" }, capture(requests))
+            expect(requests.find((r) => r.permission === "external_directory")).toBeDefined()
+            const bashReq = requests.find((r) => r.permission === "bash")
+            expect(bashReq).toBeDefined()
+            expect(bashReq!.always).not.toContain("cat *")
+          }),
+        )
+      }),
+    )
+
+    each("asks for external_directory when a symlink plus .. escapes the project", () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        yield* Effect.promise(() => symlink("/", path.join(tmp, "link"), "dir"))
+        yield* runIn(
+          tmp,
+          Effect.gen(function* () {
+            const err = new Error("stop after permission")
+            const requests: Array<Omit<PermissionV1.Request, "id" | "sessionID" | "tool">> = []
+            expect(yield* fail({ command: "cat link/../etc/opencode-missing" }, capture(requests, err))).toMatchObject({
+              message: err.message,
+            })
+            expect(requests.find((r) => r.permission === "external_directory")).toBeDefined()
+          }),
+        )
+      }),
+    )
+  }
+
   if (process.platform === "win32") {
     if (bash) {
       it.live("asks for nested bash command permissions [bash]", () =>
