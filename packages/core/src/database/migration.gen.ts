@@ -43,5 +43,6 @@ export const migrations = (
     import("./migration/20260911212236_message_diff"),
     import("./migration/20260917212851_db_projector_hot_paths"),
     import("./migration/20260917225834_wave7_l3_event_tombstone_and_shell_index"),
+    import("./migration/20260918114048_conscious_frog_thor"),
   ])
 ).map((module) => module.default) satisfies DatabaseMigration.Migration[]

@@ -7,14 +7,19 @@ export default {
     return Effect.gen(function* () {
       yield* tx.run(`DROP INDEX IF EXISTS \`part_session_idx\`;`)
       yield* tx.run(`DROP INDEX IF EXISTS \`session_message_time_created_idx\`;`)
-      yield* tx.run(`CREATE INDEX \`event_seq_idx\` ON \`event\` (\`seq\`);`)
-      yield* tx.run(`CREATE INDEX \`event_message_id_idx\` ON \`event\` (json_extract("data", '$.messageID'));`)
+      // `event_seq_idx (seq)` never served a query (every read leads with aggregate_id),
+      // so it is replaced by the composite message index below.
+      yield* tx.run(`DROP INDEX IF EXISTS \`event_seq_idx\`;`)
+      yield* tx.run(`DROP INDEX IF EXISTS \`event_message_id_idx\`;`)
       yield* tx.run(
-        `CREATE INDEX \`session_project_time_updated_idx\` ON \`session\` (\`project_id\`,\`time_updated\`,\`id\`);`,
+        `CREATE INDEX IF NOT EXISTS \`event_message_id_idx\` ON \`event\` (\`aggregate_id\`,json_extract("data", '$.messageID'));`,
       )
-      yield* tx.run(`CREATE INDEX \`session_time_updated_idx\` ON \`session\` (\`time_updated\`,\`id\`);`)
       yield* tx.run(
-        `CREATE INDEX \`session_directory_time_updated_idx\` ON \`session\` (\`directory\`,\`time_updated\`,\`id\`);`,
+        `CREATE INDEX IF NOT EXISTS \`session_project_time_updated_idx\` ON \`session\` (\`project_id\`,\`time_updated\`,\`id\`);`,
+      )
+      yield* tx.run(`CREATE INDEX IF NOT EXISTS \`session_time_updated_idx\` ON \`session\` (\`time_updated\`,\`id\`);`)
+      yield* tx.run(
+        `CREATE INDEX IF NOT EXISTS \`session_directory_time_updated_idx\` ON \`session\` (\`directory\`,\`time_updated\`,\`id\`);`,
       )
     })
   },

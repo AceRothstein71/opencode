@@ -12,7 +12,7 @@ import { EventSequenceTable, EventTable } from "@opencode-ai/core/event/sql"
 import { Location } from "@opencode-ai/core/location"
 import { AbsolutePath } from "@opencode-ai/core/schema"
 import { WorkspaceV2 } from "@opencode-ai/core/workspace"
-import { eq } from "drizzle-orm"
+import { asc, eq } from "drizzle-orm"
 import { location } from "./fixture/location"
 import { testEffect } from "./lib/effect"
 
@@ -764,6 +764,7 @@ describe("EventV2", () => {
         .select()
         .from(EventTable)
         .where(eq(EventTable.aggregate_id, aggregateID))
+        .orderBy(asc(EventTable.seq))
         .all()
         .pipe(Effect.orDie)
 
@@ -912,6 +913,7 @@ describe("EventV2", () => {
         .select()
         .from(EventTable)
         .where(eq(EventTable.aggregate_id, aggregateID))
+        .orderBy(asc(EventTable.seq))
         .all()
         .pipe(Effect.orDie)
       const sequence = yield* db
@@ -1235,6 +1237,31 @@ describe("EventV2", () => {
 
       expect(result.events.map((event) => event.data)).toEqual([{ id: aggregateID, text: "good" }])
       expect(result.hasMore).toBe(false)
+    }),
+  )
+
+  it.effect("fails a strict aggregate read on rows the manifest cannot decode", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const { db } = yield* Database.Service
+      const Row = EventV2.define({
+        type: "test.row",
+        durable: { version: 1, aggregate: "id" },
+        schema: { id: Schema.String, text: Schema.String },
+      })
+      const manifest = { definitions: Event.durable([Row]), schema: Row }
+      const aggregateID = EventV2.ID.create()
+      const corrupt = yield* events.publish(Row, { id: aggregateID, text: "corrupt" })
+      yield* db
+        .update(EventTable)
+        .set({ data: { id: aggregateID, text: 7 } })
+        .where(eq(EventTable.id, corrupt.id))
+        .run()
+        .pipe(Effect.orDie)
+
+      const exit = yield* EventV2.readAggregate(db, { aggregateID, limit: 10, manifest, strict: true }).pipe(Effect.exit)
+
+      expect(Exit.isFailure(exit)).toBe(true)
     }),
   )
 

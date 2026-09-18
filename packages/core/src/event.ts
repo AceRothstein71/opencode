@@ -1,6 +1,6 @@
 export * as EventV2 from "./event"
 
-import { Cause, Context, Effect, Layer, Option, PubSub, Queue, Schedule, Schema, Stream } from "effect"
+import { Cause, Context, Deferred, Effect, Layer, Option, PubSub, Queue, Schedule, Schema, Stream } from "effect"
 import { Event } from "@opencode-ai/schema/event"
 import type { Data, Definition, Payload } from "@opencode-ai/schema/event"
 import { and, asc, eq, gt, inArray } from "drizzle-orm"
@@ -29,8 +29,32 @@ const DURABLE_READ_LIMIT = 512
 /** Bounded retries for a lock-contention (`SQLITE_BUSY`/`SQLITE_LOCKED`) write transaction. */
 const DURABLE_BUSY_RETRIES = 3
 
+// Drizzle-decoded rows and `Schema.encodeUnknownSync` can serialize the same value with
+// different object key order, which would make a `JSON.stringify`-based digest diverge
+// spuriously. Sort keys recursively so the digest depends on the value, not the encoder.
+const canonicalize = (value: unknown): unknown => {
+  if (Array.isArray(value)) return value.map(canonicalize)
+  if (value === null || typeof value !== "object") return value
+  return Object.keys(value as Record<string, unknown>)
+    .toSorted()
+    .reduce<Record<string, unknown>>((out, key) => {
+      const entry = (value as Record<string, unknown>)[key]
+      if (entry !== undefined) out[key] = canonicalize(entry)
+      return out
+    }, {})
+}
+
 /** Stable content digest used to keep tombstoned diff rows replay-idempotent without weakening divergence checks. */
 export const eventDigest = (data: unknown) =>
+  createHash("sha256")
+    .update(JSON.stringify(canonicalize(data)) ?? "")
+    .digest("hex")
+
+/**
+ * Digest of the raw serialization order, accepted only when reading a stored tombstone.
+ * Rows written before `eventDigest` canonicalized keys must still replay idempotently.
+ */
+const legacyEventDigest = (data: unknown) =>
   createHash("sha256")
     .update(JSON.stringify(data) ?? "")
     .digest("hex")
@@ -141,6 +165,11 @@ export const readAggregate = Effect.fn("EventV2.readAggregate")(function* <A>(
       readonly definitions: ReadonlyMap<string, Definition>
       readonly schema: Schema.Decoder<A, never>
     }
+    /**
+     * Authoritative replay opts in: an undecodable row becomes a defect instead of a
+     * silent skip. The default stays lenient for forward/backward build compatibility.
+     */
+    readonly strict?: boolean
   },
 ) {
   const after = input.after ?? -1
@@ -159,20 +188,23 @@ export const readAggregate = Effect.fn("EventV2.readAggregate")(function* <A>(
     .all()
     .pipe(Effect.orDie)
   const page = rows.slice(0, input.limit)
-  const decode = Schema.decodeUnknownOption(input.manifest.schema)
-  const events = page.flatMap((event) => {
-    const decoded = decode({
-      id: event.id,
-      type: input.manifest.definitions.get(event.type)?.type ?? event.type,
-      durable: {
-        aggregateID: event.aggregate_id,
-        seq: event.seq,
-        version: input.manifest.definitions.get(event.type)?.durable?.version,
-      },
-      data: event.data,
-    })
-    return Option.isSome(decoded) ? [decoded.value] : []
+  const payload = (event: (typeof rows)[number]) => ({
+    id: event.id,
+    type: input.manifest.definitions.get(event.type)?.type ?? event.type,
+    durable: {
+      aggregateID: event.aggregate_id,
+      seq: event.seq,
+      version: input.manifest.definitions.get(event.type)?.durable?.version,
+    },
+    data: event.data,
   })
+  const decode = Schema.decodeUnknownOption(input.manifest.schema)
+  const events = input.strict
+    ? page.map((event) => Schema.decodeUnknownSync(input.manifest.schema)(payload(event)))
+    : page.flatMap((event) => {
+        const decoded = decode(payload(event))
+        return Option.isSome(decoded) ? [decoded.value] : []
+      })
   const skipped = page.length - events.length
   if (skipped > 0)
     yield* Effect.logWarning("EventV2.readAggregate skipped undecodable events", {
@@ -251,13 +283,20 @@ export interface LayerOptions {
   readonly beforeAggregateRead?: (aggregateID: string) => Effect.Effect<void>
 }
 
+// A durable wake coalesces payloads through a sliding(1) pubsub, so a terminal removal
+// can be evicted by a later signal. The Deferred carries termination independently.
+type DurableWake = {
+  readonly wake: PubSub.PubSub<Payload | null>
+  readonly removed: Deferred.Deferred<void>
+}
+
 export const layerWith = (options?: LayerOptions) =>
   Layer.effect(
     Service,
     Effect.gen(function* () {
       const pubsub = {
         all: yield* PubSub.sliding<Payload>(EVENT_PUBSUB_CAPACITY),
-        durable: new Map<string, Set<PubSub.PubSub<Payload | null>>>(),
+        durable: new Map<string, Set<DurableWake>>(),
         typed: new Map<string, PubSub.PubSub<Payload>>(),
       }
       const projectors = new Map<string, Subscriber[]>()
@@ -279,7 +318,7 @@ export const layerWith = (options?: LayerOptions) =>
           yield* PubSub.shutdown(pubsub.all)
           yield* Effect.forEach(
             pubsub.durable.values(),
-            (pubsubs) => Effect.forEach(pubsubs, PubSub.shutdown, { discard: true }),
+            (wakes) => Effect.forEach(wakes, (wake) => PubSub.shutdown(wake.wake), { discard: true }),
             { discard: true },
           )
           yield* Effect.forEach(pubsub.typed.values(), PubSub.shutdown, { discard: true })
@@ -354,7 +393,9 @@ export const layerWith = (options?: LayerOptions) =>
                               stored?.id === event.id &&
                               stored.type === versionedType(definition.type, durable.version) &&
                               (isDeepStrictEqual(stored.data, encoded) ||
-                                (stored.tombstone_digest != null && stored.tombstone_digest === eventDigest(encoded)))
+                                (stored.tombstone_digest != null &&
+                                  (stored.tombstone_digest === eventDigest(encoded) ||
+                                    stored.tombstone_digest === legacyEventDigest(encoded))))
                             ) {
                               if (input.ownerID && row?.ownerID == null) {
                                 yield* db
@@ -443,7 +484,9 @@ export const layerWith = (options?: LayerOptions) =>
                         ...event,
                         durable: { aggregateID: committed.aggregateID, seq: committed.seq, version: durable.version },
                       } as Payload
-                      yield* Effect.forEach(wakes, (wake) => PubSub.publish(wake, wakePayload), { discard: true })
+                      yield* Effect.forEach(wakes, (wake) => PubSub.publish(wake.wake, wakePayload), {
+                        discard: true,
+                      })
                     }
                   }
                   return committed
@@ -641,9 +684,15 @@ export const layerWith = (options?: LayerOptions) =>
               { behavior: "immediate" },
             )
             .pipe(retryDurableWrite("event.remove"), Effect.orDie)
-          // Terminal null marker ends durable streams against a deleted log.
+          // Terminal null marker ends durable streams against a deleted log; the Deferred
+          // guarantees termination even when the sliding(1) wake evicts the null.
           const wakes = pubsub.durable.get(aggregateID)
-          if (wakes) yield* Effect.forEach(wakes, (wake) => PubSub.publish(wake, null), { discard: true })
+          if (wakes)
+            yield* Effect.forEach(
+              wakes,
+              (wake) => PubSub.publish(wake.wake, null).pipe(Effect.andThen(Deferred.succeed(wake.removed, undefined))),
+              { discard: true },
+            )
         })
       }
 
@@ -703,71 +752,72 @@ export const layerWith = (options?: LayerOptions) =>
           })),
         )
 
-      const readAllAfter = (
-        aggregateID: string,
-        after: number,
-      ): Effect.Effect<{ events: Payload[]; lastSeq: number }> =>
-        Effect.gen(function* () {
-          const events: Payload[] = []
-          let cursor = after
-          while (true) {
-            const page = yield* readPage(aggregateID, cursor)
-            events.push(...page.events)
-            if (!page.full || page.lastSeq === undefined) return { events, lastSeq: page.lastSeq ?? cursor }
-            cursor = page.lastSeq
-          }
-        })
-
       const subscribeDurable = (aggregateID: string) =>
         Effect.gen(function* () {
           const wake = yield* PubSub.sliding<Payload | null>(1)
+          const removed = yield* Deferred.make<void>()
+          const handle: DurableWake = { wake, removed }
           const subscription = yield* PubSub.subscribe(wake)
           yield* Effect.acquireRelease(
             Effect.sync(() => {
               const wakes = pubsub.durable.get(aggregateID) ?? new Set()
-              wakes.add(wake)
+              wakes.add(handle)
               pubsub.durable.set(aggregateID, wakes)
             }),
             () =>
               Effect.sync(() => {
                 const wakes = pubsub.durable.get(aggregateID)
-                wakes?.delete(wake)
+                wakes?.delete(handle)
                 if (wakes?.size === 0) pubsub.durable.delete(aggregateID)
               }).pipe(Effect.andThen(PubSub.shutdown(wake))),
           )
-          return subscription
+          return { subscription, removed }
         })
 
       const durable = (input: { readonly aggregateID: string; readonly after?: number }): Stream.Stream<Payload> =>
         Stream.unwrap(
           Effect.gen(function* () {
-            const wakes = yield* subscribeDurable(input.aggregateID)
+            const handle = yield* subscribeDurable(input.aggregateID)
             let sequence = input.after ?? -1
-            const read = Effect.suspend(() => readAllAfter(input.aggregateID, sequence)).pipe(
-              Effect.tap((page) =>
-                Effect.sync(() => {
-                  sequence = page.lastSeq
-                }),
-              ),
-              Effect.map((page) => page.events),
-            )
-            const historical = yield* read
-            const live = Stream.fromSubscription(wakes).pipe(
+            // Pages the aggregate tail lazily; `sequence` advances as each page is consumed so
+            // the live phase resumes at the drained tail without materializing the whole log.
+            const readForward = (after: number): Stream.Stream<Payload> =>
+              Stream.paginate<number, Payload>(after, (cursor) =>
+                readPage(input.aggregateID, cursor).pipe(
+                  Effect.tap((page) =>
+                    Effect.sync(() => {
+                      if (page.lastSeq !== undefined) sequence = page.lastSeq
+                    }),
+                  ),
+                  Effect.map(
+                    (page) =>
+                      [
+                        page.events,
+                        page.full && page.lastSeq !== undefined ? Option.some(page.lastSeq) : Option.none(),
+                      ] as const,
+                  ),
+                ),
+              )
+            const live = Stream.fromSubscription(handle.subscription).pipe(
               Stream.takeWhile((signal) => signal !== null),
-              // Direct payload on seq+1; a coalesced gap falls back to an authoritative read.
-              Stream.mapEffect((signal) => {
-                if (signal === null) return Effect.succeed<Payload[]>([])
+              // Direct payload on seq+1; a coalesced gap falls back to an authoritative page read.
+              Stream.flatMap((signal): Stream.Stream<Payload> => {
+                if (signal === null) return Stream.empty
                 const seq = signal.durable?.seq
-                if (seq !== undefined && seq <= sequence) return Effect.succeed<Payload[]>([])
-                if (seq !== undefined && seq === sequence + 1) {
-                  sequence = seq
-                  return Effect.succeed([signal])
-                }
-                return read
+                if (seq !== undefined && seq <= sequence) return Stream.empty
+                if (seq !== undefined && seq === sequence + 1)
+                  return Stream.fromEffect(
+                    Effect.sync(() => {
+                      sequence = seq
+                      return signal
+                    }),
+                  )
+                return readForward(sequence)
               }),
-              Stream.flattenIterable,
             )
-            return Stream.concat(Stream.fromIterable(historical), live)
+            return Stream.concat(readForward(sequence), live).pipe(
+              Stream.interruptWhen(Deferred.await(handle.removed)),
+            )
           }),
         )
 

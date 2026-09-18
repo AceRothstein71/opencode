@@ -406,6 +406,9 @@ export function update(adapter: Adapter, event: SessionEvent.Event): Effect.Effe
 export function update<K extends keyof Cases>(adapter: Adapter, event: Cases[K]["Type"]): Effect.Effect<void> {
   // The table is exhaustive over the same tags, so the indexed handler always matches
   // the narrowed event; TS cannot correlate the two indexed accesses without this view.
+  // `hasOwn` keeps a prototype key (`__proto__`/`constructor`) from resolving to a
+  // non-handler value and being called as one.
+  if (!Object.hasOwn(handlers, event.type)) return Effect.die(`Unknown session event handler: ${event.type}`)
   const handler = handlers[event.type] as Handlers[K]
   return handler(adapter, event)
 }

@@ -288,10 +288,10 @@ export const make = Effect.gen(function* () {
         resume(Effect.succeed([proc, signal]))
       })
       return Effect.suspend(() => {
-        proc.kill("SIGTERM")
+        tryKill(proc, "SIGTERM")
         return Effect.timeoutOrElse(Deferred.await(signal), {
           duration: command.options.forceKillAfter ?? DEFAULT_FORCE_KILL_AFTER,
-          orElse: () => Effect.sync(() => void proc.kill("SIGKILL")),
+          orElse: () => Effect.sync(() => void tryKill(proc, "SIGKILL")),
         }).pipe(Effect.asVoid)
       })
     })
@@ -318,6 +318,16 @@ export const make = Effect.gen(function* () {
     })
   }
 
+  // `ChildProcess.kill` throws `ESRCH` when the child already exited; a teardown path
+  // must not let that defect escape scope exit, so a failed signal is a `false` result.
+  const tryKill = (proc: NodeChildProcess.ChildProcess, signal: NodeJS.Signals) => {
+    try {
+      return proc.kill(signal)
+    } catch {
+      return false
+    }
+  }
+
   const killOne = (
     command: ChildProcess.StandardCommand,
     proc: NodeChildProcess.ChildProcess,
@@ -325,7 +335,7 @@ export const make = Effect.gen(function* () {
     exited: Effect.Effect<boolean>,
   ) =>
     Effect.suspend(() => {
-      if (proc.kill(signal)) return Effect.void
+      if (tryKill(proc, signal)) return Effect.void
       return exited.pipe(
         Effect.flatMap((done) =>
           done ? Effect.void : Effect.fail(toPlatformError("kill", new Error("Failed to kill child process"), command)),

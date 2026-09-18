@@ -1,6 +1,6 @@
 export * as SessionProjector from "./projector"
 
-import { and, desc, eq, gt, inArray, or, sql } from "drizzle-orm"
+import { and, asc, desc, eq, gt, inArray, or, sql } from "drizzle-orm"
 import { DateTime, Effect, Layer, Schema } from "effect"
 import { Database } from "../database/database"
 import { EventV2, versionedType } from "../event"
@@ -156,11 +156,16 @@ function run(db: DatabaseService, event: SessionEvent.Event) {
       getCurrentAssistant() {
         return Effect.gen(function* () {
           // A newer turn supersedes stale incomplete rows; never resume an older assistant projection.
+          // The incomplete filter runs in SQL so a completed row is never decoded (F-072 sibling).
           const row = yield* db
             .select()
             .from(SessionMessageTable)
             .where(
-              and(eq(SessionMessageTable.session_id, event.data.sessionID), eq(SessionMessageTable.type, "assistant")),
+              and(
+                eq(SessionMessageTable.session_id, event.data.sessionID),
+                eq(SessionMessageTable.type, "assistant"),
+                sql`json_extract(${SessionMessageTable.data}, '$.time.completed') is null`,
+              ),
             )
             .orderBy(desc(SessionMessageTable.seq))
             .limit(1)
@@ -254,20 +259,27 @@ function diffEventScope(sessionID: string, messageID: string) {
 // Shrinks superseded diff payloads to tombstones. Rows stay so per-aggregate seqs
 // remain contiguous for sync replay; the original payload digest is retained on the row so
 // replaying a pre-tombstone payload still matches instead of dying "Replay diverged".
+// Retention is deliberate and unbounded: there is no TTL/GC, because deleting a tombstone
+// would make a later replay of the original payload fail the digest check. The cost is
+// storage plus empty `{diffs:[]}` rows on history/replay, traded for replay idempotency.
 const TOMBSTONE_BATCH_SIZE = 200
 
 function tombstoneDiffEvents(db: DatabaseService, sessionID: string, messageID: string) {
   return Effect.gen(function* () {
-    const rows = yield* db
-      .select({ id: EventTable.id, data: EventTable.data })
-      .from(EventTable)
-      .where(diffEventScope(sessionID, messageID))
-      .all()
-      .pipe(Effect.orDie)
-    for (let start = 0; start < rows.length; start += TOMBSTONE_BATCH_SIZE) {
-      const batch = rows.slice(start, start + TOMBSTONE_BATCH_SIZE)
+    // Page the select so a long diff history is never fully materialized. Updated rows
+    // leave the scope (their diffs array is empty), so each page strictly shrinks the set.
+    while (true) {
+      const rows = yield* db
+        .select({ id: EventTable.id, data: EventTable.data })
+        .from(EventTable)
+        .where(diffEventScope(sessionID, messageID))
+        .orderBy(asc(EventTable.seq))
+        .limit(TOMBSTONE_BATCH_SIZE)
+        .all()
+        .pipe(Effect.orDie)
+      if (rows.length === 0) return
       const digest = sql`case ${sql.join(
-        batch.map((row) => sql`when ${EventTable.id} = ${row.id} then ${EventV2.eventDigest(row.data)}`),
+        rows.map((row) => sql`when ${EventTable.id} = ${row.id} then ${EventV2.eventDigest(row.data)}`),
         sql` `,
       )} end`
       yield* db
@@ -276,11 +288,12 @@ function tombstoneDiffEvents(db: DatabaseService, sessionID: string, messageID: 
         .where(
           inArray(
             EventTable.id,
-            batch.map((row) => row.id),
+            rows.map((row) => row.id),
           ),
         )
         .run()
         .pipe(Effect.orDie)
+      if (rows.length < TOMBSTONE_BATCH_SIZE) return
     }
   })
 }
@@ -452,9 +465,16 @@ const layer = Layer.effectDiscard(
         const data = partData(event.data.part)
         // usage() only ever returns a value for step-finish, and a part's type is immutable, so
         // only a step-finish update can carry a previous usage to reverse (F-026).
+        // Scope the reversal row to this session so a mismatched part can never decrement
+        // usage against a different session's totals.
         const previousRow =
           event.data.part.type === "step-finish"
-            ? yield* db.select().from(PartTable).where(eq(PartTable.id, id)).get().pipe(Effect.orDie)
+            ? yield* db
+                .select()
+                .from(PartTable)
+                .where(and(eq(PartTable.id, id), eq(PartTable.session_id, sessionID)))
+                .get()
+                .pipe(Effect.orDie)
             : undefined
         yield* db
           .insert(PartTable)
