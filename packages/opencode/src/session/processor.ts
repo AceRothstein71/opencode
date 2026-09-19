@@ -24,7 +24,8 @@ import { errorMessage } from "@/util/error"
 import { isRecord } from "@/util/record"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Database } from "@opencode-ai/core/database/database"
-import { Usage, type LLMEvent } from "@opencode-ai/llm"
+import { Usage, isStaleReasoningFailure, type LLMEvent } from "@opencode-ai/llm"
+import { SessionStaleReasoning } from "./stale-reasoning"
 
 const DOOM_LOOP_THRESHOLD = 3
 // Bounded tail of the newest *tool* parts to test for consecutive repeats (F-104). Counting
@@ -93,6 +94,7 @@ interface ProcessorContext extends Input {
   abandonedReasoning: Record<string, SessionV1.ReasoningPart["id"]>
   reasoningMap: Record<string, SessionV1.ReasoningPart>
   lastToolFingerprint?: string
+  recoveredStaleReasoning: boolean
 }
 
 type StreamEvent = LLMEvent
@@ -138,6 +140,7 @@ const layer = Layer.effect(
         abandonedReasoning: {},
         reasoningMap: {},
         pendingToolUpdates: new Map(),
+        recoveredStaleReasoning: false,
       }
       let aborted = false
       // A retry re-issues the whole provider request from the original snapshot and
@@ -802,6 +805,29 @@ const layer = Layer.effect(
         yield* status.set(ctx.sessionID, { type: "idle" })
       })
 
+      const outputStarted = () =>
+        ctx.currentText !== undefined || Object.keys(ctx.reasoningMap).length > 0 || Object.keys(ctx.toolcalls).length > 0
+
+      // Strip rejected caller-bound reasoning from request and persisted parts, then replay once.
+      const recoverStaleReasoning = Effect.fn("SessionProcessor.recoverStaleReasoning")(function* (
+        streamInput: LLM.StreamInput,
+      ) {
+        SessionStaleReasoning.stripRequest(streamInput.messages)
+        yield* SessionStaleReasoning.persist(session, ctx.sessionID)
+        yield* Effect.logInfo("recovered stale encrypted reasoning", {
+          "session.id": ctx.sessionID,
+          messageID: ctx.assistantMessage.id,
+        })
+        ctx.currentText = undefined
+        ctx.reasoningMap = {}
+        yield* status.set(ctx.sessionID, { type: "busy" })
+        yield* llm.stream(streamInput).pipe(
+          Stream.tap((event) => handleEvent(event)),
+          Stream.takeUntil(() => ctx.needsCompaction),
+          Stream.runDrain,
+        )
+      })
+
       // cleanup only runs after the last attempt, so a retry must finalize the aborted
       // attempt's in-flight parts, buffers and tool calls or they are orphaned (F-023).
       const finalizeRetryInflight = Effect.fn("SessionProcessor.finalizeRetryInflight")(function* () {
@@ -872,6 +898,14 @@ const layer = Layer.effect(
               }),
               while: () => !toolExecuted,
             }),
+            Effect.catchIf(
+              (error) => !ctx.recoveredStaleReasoning && !outputStarted() && isStaleReasoningFailure(error),
+              () =>
+                Effect.gen(function* () {
+                  ctx.recoveredStaleReasoning = true
+                  yield* recoverStaleReasoning(streamInput)
+                }).pipe(Effect.catch(halt)),
+            ),
             Effect.catch(halt),
             Effect.ensuring(cleanup()),
           )
