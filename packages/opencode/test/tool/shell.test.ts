@@ -3144,3 +3144,257 @@ describe("tool.shell wave N classification", () => {
     120_000,
   )
 })
+
+describe("tool.shell wave O classification", () => {
+  if (process.platform === "win32") return
+
+  const requests = (command: string, directory: string, stop: boolean) =>
+    Effect.gen(function* () {
+      const list: Array<Omit<PermissionV1.Request, "id" | "sessionID" | "tool">> = []
+      if (stop) {
+        yield* runIn(directory, fail({ command }, capture(list, new Error("stop after permission"))))
+      } else {
+        yield* runIn(directory, run({ command }, capture(list)))
+      }
+      return list
+    })
+
+  const expectExternal = (command: string, directory: string, stop = true) =>
+    Effect.gen(function* () {
+      const list = yield* requests(command, directory, stop)
+      expect({ command, external: list.some((item) => item.permission === "external_directory") }).toEqual({
+        command,
+        external: true,
+      })
+    })
+
+  const expectCleanStopped = (command: string, directory: string) =>
+    Effect.gen(function* () {
+      const list: Array<Omit<PermissionV1.Request, "id" | "sessionID" | "tool">> = []
+      yield* runIn(directory, run({ command }, capture(list, new Error("stop after permission"))).pipe(Effect.exit))
+      expect({ command, external: list.some((item) => item.permission === "external_directory") }).toEqual({
+        command,
+        external: false,
+      })
+    })
+
+  const expectNotAbsorbed = (rule: string, command: string, directory: string) =>
+    Effect.gen(function* () {
+      const list = yield* requests(command, directory, true)
+      const approved = [{ permission: "bash", pattern: rule }]
+      const uncovered = list.filter(
+        (req) =>
+          !req.patterns.every((pattern) =>
+            approved.some(
+              (item) =>
+                Wildcard.matchStrict(req.permission, item.permission) && Wildcard.matchStrict(pattern, item.pattern),
+            ),
+          ),
+      )
+      expect({
+        rule,
+        command,
+        external: uncovered.some((item) => item.permission === "external_directory"),
+      }).toEqual({ rule, command, external: true })
+    })
+
+  const expectNoAlways = (command: string, directory: string) =>
+    Effect.gen(function* () {
+      const list = yield* requests(command, directory, false)
+      const bash = list.find((item) => item.permission === "bash")
+      expect({
+        command,
+        external: list.some((item) => item.permission === "external_directory"),
+        always: bash?.always ?? [],
+      }).toEqual({ command, external: true, always: [] })
+    })
+
+  it.live(
+    "fails closed on an eval script whose commands are all dynamic-named or unresolvable",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        yield* Effect.promise(() => Bun.write(path.join(tmp, "notes.txt"), "x"))
+        for (const command of [
+          'bash -c "$UNSET_V18 cat /etc/hostname"',
+          'sh -c "$UNSET_V18 cat /etc/hostname"',
+          'eval "$UNSET_V18 cat /etc/hostname"',
+          'bash -c "${UNSET_V18} cat /etc/hostname"',
+          'bash -c "$UNSET_V18cat /etc/hostname"',
+          'bash -c "${X:-cat /etc/hostname}"',
+          'eval "${X:-cat /etc/hostname}"',
+          'sh -c "${X:=cat /etc/hostname}"',
+          'bash -c "${X-cat /etc/hostname}"',
+          'C="${X:-cat /etc/hostname}"; bash -c "$C"',
+        ]) {
+          yield* expectExternal(command, tmp)
+        }
+        yield* expectNoAlways('bash -c "$UNSET_V18 cat /etc/hostname"', tmp)
+        for (const command of ['bash -c "${X:-cat notes.txt}"', 'sh -c "${X:-echo hi}"']) {
+          yield* expectCleanStopped(command, tmp)
+        }
+      }),
+    120_000,
+  )
+
+  it.live(
+    "scopes an eval script's re-parsed program text with its own assignments",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        for (const command of [
+          "C='x=/etc/hostname; cat $x'; bash -c \"$C\"",
+          "C='x=/etc/hostname; cat ${x}'; bash -c \"$C\"",
+          "C='x=/etc/hostname; cat $x'; sh -c \"$C\"",
+          "C='x=/etc/hostname; cat $x'; eval \"$C\"",
+          "C='x=/etc; cat $x/hostname'; bash -c \"$C\"",
+          "C='for f in /etc/hostname; do cat $f; done'; bash -c \"$C\"",
+          "C='x=/etc/hostname; cat $x'; bash -c \"$C\" ; true",
+        ]) {
+          yield* expectExternal(command, tmp)
+        }
+        yield* expectNoAlways("C='x=/etc/hostname; cat $x'; bash -c \"$C\"", tmp)
+        for (const command of [
+          "C='x=notes.txt; cat $x'; bash -c \"$C\"",
+          "C='x=notes.txt; cat $x'; sh -c \"$C\"",
+        ]) {
+          yield* expectCleanStopped(command, tmp)
+        }
+      }),
+    120_000,
+  )
+
+  it.live(
+    "finds the remote subcommand past a global option whose value is a subcommand word",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        for (const command of [
+          "docker --tlscacert ps cp /etc/hostname cid:/x",
+          "docker --tlscert logs cp /etc/hostname cid:/x",
+          "docker --tlskey info cp /etc/hostname cid:/x",
+          "docker --tlsverify ps cp /etc/hostname cid:/x",
+          "podman --connection version cp /etc/hostname cid:/x",
+          "podman --cgroup-manager ps cp /etc/hostname cid:/x",
+          "podman --tmpdir ps load -i /etc/hostname",
+          "kubectl --insecure-skip-tls-verify get cp /etc/passwd pod:/x",
+          "docker --tlscacert ps build /etc/ssl",
+          "docker --tlscacert ps context import x /etc/hostname",
+          "docker --tlscacert ps play kube /etc/hostname",
+          "podman --connection ps kube play /etc/hostname",
+          "docker --tlscacert ps -- cp /etc/hostname cid:/x",
+          "docker --tlscacert ps cp cid:/x /etc/v18out",
+        ]) {
+          yield* expectExternal(command, tmp)
+        }
+        yield* expectNotAbsorbed("docker --tlscacert *", "docker --tlscacert ps cp /etc/hostname cid:/x", tmp)
+        yield* expectNotAbsorbed("docker --tlskey *", "docker --tlskey info cp /etc/hostname cid:/x", tmp)
+        yield* expectNotAbsorbed("podman --connection *", "podman --connection version cp /etc/hostname cid:/x", tmp)
+        for (const command of [
+          "docker --tlscacert /tmp/ca.pem cp /etc/hostname cid:/x",
+          "docker --config ps cp /etc/hostname cid:/x",
+          "docker --unknown-flag-xyz cp /etc/hostname cid:/x",
+        ]) {
+          yield* expectExternal(command, tmp)
+        }
+        for (const command of [
+          "docker --log-level debug ps",
+          "kubectl -n default get pods",
+          "docker --context default ps",
+          "docker --config ~/.docker ps",
+          "docker --tlsverify ps",
+          "docker run --rm alpine cat /etc/hostname",
+        ]) {
+          yield* expectCleanStopped(command, tmp)
+        }
+      }),
+    120_000,
+  )
+
+  it.live(
+    "strips quotes before inspecting an attached option value",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        yield* Effect.promise(() => Bun.write(path.join(tmp, "notes.txt"), "x"))
+        for (const command of [
+          'gcc "-I/etc" -c main.c',
+          "gcc '-include/etc' -E main.c",
+          'gcc "-Wl,/etc/hostname" -o /dev/null main.c',
+          'zzz "-X=/etc"',
+          "zzz '-Wl,/etc/hostname'",
+        ]) {
+          yield* expectExternal(command, tmp)
+        }
+        for (const command of [
+          'gcc "-Iinclude" -o out main.c',
+          'zzz "-Dfoo=bar/baz"',
+          "gawk \"-F/\" 'BEGIN{}' notes.txt",
+        ]) {
+          yield* expectCleanStopped(command, tmp)
+        }
+      }),
+    120_000,
+  )
+
+  it.live(
+    "resolves the alternate ${VAR:+word} expansion",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        for (const command of [
+          "O=notes.txt; cat ${O:+/etc/hostname}",
+          "O=1; cat ${O:+/etc/hostname}",
+          'O=notes.txt; bash -c "${O:+cat /etc/hostname}"',
+        ]) {
+          yield* expectExternal(command, tmp)
+        }
+        for (const command of ["O=notes.txt; cat ${O:+notes.txt}", "cat ${O:+notes.txt}"]) {
+          yield* expectCleanStopped(command, tmp)
+        }
+      }),
+    120_000,
+  )
+
+  it.live(
+    "scans the attached docker --config= value",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        yield* Effect.promise(() => Bun.write(path.join(tmp, "notes.txt"), "x"))
+        yield* expectExternal("docker --config=/etc/hostname ps", tmp)
+        yield* expectNoAlways("docker --config=/etc/hostname ps", tmp)
+        yield* expectNotAbsorbed("docker --config=/etc/hostname *", "docker --config=/etc/hostname ps", tmp)
+        for (const command of [
+          "docker --config notes.txt ps",
+          "docker --config=notes.txt ps",
+          "docker --config ~/.docker ps",
+        ]) {
+          yield* expectCleanStopped(command, tmp)
+        }
+      }),
+    120_000,
+  )
+
+  it.live(
+    "classifies a function body with the fully-merged scope",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        for (const command of [
+          "f(){ cat $x; }; x=/etc/hostname; f",
+          "bash -c 'f(){ cat $x; }; x=/etc/hostname; f'",
+          "sh -c \"$(echo 'f(){ cat $x; }; x=/etc/hostname; f')\"",
+        ]) {
+          yield* expectExternal(command, tmp)
+        }
+        for (const command of [
+          "bash -c 'f(){ cat notes.txt; }; f'",
+          "bash -c 'f(){ cat $x; }; x=notes.txt; f'",
+        ]) {
+          yield* expectCleanStopped(command, tmp)
+        }
+      }),
+    120_000,
+  )
+})
