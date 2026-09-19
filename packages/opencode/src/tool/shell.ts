@@ -625,9 +625,16 @@ function expand(text: string, cwd: string, shell: string, vars?: Map<string, str
       )
       // One assignment can name another (`A=$B`), so resolve transitively.
       .replace(/\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?/g, (whole, name: string) => vars?.get(name) ?? whole)
-  let unquoted = substitute(unquote(text))
+  // A self-referential assignment multiplies its text on every pass (`A='$A$A…'; cat $A`),
+  // so the pass cap alone leaves the working string unbounded — eight references allocate
+  // 256 MB and twelve exhaust memory. Bound the working text and mark the result with the
+  // unresolved sentinel so `argPath` anchors the scan at the filesystem root and fails
+  // closed instead of allocating an unbounded string.
+  const limit = 1 << 16
+  const bounded = (value: string) => (value.length > limit ? UNRESOLVED + value.slice(0, limit) : value)
+  let unquoted = bounded(substitute(unquote(text)))
   for (let pass = 0; pass < 8; pass++) {
-    const next = substitute(unquoted)
+    const next = bounded(substitute(unquoted))
     if (next === unquoted) break
     unquoted = next
   }
@@ -1231,6 +1238,14 @@ function stripKeyPrefix(value: string) {
   return match ? match[1] : value
 }
 
+// An attached option value names a local file only when it is absolute, home-relative,
+// variable-driven or climbs out of the worktree (`/etc/x`, `~/.x`, `$D/x`, `../x`). A
+// config word (`debug`, `default`) or a runtime URL (`tcp://…`) names no local file and
+// must stay quiet.
+function looksPathLike(value: string) {
+  return value.startsWith("/") || value.startsWith("~") || value.includes("$") || /(^|[\\/])\.\.([\\/]|$)/.test(value)
+}
+
 // A `-v`/`--volume` value is `local[:container[:opts]]`; a `--mount` value is a
 // comma-separated pair list where `source`/`src` is the host path.
 function mountLocal(value: string) {
@@ -1262,7 +1277,10 @@ function remotePaths(name: string, command: Part[]) {
     out.push(...(volume ? mountLocal(value) : [stripKeyPrefix(value)]))
   }
   while (index < args.length) {
-    const text = args[index].text
+    // Quotes hide an option from the `startsWith("--")` tests below (`docker "--tlscacert"
+    // ps cp …`), which drops the option and its value from the model. Inspect the token
+    // the shell actually runs.
+    const text = unquote(args[index].text)
     if (text === "--") {
       for (const item of args.slice(index + 1)) {
         positionals.push({ text: item.text, optionValue: false })
@@ -1274,11 +1292,16 @@ function remotePaths(name: string, command: Part[]) {
       const equals = text.indexOf("=")
       if (equals !== -1) {
         const key = text.slice(0, equals)
-        if (pathLong.has(key)) addValue(VOLUME_LONG.has(key), text.slice(equals + 1))
+        const value = text.slice(equals + 1)
+        if (pathLong.has(key)) addValue(VOLUME_LONG.has(key), value)
         // `docker --config=<dir>` names a local directory whose `<dir>/config.json` the
         // runtime opens. The space form is a declared residual (it would prompt on the
         // routine `--config ~/.docker`); the attached `=` form is consumed and scanned.
-        else if (key === "--config") out.push(stripKeyPrefix(text.slice(equals + 1)))
+        else if (key === "--config") out.push(stripKeyPrefix(value))
+        // An unmodelled `--opt=<value>` global option still carries a local value the
+        // runtime may open (`docker --tlscacert=/etc/hostname ps`). Scan a path-like value
+        // fail-closed; a config word attaches to no local file and stays quiet.
+        else if (plain === 0 && looksPathLike(value)) out.push(stripKeyPrefix(value))
         index++
         continue
       }
@@ -1587,6 +1610,7 @@ export const ShellTool = Tool.define(
       if (!ps && arg.includes(UNRESOLVED)) return { external: true as const }
       const text = expand(arg, cwd, shell, vars)
       if (!text) return
+      if (!ps && text.includes(UNRESOLVED)) return { external: true as const }
       if (!ps && deviceSink(text)) return
       const file = prefix(text)
       // A glob at position 0 has no literal prefix, but the shell still expands it
@@ -1712,6 +1736,11 @@ export const ShellTool = Tool.define(
             }
             const expanded = expand(text, cwd, shell, base)
             if (!expanded) return
+            if (expanded.includes(UNRESOLVED)) {
+              state.dynamic = true
+              scan.dirs.add(path.parse(cwd).root)
+              return
+            }
             const exit = yield* parse(expanded, ps).pipe(Effect.exit)
             if (Exit.isFailure(exit)) {
               state.dynamic = true
@@ -1769,7 +1798,13 @@ export const ShellTool = Tool.define(
           // filename: a payload quoted into one word must be re-parsed as a command line
           // or `sh -c "$(echo 'cat /etc/hostname')"` reads the file unscanned. A bare path
           // stays a path so `O=$(echo /etc/x); cat $O` is still scanned by the operand path.
-          if (substituted && expanded && !expanded.startsWith("-") && looksLikeCommandLine(expanded)) {
+          if (
+            substituted &&
+            expanded &&
+            !expanded.includes(UNRESOLVED) &&
+            !expanded.startsWith("-") &&
+            looksLikeCommandLine(expanded)
+          ) {
             yield* reparse(expanded, vars)
             return
           }
@@ -1823,11 +1858,15 @@ export const ShellTool = Tool.define(
           // A `${…:-word}`/`${…:+word}` default is resolved even without a known variable:
           // `expand` substitutes the word, so `bash -c "${X:-cat notes.txt}"` stays an
           // in-tree read rather than a literal script the fail-closed anchor would prompt.
-          const defaulted = /\$\{[A-Za-z_][A-Za-z0-9_]*(?::-|:=|-|\+:)/.test(info.evalScript)
+          const defaulted = /\$\{[A-Za-z_][A-Za-z0-9_]*(?::-|:=|-|:\+)/.test(info.evalScript)
           const known =
             defaulted ||
             [...info.evalScript.matchAll(/\$\{?([A-Za-z_][A-Za-z0-9_]*)/g)].some((match) => vars.has(match[1]))
           const script = known ? expand(info.evalScript, cwd, shell, vars) : info.evalScript
+          if (script.includes(UNRESOLVED)) {
+            state.dynamic = true
+            scan.dirs.add(path.parse(cwd).root)
+          }
           // A `$(...)`/backtick inside the extracted string is not data: the substitution
           // result is what the shell executes, so its content must never hit `DATA`.
           const nestedSubstituted = substituted || script.includes("$(") || script.includes("`")
@@ -1855,20 +1894,31 @@ export const ShellTool = Tool.define(
               return merged
             }
             let classified = 0
+            let rejected = false
             for (const node of nested) {
               const item = parts(node)
               // A bare `$(...)` string parses as a command named by the substitution; its
               // program is the descendant command, so skip the wrapper to avoid a false root anchor.
-              if (item.length === 0 || dynamic(unquote(item[0].text), ps)) continue
+              if (item.length === 0) continue
+              const head = unquote(item[0].text)
+              if (head.startsWith("$(") || head.startsWith("`")) continue
+              // A command name the classifier cannot resolve (`$Q cat …`) is still executed
+              // by the shell. Dropping it silently loses the program text, so remember it:
+              // the anchor below must fire even when a sibling command classifies.
+              if (dynamic(head, ps)) {
+                rejected = true
+                continue
+              }
               classified++
               const scope = scoped(inFunction(node) ? Number.MAX_SAFE_INTEGER : node.startIndex)
               const result = yield* classify(item, depth + 1, nestedSubstituted, scope)
               if (result.conservative) conservative = true
             }
-            // Every command was rejected by `dynamic()` (an unassigned `$Q` prefix, or an
-            // unresolvable `${X:-…}` default): the shell still runs that program text, so
-            // fail closed rather than drop it unscanned with no anchor.
-            if (classified === 0 && script.trim().length > 0) {
+            // Any command rejected by `dynamic()` (an unassigned `$Q` prefix, or an
+            // unresolvable `${X:-…}` default), or an entirely unclassifiable script: the
+            // shell still runs that program text, so fail closed rather than drop it
+            // unscanned with no anchor.
+            if ((classified === 0 || rejected) && script.trim().length > 0) {
               state.dynamic = true
               scan.dirs.add(path.parse(cwd).root)
             }
@@ -1894,7 +1944,7 @@ export const ShellTool = Tool.define(
         const destination = redirect.childForFieldName("destination")
         if (!destination) continue
         const text = destination.text
-        const vars = varsAt(redirect.startIndex)
+        const vars = varsAt(inFunction(redirect) ? Number.MAX_SAFE_INTEGER : redirect.startIndex)
         const resolved = yield* argPath(text, cwd, ps, shell, vars)
         yield* addPath(resolved)
         if (resolved !== undefined || ps) continue

@@ -3398,3 +3398,214 @@ describe("tool.shell wave O classification", () => {
     120_000,
   )
 })
+
+describe("tool.shell wave P classification", () => {
+  if (process.platform === "win32") return
+
+  const requests = (command: string, directory: string, stop: boolean) =>
+    Effect.gen(function* () {
+      const list: Array<Omit<PermissionV1.Request, "id" | "sessionID" | "tool">> = []
+      if (stop) {
+        yield* runIn(directory, fail({ command }, capture(list, new Error("stop after permission"))))
+      } else {
+        yield* runIn(directory, run({ command }, capture(list)))
+      }
+      return list
+    })
+
+  const expectExternal = (command: string, directory: string, stop = true) =>
+    Effect.gen(function* () {
+      const list = yield* requests(command, directory, stop)
+      expect({ command, external: list.some((item) => item.permission === "external_directory") }).toEqual({
+        command,
+        external: true,
+      })
+    })
+
+  const expectCleanStopped = (command: string, directory: string) =>
+    Effect.gen(function* () {
+      const list: Array<Omit<PermissionV1.Request, "id" | "sessionID" | "tool">> = []
+      yield* runIn(directory, run({ command }, capture(list, new Error("stop after permission"))).pipe(Effect.exit))
+      expect({ command, external: list.some((item) => item.permission === "external_directory") }).toEqual({
+        command,
+        external: false,
+      })
+    })
+
+  const expectNotAbsorbed = (rule: string, command: string, directory: string) =>
+    Effect.gen(function* () {
+      const list = yield* requests(command, directory, true)
+      const approved = [{ permission: "bash", pattern: rule }]
+      const uncovered = list.filter(
+        (req) =>
+          !req.patterns.every((pattern) =>
+            approved.some(
+              (item) =>
+                Wildcard.matchStrict(req.permission, item.permission) && Wildcard.matchStrict(pattern, item.pattern),
+            ),
+          ),
+      )
+      expect({
+        rule,
+        command,
+        external: uncovered.some((item) => item.permission === "external_directory"),
+      }).toEqual({ rule, command, external: true })
+    })
+
+  const expectNoAlways = (command: string, directory: string) =>
+    Effect.gen(function* () {
+      const list = yield* requests(command, directory, false)
+      const bash = list.find((item) => item.permission === "bash")
+      expect({
+        command,
+        external: list.some((item) => item.permission === "external_directory"),
+        always: bash?.always ?? [],
+      }).toEqual({ command, external: true, always: [] })
+    })
+
+  it.live(
+    "wave P: scopes a function-body redirect destination with the fully-merged scope",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        yield* Effect.promise(() => Bun.write(path.join(tmp, "notes.txt"), "x"))
+        for (const command of [
+          "x=notes.txt; f(){ cat < $x; }; x=/etc/hostname; f",
+          "x=notes.txt; f(){ echo hi > $x; }; x=/etc/hostname; f",
+          "x=notes.txt; f(){ cat >> $x; }; x=/etc/hostname; f",
+          "function f { cat < $x; }; x=/etc/hostname; f",
+        ]) {
+          yield* expectExternal(command, tmp)
+        }
+        yield* expectNotAbsorbed("f *", "x=notes.txt; f(){ echo hi > $x; }; x=/etc/hostname; f", tmp)
+        for (const command of [
+          "x=notes.txt; f(){ cat < $x; }; f",
+          "f(){ echo hi > $x; }; x=dist/o.txt; f",
+          "x=notes.txt; f(){ echo hi > $x; }; f",
+        ]) {
+          yield* expectCleanStopped(command, tmp)
+        }
+      }),
+    120_000,
+  )
+
+  it.live(
+    "wave P: anchors an eval script when a dynamic-named command is dropped beside a classifiable one",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        yield* Effect.promise(() => Bun.write(path.join(tmp, "notes.txt"), "x"))
+        for (const command of [
+          'bash -c "$Q cat /etc/hostname; true"',
+          'bash -c "$Q cat /etc/hostname; cat notes.txt"',
+          'bash -c "true; $Q cat /etc/hostname"',
+          'bash -c "$Q cat /etc/hostname && true"',
+          'bash -c "$Q cat /etc/hostname; echo hi"',
+          'sh -c "$Q cat /etc/hostname; true"',
+          'eval "$Q cat /etc/hostname; true"',
+          'bash -c "$Q cat /etc/hostname | cat"',
+        ]) {
+          yield* expectExternal(command, tmp)
+        }
+        yield* expectNoAlways('bash -c "$Q cat /etc/hostname; true"', tmp)
+        yield* expectNotAbsorbed("bash *", 'bash -c "$Q cat /etc/hostname; true"', tmp)
+        for (const command of [
+          'bash -c "echo hi; true"',
+          'bash -c "set -e; npm ci; npm test"',
+          'bash -c "cat notes.txt; true"',
+        ]) {
+          yield* expectCleanStopped(command, tmp)
+        }
+      }),
+    120_000,
+  )
+
+  it.live(
+    "wave P: strips quotes from a remote option name before inspecting it",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        for (const command of [
+          'docker "--tlscacert" ps cp /etc/hostname cid:/x',
+          "docker '--tlscacert' ps cp /etc/hostname cid:/x",
+          'docker "--config=/etc/hostname" ps',
+          "docker '--config=/etc/hostname' ps",
+          'podman "--connection" ps cp /etc/hostname cid:/x',
+          'docker "--tlscacert=ps" cp /etc/hostname cid:/x',
+        ]) {
+          yield* expectExternal(command, tmp)
+        }
+        yield* expectNoAlways('docker "--tlscacert" ps cp /etc/hostname cid:/x', tmp)
+        yield* expectNotAbsorbed('docker "--tlscacert" *', 'docker "--tlscacert" ps cp /etc/hostname cid:/x', tmp)
+        yield* expectNotAbsorbed('docker "--config=/etc/hostname" *', 'docker "--config=/etc/hostname" ps', tmp)
+        for (const command of ['docker "--log-level" debug ps', 'docker "--context" default ps', 'docker "--config" ~/.docker ps']) {
+          yield* expectCleanStopped(command, tmp)
+        }
+      }),
+    120_000,
+  )
+
+  it.live(
+    "wave P: scans the attached value of an unmodelled remote global option",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        for (const command of [
+          "docker --tlscacert=/etc/hostname ps",
+          "docker --data-root=/etc/hostname ps",
+          "podman --root=/etc/hostname ps",
+          "docker --tlscacert=../etc/hostname ps",
+        ]) {
+          yield* expectExternal(command, tmp)
+        }
+        yield* expectNoAlways("docker --tlscacert=/etc/hostname ps", tmp)
+        yield* expectNotAbsorbed("docker --tlscacert *", "docker --tlscacert=/etc/hostname ps", tmp)
+        yield* expectNotAbsorbed("docker --config *", "docker --tlscacert=/etc/hostname ps", tmp)
+        for (const command of [
+          "docker --log-level=debug ps",
+          "docker --context=default ps",
+          "docker --host=tcp://127.0.0.1:2375 ps",
+          "docker --config=.docker ps",
+        ]) {
+          yield* expectCleanStopped(command, tmp)
+        }
+      }),
+    120_000,
+  )
+
+  it.live(
+    "wave P: bounds a self-referential expansion and fails closed",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        for (const command of [
+          "A='$A$A$A$A$A$A$A$A'; cat $A",
+          "A='$A$A$A$A$A$A$A$A$A$A$A$A'; cat $A",
+          "bash -c \"A='$A$A$A$A$A$A$A$A'; cat \\$A\"",
+        ]) {
+          yield* expectExternal(command, tmp)
+        }
+        yield* expectExternal('cat "${X:-${Y:-/etc/hostname}}"', tmp)
+      }),
+    120_000,
+  )
+
+  it.live(
+    "wave P: resolves the alternate ${VAR:+word} expansion in an eval script",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        yield* Effect.promise(() => Bun.write(path.join(tmp, "notes.txt"), "x"))
+        for (const command of ['bash -c "${PAGER:+cat} notes.txt"', 'bash -c "${X:+echo hi}"']) {
+          yield* expectCleanStopped(command, tmp)
+        }
+        for (const command of [
+          'bash -c "${X:+cat /etc/hostname}"',
+          'X=1; bash -c "${X:+cat /etc/hostname}"',
+        ]) {
+          yield* expectExternal(command, tmp)
+        }
+      }),
+    120_000,
+  )
+})
