@@ -2780,3 +2780,367 @@ describe("tool.shell wave MA classification", () => {
     120_000,
   )
 })
+
+describe("tool.shell wave N classification", () => {
+  if (process.platform === "win32") return
+
+  const requests = (command: string, directory: string, stop: boolean) =>
+    Effect.gen(function* () {
+      const list: Array<Omit<PermissionV1.Request, "id" | "sessionID" | "tool">> = []
+      if (stop) {
+        yield* runIn(directory, fail({ command }, capture(list, new Error("stop after permission"))))
+      } else {
+        yield* runIn(directory, run({ command }, capture(list)))
+      }
+      return list
+    })
+
+  const expectExternal = (command: string, directory: string, stop = true) =>
+    Effect.gen(function* () {
+      const list = yield* requests(command, directory, stop)
+      expect({ command, external: list.some((item) => item.permission === "external_directory") }).toEqual({
+        command,
+        external: true,
+      })
+    })
+
+  const expectCleanStopped = (command: string, directory: string) =>
+    Effect.gen(function* () {
+      const list: Array<Omit<PermissionV1.Request, "id" | "sessionID" | "tool">> = []
+      yield* runIn(directory, run({ command }, capture(list, new Error("stop after permission"))).pipe(Effect.exit))
+      expect({ command, external: list.some((item) => item.permission === "external_directory") }).toEqual({
+        command,
+        external: false,
+      })
+    })
+
+  const expectNotAbsorbed = (rule: string, command: string, directory: string) =>
+    Effect.gen(function* () {
+      const list = yield* requests(command, directory, true)
+      const approved = [{ permission: "bash", pattern: rule }]
+      const uncovered = list.filter(
+        (req) =>
+          !req.patterns.every((pattern) =>
+            approved.some(
+              (item) =>
+                Wildcard.matchStrict(req.permission, item.permission) && Wildcard.matchStrict(pattern, item.pattern),
+            ),
+          ),
+      )
+      expect({
+        rule,
+        command,
+        external: uncovered.some((item) => item.permission === "external_directory"),
+      }).toEqual({ rule, command, external: true })
+    })
+
+  const expectNoAlways = (command: string, directory: string) =>
+    Effect.gen(function* () {
+      const list = yield* requests(command, directory, false)
+      const bash = list.find((item) => item.permission === "bash")
+      expect({
+        command,
+        external: list.some((item) => item.permission === "external_directory"),
+        always: bash?.always ?? [],
+      }).toEqual({ command, external: true, always: [] })
+    })
+
+  it.live(
+    "classifies variable-held program text consumed as a -c/eval operand",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        yield* Effect.promise(() => Bun.write(path.join(tmp, "notes.txt"), "x"))
+        for (const command of [
+          "C='cat /etc/hostname'; bash -c \"$C\"",
+          "C='cat /etc/hostname'; sh -c \"$C\"",
+          "C='cat /etc/hostname'; eval \"$C\"",
+          "C='cat /etc/hostname'; eval $C",
+          "C='cat /etc/hostname'; bash -c $C",
+          "C='cat /etc/hostname'; bash -c \"$C\" ; true",
+          "C='strings /etc/hostname'; bash -c \"$C\"",
+          "C='docker run -v /etc:/h alpine ls /h'; bash -c \"$C\"",
+          'A=cat; B=/etc/hostname; bash -c "$A $B"',
+        ]) {
+          yield* expectExternal(command, tmp)
+        }
+        yield* expectNoAlways("C='cat /etc/hostname'; bash -c \"$C\"", tmp)
+        yield* expectNotAbsorbed("bash *", "C='cat /etc/hostname'; sh -c \"$C\"", tmp)
+        for (const command of [
+          "C='cat notes.txt'; bash -c \"$C\"",
+          "C='echo hi'; bash -c \"$C\"",
+          "C='ls notes.txt'; sh -c \"$C\"",
+        ]) {
+          yield* expectCleanStopped(command, tmp)
+        }
+      }),
+    120_000,
+  )
+
+  it.live(
+    "finds the remote subcommand past unlisted global value-options",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        for (const command of [
+          "docker --tlscacert /tmp/ca.pem cp /etc/hostname cid:/x",
+          "docker --tlscert /tmp/c.pem cp /etc/hostname cid:/x",
+          "docker --tlskey /tmp/k.pem cp /etc/hostname cid:/x",
+          "docker --log-driver json cp /etc/hostname cid:/x",
+          "podman --connection foo cp /etc/hostname cid:/x",
+          "docker --tlscacert /tmp/ca.pem build /etc/ssl",
+          "docker --tlscacert=/tmp/ca.pem cp /etc/hostname cid:/x",
+        ]) {
+          yield* expectExternal(command, tmp)
+        }
+        yield* expectNotAbsorbed("docker --tlscacert *", "docker --tlscacert /tmp/ca.pem cp /etc/hostname cid:/x", tmp)
+        yield* expectNotAbsorbed("docker *", "docker --tlscert /tmp/c.pem cp /etc/hostname cid:/x", tmp)
+        for (const command of [
+          "docker --log-level debug cp /etc/hostname cid:/x",
+          "kubectl -n default cp /etc/passwd pod:/tmp/x",
+          "podman --log-level debug cp /etc/hostname cid:/x",
+        ]) {
+          yield* expectExternal(command, tmp)
+        }
+        for (const command of [
+          "docker --log-level debug ps",
+          "kubectl -n default get pods",
+          "docker --context default ps",
+          "podman --log-level debug ps",
+          "docker run --rm alpine cat /etc/hostname",
+          "kubectl exec pod -- cat /etc/hostname",
+        ]) {
+          yield* expectCleanStopped(command, tmp)
+        }
+      }),
+    120_000,
+  )
+
+  it.live(
+    "falls back to the generic scan for unmodelled short options of modelled commands",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        yield* Effect.promise(() => Bun.write(path.join(tmp, "notes.txt"), "x"))
+        for (const command of [
+          "gcc -I/etc/hostname -c main.c",
+          "gcc -include/etc/hostname -E main.c",
+          "gcc -imacros/etc/hostname -E main.c",
+          "gcc -idirafter/etc/hostname -c main.c",
+          "gcc -isystem/etc/hostname -c main.c",
+          "gcc -Wl,/etc/hostname -o /dev/null main.c",
+          "gcc -D/etc/hostname -E main.c",
+          "gcc -U/etc/hostname -E main.c",
+          "cc -I/etc/hostname -c main.c",
+          "javac -d/etc/hostname Foo.java",
+          "javac -cp/etc/hostname Foo.java",
+          "java -cp/etc/hostname Foo",
+          "gawk -i/etc/hostname 'BEGIN{}' notes.txt",
+          "gcc -o/etc/hostname main.c",
+          "gcc -L/etc/hostname main.c",
+        ]) {
+          yield* expectExternal(command, tmp)
+        }
+        for (const command of [
+          "awk -F/ '{print $1}' notes.txt",
+          "cut -d/ -f1 notes.txt",
+          "sort -t/ notes.txt",
+          "tr -d/ < notes.txt",
+          "grep -e/etc/hostname notes.txt",
+          "sed -e/etc/x notes.txt",
+          "ls -d/etc",
+          "gcc -Iinclude/sub -o out main.c",
+          "cc -Lbuild/lib -lfoo main.c",
+          "java -Dlog.dir=logs/app -jar app.jar",
+          "grep --regexp=/etc/passwd notes.txt",
+          "gawk -F/ 'BEGIN{}' notes.txt",
+        ]) {
+          yield* expectCleanStopped(command, tmp)
+        }
+      }),
+    120_000,
+  )
+
+  it.live(
+    "scopes a re-parsed substitution payload's own assignments",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        yield* Effect.promise(() => Bun.write(path.join(tmp, "notes.txt"), "x"))
+        for (const command of [
+          "sh -c \"$(echo 'x=/etc/hostname;cat $x')\"",
+          "sh -c \"$(echo 'x=/etc/hostname; cat $x')\"",
+          "sh -c \"$(echo 'x=/etc/hostname; cat ${x}')\"",
+          "sh -c \"$(printf %s 'x=/etc/hostname; cat $x')\"",
+          "eval \"$(echo 'x=/etc/hostname; cat $x')\"",
+          "sh -c \"$(echo 'export x=/etc/hostname; cat $x')\"",
+        ]) {
+          yield* expectExternal(command, tmp)
+        }
+        for (const command of ["sh -c \"$(echo 'x=notes.txt; cat $x')\"", "sh -c \"$(echo 'x=notes.txt;cat $x')\""]) {
+          yield* expectCleanStopped(command, tmp)
+        }
+      }),
+    120_000,
+  )
+
+  it.live(
+    "scans =/, attached external option values on unmodelled commands",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        for (const command of [
+          "zzz -X=/etc/hostname",
+          "zzz -Wl,/etc/hostname",
+          "gcc -Wl,-rpath,/etc",
+          "gcc -Wl,/etc/hostname -o /dev/null main.c",
+          "zzz -Wl,-rpath,/etc",
+        ]) {
+          yield* expectExternal(command, tmp)
+        }
+        for (const command of [
+          "zzz -Dfoo=bar/baz",
+          "zzz -x2/3",
+          "zzz -Wl,-rpath,lib/x",
+          "gcc -Wl,-rpath,lib/x -o /dev/null main.c",
+        ]) {
+          yield* expectCleanStopped(command, tmp)
+        }
+      }),
+    120_000,
+  )
+
+  it.live(
+    "parses no-whitespace substitution payloads",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        for (const command of [
+          "sh -c \"$(echo 'cat</etc/hostname')\"",
+          "sh -c \"$(echo 'wc</etc/hostname')\"",
+          "sh -c \"$(echo 'head</etc/hostname')\"",
+          "sh -c \"$(printf %s 'cat</etc/hostname')\"",
+          "eval \"$(echo 'cat</etc/hostname')\"",
+          "sh -c \"$(echo 'cat /etc/hostname>/tmp/opencode-wave-n-n6')\"",
+        ]) {
+          yield* expectExternal(command, tmp)
+        }
+        yield* expectCleanStopped("sh -c \"$(echo 'cat<notes.txt')\"", tmp)
+      }),
+    120_000,
+  )
+
+  it.live(
+    "scans redirect destinations inside a re-parsed payload",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        for (const command of [
+          "sh -c \"$(echo 'true > /tmp/opencode-wave-n-n7')\"",
+          "sh -c \"$(echo 'true>/tmp/opencode-wave-n-n7b')\"",
+          "sh -c \"$(echo 'echo hi > /tmp/opencode-wave-n-n7c')\"",
+          "sh -c \"$(printf %s 'touch>/tmp/opencode-wave-n-n7d')\"",
+          "eval \"$(echo 'true > /tmp/opencode-wave-n-n7e')\"",
+        ]) {
+          yield* expectExternal(command, tmp)
+        }
+        yield* expectCleanStopped("sh -c \"$(echo 'true > notes.txt')\"", tmp)
+      }),
+    120_000,
+  )
+
+  it.live(
+    "gates remote local-file options and shell default-value expansions",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        yield* Effect.promise(() => Bun.write(path.join(tmp, "notes.txt"), "x"))
+        for (const command of [
+          "podman context import x /etc/hostname",
+          "docker load --input=/etc/hostname",
+          "podman load --input=/etc/hostname",
+          "kubectl --client-certificate /etc/hostname get pods",
+          "kubectl --client-key /etc/hostname get pods",
+          "kubectl --certificate-authority /etc/hostname get pods",
+          "kubectl --token-file /etc/hostname get pods",
+          "docker run --secret id=x,src=/etc/hostname alpine true",
+          "ssh -o IdentityFile=/etc/hostname host true",
+          "ssh -E /etc/hostname host true",
+          "cat ${O:-/etc/hostname}",
+        ]) {
+          yield* expectExternal(command, tmp)
+        }
+        for (const command of ["cat ${O:-notes.txt}", "kubectl --client-certificate=notes.txt get pods"]) {
+          yield* expectCleanStopped(command, tmp)
+        }
+      }),
+    120_000,
+  )
+
+  it.live(
+    "keeps the wider benign corpus prompt-free while the M-A closes hold",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        yield* Effect.promise(() => Bun.write(path.join(tmp, "notes.txt"), "x"))
+        yield* Effect.promise(() => Bun.write(path.join(tmp, "notes.tar"), "x"))
+        for (const command of [
+          "awk -F/ '{print $1}' notes.txt",
+          "cut -d/ -f1 notes.txt",
+          "sort -t/ notes.txt",
+          "tr -d/ < notes.txt",
+          "grep -e/etc/hostname notes.txt",
+          "sed -e/etc/x notes.txt",
+          "ls -d/etc",
+          "gcc -Iinclude/sub -o out main.c",
+          "cc -Lbuild/lib -lfoo main.c",
+          "java -Dlog.dir=logs/app -jar app.jar",
+          "grep --regexp=/etc/passwd notes.txt",
+          "zzz -Dfoo=bar/baz",
+          "zzz -x2/3",
+          "zzz -Wl,-rpath,lib/x",
+          "echo hi > out-$$.log",
+          "echo hi > $RANDOM.log",
+          "echo hi > notes.txt",
+          "O=notes.txt; strings $O; O=/etc/hostname",
+          "B=notes.txt; A=$B; cat $A",
+          "for f in notes.txt; do cat $f; done",
+          "podman load -i notes.tar",
+          "podman import notes.tar",
+          "podman run --security-opt label=disable alpine true",
+          "docker build --build-arg VERSION=1 .",
+          "docker --log-level debug ps",
+          "kubectl -n default get pods",
+          "kubectl --namespace kube-system get pods",
+          "podman --log-level debug ps",
+          "docker --context default ps",
+          "docker run --rm alpine cat /etc/hostname",
+          "kubectl exec pod -- cat /etc/hostname",
+          "ssh host cat /etc/hostname",
+          'bash -c "$(echo \'hello world\')"',
+          'sh -c "$(echo hi)"',
+          "cat notes.txt",
+        ]) {
+          yield* expectCleanStopped(command, tmp)
+        }
+        for (const command of [
+          "docker --log-level debug cp /etc/hostname cid:/x",
+          "kubectl -n default cp /etc/passwd pod:/tmp/x",
+          "podman load -i /etc/hostname",
+          "podman play kube /etc/hostname",
+          'sh -c "$(echo \'cat /etc/hostname\')"',
+          "O=/etc/hostname; strings $O; O=notes.txt",
+          "for f in /etc/hostname; do cat $f; done",
+          "tar -T/etc/hostname -cf /dev/null",
+          "grep -f/etc/hostname notes.txt",
+          "sed -f/etc/hostname notes.txt",
+          "gcc -o/etc/hostname main.c",
+          "zzz -f/etc/hostname",
+          "cat /etc/hostname",
+        ]) {
+          yield* expectExternal(command, tmp)
+        }
+      }),
+    120_000,
+  )
+})
