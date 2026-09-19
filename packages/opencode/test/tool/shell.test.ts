@@ -2503,3 +2503,280 @@ describe("tool.shell wave LA classification", () => {
     120_000,
   )
 })
+
+describe("tool.shell wave MA classification", () => {
+  if (process.platform === "win32") return
+
+  const requests = (command: string, directory: string, stop: boolean) =>
+    Effect.gen(function* () {
+      const list: Array<Omit<PermissionV1.Request, "id" | "sessionID" | "tool">> = []
+      if (stop) {
+        yield* runIn(directory, fail({ command }, capture(list, new Error("stop after permission"))))
+      } else {
+        yield* runIn(directory, run({ command }, capture(list)))
+      }
+      return list
+    })
+
+  const expectExternal = (command: string, directory: string, stop = true) =>
+    Effect.gen(function* () {
+      const list = yield* requests(command, directory, stop)
+      expect({ command, external: list.some((item) => item.permission === "external_directory") }).toEqual({
+        command,
+        external: true,
+      })
+    })
+
+  const expectCleanStopped = (command: string, directory: string) =>
+    Effect.gen(function* () {
+      const list: Array<Omit<PermissionV1.Request, "id" | "sessionID" | "tool">> = []
+      yield* runIn(directory, run({ command }, capture(list, new Error("stop after permission"))).pipe(Effect.exit))
+      expect({ command, external: list.some((item) => item.permission === "external_directory") }).toEqual({
+        command,
+        external: false,
+      })
+    })
+
+  const expectNotAbsorbed = (rule: string, command: string, directory: string) =>
+    Effect.gen(function* () {
+      const list = yield* requests(command, directory, true)
+      const approved = [{ permission: "bash", pattern: rule }]
+      const uncovered = list.filter(
+        (req) =>
+          !req.patterns.every((pattern) =>
+            approved.some(
+              (item) =>
+                Wildcard.matchStrict(req.permission, item.permission) &&
+                Wildcard.matchStrict(pattern, item.pattern),
+            ),
+          ),
+      )
+      expect({
+        rule,
+        command,
+        external: uncovered.some((item) => item.permission === "external_directory"),
+      }).toEqual({ rule, command, external: true })
+    })
+
+  it.live(
+    "parses the remote subcommand past global value-options",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        for (const command of [
+          "docker --log-level debug cp /etc/hostname cid:/x",
+          "docker -l debug cp /etc/hostname cid:/x",
+          "docker --context default cp /etc/hostname cid:/x",
+          "docker -H unix:///var/run/docker.sock cp /etc/hostname cid:/x",
+          "kubectl -n default cp /etc/passwd pod:/tmp/x",
+          "kubectl --namespace default cp /etc/passwd pod:/tmp/x",
+          "kubectl -v 5 cp /etc/passwd pod:/tmp/x",
+          "podman --log-level debug cp /etc/hostname cid:/x",
+          "docker --log-level debug build /etc/ssl",
+        ]) {
+          yield* expectExternal(command, tmp)
+        }
+        for (const [rule, command] of [
+          ["docker --log-level *", "docker --log-level debug cp /etc/hostname cid:/x"],
+          ["kubectl -n *", "kubectl -n default cp /etc/passwd pod:/tmp/x"],
+          ["docker --context *", "docker --context default cp /etc/hostname cid:/x"],
+          ["podman --log-level *", "podman --log-level debug cp /etc/hostname cid:/x"],
+        ] as const) {
+          yield* expectNotAbsorbed(rule, command, tmp)
+        }
+        for (const command of [
+          "docker --log-level debug ps",
+          "kubectl -n default get pods",
+          "kubectl --namespace kube-system get pods",
+          "podman --log-level debug ps",
+          "docker --context default ps",
+        ]) {
+          yield* expectCleanStopped(command, tmp)
+        }
+      }),
+    120_000,
+  )
+
+  it.live(
+    "gates podman local-file subcommands and path-bearing options",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        yield* Effect.promise(() => Bun.write(path.join(tmp, "notes.tar"), "x"))
+        for (const command of [
+          "podman load -i /etc/hostname",
+          "podman import /etc/hostname",
+          "podman play kube /etc/hostname",
+          "podman kube play /etc/hostname",
+          "docker load -i /etc/hostname",
+          "docker import /etc/hostname",
+          "podman run --security-opt seccomp=/etc/hostname alpine true",
+          "podman create --security-opt seccomp=/etc/hostname alpine",
+          "podman run --device /etc/hostname alpine true",
+          "podman build --iidfile /etc/hostname .",
+          "podman build --build-arg X=/etc/hostname .",
+          "docker run --security-opt seccomp=/etc/hostname alpine true",
+          "docker build --iidfile /etc/hostname .",
+        ]) {
+          yield* expectExternal(command, tmp)
+        }
+        for (const [rule, command] of [
+          ["podman import *", "podman import /etc/hostname"],
+          ["podman play *", "podman play kube /etc/hostname"],
+          ["podman run *", "podman run --device /etc/hostname alpine true"],
+        ] as const) {
+          yield* expectNotAbsorbed(rule, command, tmp)
+        }
+        for (const command of [
+          "podman load -i notes.tar",
+          "podman import notes.tar",
+          "podman run --security-opt label=disable alpine true",
+          "docker build --build-arg VERSION=1 .",
+          "podman run -v notes.tar:/data alpine true",
+        ]) {
+          yield* expectCleanStopped(command, tmp)
+        }
+      }),
+    120_000,
+  )
+
+  it.live(
+    "does not exempt a quoted command-substitution payload",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        for (const command of [
+          'sh -c "$(echo \'cat /etc/hostname\')"',
+          'bash -c "$(printf %s \'cat /etc/hostname\')"',
+          'eval "$(printf %s \'cat /etc/hostname\')"',
+          'bash -c "$(echo -n \'cat /etc/hostname\')"',
+          'sh -c "$(printf \'cat /etc/hostname\')"',
+          'bash -c "$(echo \'docker run -v /etc:/h alpine ls /h\')"',
+        ]) {
+          yield* expectExternal(command, tmp)
+        }
+        for (const [rule, command] of [
+          ["echo *", 'sh -c "$(echo \'cat /etc/hostname\')"'],
+          ["printf *", 'bash -c "$(printf %s \'cat /etc/hostname\')"'],
+        ] as const) {
+          yield* expectNotAbsorbed(rule, command, tmp)
+        }
+        for (const command of ['bash -c "$(echo \'hello world\')"', 'sh -c "$(echo hi)"']) {
+          yield* expectCleanStopped(command, tmp)
+        }
+      }),
+    120_000,
+  )
+
+  it.live(
+    "does not prompt on non-path attached option values while scanning real ones",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        yield* Effect.promise(() => Bun.write(path.join(tmp, "notes.txt"), "x"))
+        for (const command of [
+          "awk -F/ '{print $1}' notes.txt",
+          "cut -d/ -f1 notes.txt",
+          "sort -t/ notes.txt",
+          "tr -d/ < notes.txt",
+          "grep -e/etc/hostname notes.txt",
+          "sed -e/etc/x notes.txt",
+          "ls -d/etc",
+          "gcc -Iinclude/sub -o out main.c",
+          "cc -Lbuild/lib -lfoo main.c",
+          "java -Dlog.dir=logs/app -jar app.jar",
+          "grep --regexp=/etc/passwd notes.txt",
+          "zzz -Dfoo=bar/baz",
+          "zzz -x2/3",
+          "zzz -Wl,-rpath,lib/x",
+        ]) {
+          yield* expectCleanStopped(command, tmp)
+        }
+        for (const command of [
+          "tar -T/etc/hostname -cf /dev/null",
+          "grep -f/etc/hostname notes.txt",
+          "sed -f/etc/x notes.txt",
+          `sort -o${path.join(path.dirname(tmp), "ma-sort-out")} notes.txt`,
+          "gcc -o/etc/ma-gcc-out main.c",
+          "zzz -f/etc/hostname",
+          "zzz -T/etc/hostname",
+        ]) {
+          yield* expectExternal(command, tmp)
+        }
+      }),
+    120_000,
+  )
+
+  it.live(
+    "keeps relative unresolved redirects prompt-free but anchors unknown variables",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        yield* Effect.promise(() => Bun.write(path.join(tmp, "notes.txt"), "x"))
+        for (const command of ["echo hi > out-$$.log", "echo hi > $RANDOM.log", "echo hi > notes.txt"]) {
+          yield* expectCleanStopped(command, tmp)
+        }
+        for (const command of [
+          "O=/etc/hostname; echo hi > $O",
+          "echo hi > $MA_PROBE_UNDEFINED",
+          "echo hi > $MA_PROBE_UNDEFINED.out",
+        ]) {
+          yield* expectExternal(command, tmp)
+        }
+      }),
+    120_000,
+  )
+
+  it.live(
+    "resolves variables in source order including chains, substitutions and loops",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        yield* Effect.promise(() => Bun.write(path.join(tmp, "notes.txt"), "x"))
+        for (const command of [
+          "O=/etc/hostname; strings $O; O=notes.txt",
+          "B=/etc/hostname; A=$B; cat $A",
+          "O=$(echo /etc/hostname); cat $O",
+          "for f in /etc/hostname; do cat $f; done",
+        ]) {
+          yield* expectExternal(command, tmp)
+        }
+        for (const command of [
+          "O=notes.txt; strings $O; O=/etc/hostname",
+          "B=notes.txt; A=$B; cat $A",
+          "for f in notes.txt; do cat $f; done",
+        ]) {
+          yield* expectCleanStopped(command, tmp)
+        }
+      }),
+    120_000,
+  )
+
+  // The offered `always` grant is what turns a single approval into a standing
+  // zero-prompt channel, so the repaired attack shapes must withdraw it.
+  it.live(
+    "offers no absorbing always grant on the repaired attack shapes",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        yield* Effect.promise(() => Bun.write(path.join(tmp, "notes.txt"), "x"))
+        for (const command of [
+          "docker --log-level debug cp /etc/hostname cid:/x",
+          "kubectl -n default cp /etc/passwd pod:/tmp/x",
+          "podman load -i /etc/hostname",
+          "podman play kube /etc/hostname",
+          "O=/etc/hostname; strings $O; O=notes.txt",
+          "for f in /etc/hostname; do cat $f; done",
+        ]) {
+          const list = yield* requests(command, tmp, false)
+          const bash = list.find((item) => item.permission === "bash")
+          expect({
+            command,
+            external: list.some((item) => item.permission === "external_directory"),
+            always: bash?.always ?? [],
+          }).toEqual({ command, external: true, always: [] })
+        }
+      }),
+    120_000,
+  )
+})

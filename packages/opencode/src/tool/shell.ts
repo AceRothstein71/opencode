@@ -592,12 +592,17 @@ function auto(key: string, cwd: string, shell: string) {
 }
 
 function expand(text: string, cwd: string, shell: string, vars?: Map<string, string>) {
-  const unquoted = unquote(text)
-  const substituted =
-    vars && vars.size > 0
-      ? unquoted.replace(/\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?/g, (whole, name: string) => vars.get(name) ?? whole)
-      : unquoted
-  const out = substituted
+  let unquoted = unquote(text)
+  if (vars && vars.size > 0) {
+    // One assignment can name another (`A=$B`), so resolve transitively until the
+    // text stops changing instead of leaving a `$B` that hides the real path.
+    for (let pass = 0; pass < 8; pass++) {
+      const next = unquoted.replace(/\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?/g, (whole, name: string) => vars.get(name) ?? whole)
+      if (next === unquoted) break
+      unquoted = next
+    }
+  }
+  const out = unquoted
     .replace(/\$\{env:([^}]+)\}/gi, (_, key: string) => envValue(key) || "")
     .replace(/\$env:([A-Za-z_][A-Za-z0-9_]*)/gi, (_, key: string) => envValue(key) || "")
     .replace(/\$\{?(HOME|PWD|PSHOME)\}?(?=$|[\\/])/gi, (_, key: string) => auto(key, cwd, shell) || "")
@@ -952,6 +957,11 @@ function deviceSink(text: string) {
   return /^\/dev\/(null|zero|stdin|stdout|stderr|tty|fd\/[0-9]+)$/.test(text)
 }
 
+// Shell-synthesised numeric/positional variables. They cannot carry an absolute path,
+// so a redirect target built only from them stays relative to cwd.
+const RELATIVE_VAR =
+  /\$(?:\$|[0-9]+|!|\?|#|\*|@|-|_|\{[0-9]+\}|\{?(?:RANDOM|SRANDOM|BASHPID|PPID|SECONDS|EPOCHSECONDS|EPOCHREALTIME|LINENO|UID|EUID|GID|EGID|SHLVL|BASH_SUBSHELL|BASH_VERSION|HOSTTYPE|OSTYPE|MACHTYPE)(?![\w])\}?)/g
+
 function globAnchor(text: string) {
   // A leading glob has no literal prefix to resolve. Keep one placeholder segment
   // per glob metacharacter (so a trailing `..` traversal still cancels correctly),
@@ -960,26 +970,74 @@ function globAnchor(text: string) {
   return path.dirname(text.replace(/[*?[\]]/g, "_"))
 }
 
+// Short options whose attached value is a pattern, separator or script rather than a
+// local file. `values` are the flags that consume an attached value and `path` the
+// subset naming a file; without this the generic rule invents paths for `awk -F/`,
+// `gcc -Iinclude/sub` or `java -Dlog.dir=logs/app`. A command absent here keeps the
+// generic rule, so `zzz -f/etc/x` still scans.
+const ATTACHED_SHORT_MODEL: Record<string, { values: string; path: string }> = {
+  awk: { values: "Ffv", path: "f" },
+  gawk: { values: "Ffv", path: "f" },
+  grep: { values: "efm", path: "f" },
+  egrep: { values: "efm", path: "f" },
+  fgrep: { values: "efm", path: "f" },
+  sed: { values: "ef", path: "f" },
+  cut: { values: "dfbc", path: "" },
+  sort: { values: "ktoST", path: "oT" },
+  tr: { values: "", path: "" },
+  ls: { values: "", path: "" },
+  gcc: { values: "ILDxUo", path: "o" },
+  cc: { values: "ILDxUo", path: "o" },
+  java: { values: "D", path: "" },
+  javac: { values: "dD", path: "" },
+}
+
+// Long options whose `--opt=value` is a pattern or script, not a path. Path-bearing
+// long options (`--files-from=`, `--file=`) stay generic.
+const ATTACHED_LONG_NOT_PATH: Record<string, Set<string>> = {
+  grep: new Set(["--regexp", "--exclude", "--include", "--exclude-dir", "--include-dir"]),
+  egrep: new Set(["--regexp", "--exclude", "--include", "--exclude-dir", "--include-dir"]),
+  fgrep: new Set(["--regexp", "--exclude", "--include", "--exclude-dir", "--include-dir"]),
+  sed: new Set(["--expression"]),
+  awk: new Set(["--field-separator"]),
+  gawk: new Set(["--field-separator"]),
+  java: new Set(["--define"]),
+}
+
 // A path attached to an option (`--files-from=/etc/x`, `-T/etc/x`, `tar -cf<path>`)
 // starts with `-`, so a plain dash-skip loses it before the scan. Extract the
 // path-like remainder so it can be scanned first.
-function attachedOptionValue(text: string) {
+function attachedOptionValue(text: string, name?: string) {
   if (text.startsWith("--")) {
     const equals = text.indexOf("=")
     if (equals === -1) return
+    if (name && ATTACHED_LONG_NOT_PATH[name]?.has(text.slice(0, equals))) return
     return text.slice(equals + 1) || undefined
   }
   const body = text.slice(1)
+  const model = name ? ATTACHED_SHORT_MODEL[name] : undefined
+  if (model) {
+    for (let at = 0; at < body.length; at++) {
+      if (!model.values.includes(body[at])) continue
+      if (!model.path.includes(body[at])) return
+      return body.slice(at + 1) || undefined
+    }
+    return
+  }
   const marks = [body.indexOf("/"), body.indexOf("~"), body.indexOf("..")].filter((index) => index !== -1)
   if (marks.length === 0) return
-  return body.slice(Math.min(...marks))
+  const at = Math.min(...marks)
+  // Only a value preceded purely by option letters is a path (`-T/etc`, `-cf/out`);
+  // a mid-value slash (`-Dfoo=bar/baz`, `-x2/3`, `-Wl,-rpath,lib/x`) must not invent one.
+  if (![...body.slice(0, at)].every((char) => /[A-Za-z]/.test(char))) return
+  return body.slice(at)
 }
 
 // The operands a fail-closed scan must inspect for one token: the token itself plus
 // the value of an `if=`/`of=`-style assignment, with attached option paths split out.
-function operandTargets(text: string) {
+function operandTargets(text: string, name?: string) {
   if (text.startsWith("-") && text !== "-") {
-    const value = attachedOptionValue(text)
+    const value = attachedOptionValue(text, name)
     return value === undefined ? [] : [value]
   }
   const operand = /^[A-Za-z_][A-Za-z0-9_]*=(.*)$/.exec(text)
@@ -992,8 +1050,68 @@ const REMOTE_PATH_CHARS: Record<string, string> = { ssh: "iF", kubectl: "f", doc
 const REMOTE_PATH_LONG: Record<string, Set<string>> = {
   ssh: new Set(["--identity", "--config"]),
   kubectl: new Set(["--filename", "--kubeconfig", "--from-file", "--from-env-file"]),
-  docker: new Set(["--file", "--volume", "--mount", "--output", "--env-file", "--kubeconfig"]),
-  podman: new Set(["--file", "--volume", "--mount", "--output", "--env-file", "--kubeconfig"]),
+  docker: new Set([
+    "--file",
+    "--volume",
+    "--mount",
+    "--output",
+    "--env-file",
+    "--kubeconfig",
+    "--security-opt",
+    "--device",
+    "--iidfile",
+    "--build-arg",
+  ]),
+  podman: new Set([
+    "--file",
+    "--volume",
+    "--mount",
+    "--output",
+    "--env-file",
+    "--kubeconfig",
+    "--security-opt",
+    "--device",
+    "--iidfile",
+    "--build-arg",
+  ]),
+}
+
+// Global options that consume the following token as a value. They appear before the
+// subcommand, so an unmodelled one would otherwise push its value into `positionals`
+// and displace `cp`/`build` (`docker --log-level debug cp …`, `kubectl -n default cp`).
+const REMOTE_GLOBAL_CHARS: Record<string, string> = { ssh: "", kubectl: "nsv", docker: "lHc", podman: "lHc" }
+const REMOTE_GLOBAL_LONG: Record<string, Set<string>> = {
+  ssh: new Set(),
+  kubectl: new Set([
+    "--namespace",
+    "--context",
+    "--kubeconfig",
+    "--user",
+    "--cluster",
+    "--server",
+    "--token",
+    "--certificate-authority",
+    "--client-certificate",
+    "--client-key",
+    "--request-timeout",
+    "--as",
+    "--as-group",
+    "--cache-dir",
+    "--tls-server-name",
+  ]),
+  docker: new Set(["--log-level", "--context", "--host", "--config"]),
+  podman: new Set([
+    "--log-level",
+    "--context",
+    "--host",
+    "--config",
+    "--root",
+    "--runroot",
+    "--runtime",
+    "--storage-driver",
+    "--url",
+    "--identity",
+  ]),
 }
 const VOLUME_LONG = new Set(["--volume", "--mount"])
 const VOLUME_CHARS = "v"
@@ -1021,6 +1139,8 @@ function remotePaths(name: string, command: Part[]) {
   const args = command.slice(1)
   const pathChars = REMOTE_PATH_CHARS[name] ?? ""
   const pathLong = REMOTE_PATH_LONG[name] ?? new Set<string>()
+  const globalChars = REMOTE_GLOBAL_CHARS[name] ?? ""
+  const globalLong = REMOTE_GLOBAL_LONG[name] ?? new Set<string>()
   const out: string[] = []
   const positionals: string[] = []
   let index = 0
@@ -1047,6 +1167,12 @@ function remotePaths(name: string, command: Part[]) {
         index += 2
         continue
       }
+      // A known global value-option before the subcommand consumes its value, so the
+      // subcommand stays at `positionals[0]`.
+      if (positionals.length === 0 && globalLong.has(text)) {
+        index += 2
+        continue
+      }
       index++
       continue
     }
@@ -1055,15 +1181,20 @@ function remotePaths(name: string, command: Part[]) {
       let consumeNext = false
       for (let at = 0; at < body.length; at++) {
         const flag = body[at]
-        if (!pathChars.includes(flag)) continue
-        const attached = body.slice(at + 1)
-        if (attached) addValue(VOLUME_CHARS.includes(flag), attached)
-        else {
-          const value = args[index + 1]?.text
-          if (value !== undefined) addValue(VOLUME_CHARS.includes(flag), value)
-          consumeNext = true
+        if (pathChars.includes(flag)) {
+          const attached = body.slice(at + 1)
+          if (attached) addValue(VOLUME_CHARS.includes(flag), attached)
+          else {
+            const value = args[index + 1]?.text
+            if (value !== undefined) addValue(VOLUME_CHARS.includes(flag), value)
+            consumeNext = true
+          }
+          break
         }
-        break
+        if (positionals.length === 0 && globalChars.includes(flag)) {
+          if (at === body.length - 1) consumeNext = true
+          break
+        }
       }
       index += consumeNext ? 2 : 1
       continue
@@ -1072,23 +1203,32 @@ function remotePaths(name: string, command: Part[]) {
     index++
   }
   const sub = positionals[0]
+  // A `container:/path` operand resolves inside the runtime; a bare one is local.
+  const local = (operand: string) => !/^[^/\\:]+:/.test(operand)
   if (sub === "cp") {
-    for (const operand of positionals.slice(1)) {
-      // A `container:/path` operand resolves inside the runtime; a bare one is local.
-      if (!/^[^/\\:]+:/.test(operand)) out.push(operand)
-    }
+    for (const operand of positionals.slice(1)) if (local(operand)) out.push(operand)
   } else if ((name === "docker" || name === "podman") && sub === "build") {
     const context = positionals[positionals.length - 1]
     if (context !== undefined && context !== sub && context !== ".") out.push(context)
+  } else if (sub === "load" || sub === "import") {
+    // `load -i FILE` / `import FILE` read a local archive or image.
+    for (const operand of positionals.slice(1)) if (local(operand)) out.push(operand)
+  } else if ((name === "docker" || name === "podman") && sub === "play" && positionals[1] === "kube") {
+    for (const operand of positionals.slice(2)) if (local(operand)) out.push(operand)
+  } else if ((name === "docker" || name === "podman") && sub === "kube" && positionals[1] === "play") {
+    for (const operand of positionals.slice(2)) if (local(operand)) out.push(operand)
+  } else if (name === "docker" && sub === "context" && positionals[1] === "import") {
+    for (const operand of positionals.slice(3)) if (local(operand)) out.push(operand)
   }
   return out
 }
 
 function pathArgs(list: Part[], ps: boolean, cmd = false) {
   if (!ps) {
+    const name = list[0] ? bareName(commandName(list[0].text)) : undefined
     return list.slice(1).flatMap((item): string[] => {
       if (item.text.startsWith("-") && item.text !== "-") {
-        const value = attachedOptionValue(item.text)
+        const value = attachedOptionValue(item.text, name)
         return value === undefined ? [] : [value]
       }
       if (cmd && item.text.startsWith("/")) return []
@@ -1321,13 +1461,25 @@ export const ShellTool = Tool.define(
       const state = { dynamic: false }
       const pending: { tokens: string[]; dynamic: boolean }[] = []
       // A redirect target built from a variable (`O=/etc/x; cmd > $O`) resolves to empty
-      // in `expand` and would silently pass. Carry the command line's own assignments so
-      // `$NAME` resolves to the value the shell will actually use.
-      const assignments = new Map<string, string>()
+      // in `expand` and would silently pass. Carry the assignments so `$NAME` resolves to
+      // the value the shell will actually use. They are keyed by source offset so a later
+      // reassignment (`strings $O; O=notes.txt`) cannot retroactively rewrite an earlier
+      // read, and a for-loop variable is treated like an assignment for its body.
+      const assignments: { at: number; name: string; value: string }[] = []
       for (const node of root.descendantsOfType("variable_assignment")) {
         const name = node?.childForFieldName("name")?.text
         const value = node?.childForFieldName("value")?.text
-        if (name && value !== undefined) assignments.set(name, unquote(value))
+        if (name && value !== undefined) assignments.push({ at: node.startIndex, name, value: unquote(value) })
+      }
+      for (const node of root.descendantsOfType("for_statement")) {
+        const name = node?.childForFieldName("variable")?.text
+        const value = node?.childForFieldName("value")?.text
+        if (name && value !== undefined) assignments.push({ at: node.startIndex, name, value: unquote(value) })
+      }
+      const varsAt = (at: number) => {
+        const vars = new Map<string, string>()
+        for (const item of assignments) if (item.at <= at) vars.set(item.name, item.value)
+        return vars
       }
 
       const addPath = Effect.fnUntraced(function* (resolved: string | { external: true } | undefined) {
@@ -1364,10 +1516,12 @@ export const ShellTool = Tool.define(
         command: Part[],
         depth?: number,
         substituted?: boolean,
+        vars?: Map<string, string>,
       ) => Effect.Effect<{ name?: string; info: Effective; conservative?: boolean }, never, never> = Effect.fnUntraced(function* (
         command: Part[],
         depth = 0,
         substituted = false,
+        vars: Map<string, string> = new Map(),
       ) {
         const info = effective(command)
         const name = shellKind === "cmd" ? info.name?.toLowerCase() : info.name
@@ -1381,23 +1535,54 @@ export const ShellTool = Tool.define(
           info.command.slice(1).map((item) => item.text),
         )
         if (info.cwdTarget && dynamic(unquote(info.cwdTarget.text), ps)) state.dynamic = true
-        if (info.cwdTarget) yield* addPath(yield* argPath(info.cwdTarget.text, cwd, ps, shell, assignments))
+        if (info.cwdTarget) yield* addPath(yield* argPath(info.cwdTarget.text, cwd, ps, shell, vars))
         if (info.extraPaths?.length) {
-          for (const item of info.extraPaths) yield* addPath(yield* argPath(item, cwd, ps, shell, assignments))
+          for (const item of info.extraPaths) yield* addPath(yield* argPath(item, cwd, ps, shell, vars))
         }
         let conservative = info.command.some((item) => item.text.includes(UNRESOLVED))
         let external = false
+        const parseSubstitution = Effect.fnUntraced(function* (text: string) {
+          const exit = yield* parse(text, ps).pipe(Effect.exit)
+          if (Exit.isFailure(exit)) {
+            state.dynamic = true
+            scan.dirs.add(path.parse(cwd).root)
+            return
+          }
+          const tree = exit.value
+          for (const node of commands(tree.rootNode)) {
+            const nested = parts(node)
+            // A bare `$(...)` parses as a command whose name is the substitution itself;
+            // its real program is the descendant command, which `commands` also returns.
+            if (nested.length === 0 || dynamic(unquote(nested[0].text), ps)) continue
+            yield* classify(nested, depth + 1, true, vars)
+          }
+          tree.delete()
+        })
+        const scanTarget = Effect.fnUntraced(function* (target: string) {
+          const expanded = expand(target, cwd, shell, vars)
+          // Inside an extracted shell string a `$(...)` result is program text, not a
+          // filename: a payload quoted into one word must be re-parsed as a command line
+          // or `sh -c "$(echo 'cat /etc/hostname')"` reads the file unscanned.
+          if (substituted && expanded && !expanded.startsWith("-") && /\s/.test(expanded)) {
+            yield* parseSubstitution(expanded)
+            return
+          }
+          const resolved = yield* argPath(target, cwd, ps, shell, vars)
+          if (yield* addPath(resolved)) external = true
+          if (resolved !== undefined) return
+          // A variable assigned a command substitution (`O=$(echo /etc/x); cat $O`)
+          // executes it even though `argPath` cannot resolve the result.
+          if (target.includes("$") && expanded && (expanded.includes("$(") || expanded.includes("`"))) {
+            yield* parseSubstitution(expanded)
+          }
+        })
         const scanOperands = Effect.fnUntraced(function* () {
           for (const item of info.command.slice(1)) {
-            for (const target of operandTargets(item.text)) {
-              if (yield* addPath(yield* argPath(target, cwd, ps, shell, assignments))) external = true
-            }
+            for (const target of operandTargets(item.text, name)) yield* scanTarget(target)
           }
         })
         if (name && (FILES.has(name) || (shellKind === "cmd" && CMD_FILES.has(name)))) {
-          for (const arg of pathArgs(info.command, ps, shellKind === "cmd")) {
-            yield* addPath(yield* argPath(arg, cwd, ps, shell, assignments))
-          }
+          for (const arg of pathArgs(info.command, ps, shellKind === "cmd")) yield* scanTarget(arg)
         } else if (info.unresolved) {
           // The wrapper could not be resolved, so the real command is somewhere in the
           // argument list. Scan every token for an external path rather than trust the
@@ -1411,7 +1596,7 @@ export const ShellTool = Tool.define(
           // The inner command runs on another host or inside a container, but a bind
           // mount, copy operand or key/config file is still a local path.
           for (const target of remotePaths(name, info.command)) {
-            if (yield* addPath(yield* argPath(target, cwd, ps, shell, assignments))) external = true
+            if (yield* addPath(yield* argPath(target, cwd, ps, shell, vars))) external = true
           }
           conservative = conservative || external
         } else {
@@ -1431,7 +1616,13 @@ export const ShellTool = Tool.define(
           if (Exit.isSuccess(exit)) {
             const tree = exit.value
             const nested = commands(tree.rootNode)
-            for (const node of nested) yield* classify(parts(node), depth + 1, nestedSubstituted)
+            for (const node of nested) {
+              const item = parts(node)
+              // A bare `$(...)` string parses as a command named by the substitution; its
+              // program is the descendant command, so skip the wrapper to avoid a false root anchor.
+              if (item.length === 0 || dynamic(unquote(item[0].text), ps)) continue
+              yield* classify(item, depth + 1, nestedSubstituted, vars)
+            }
             if (nested.length === 0 && tree.rootNode.hasError && info.evalScript.trim().length > 0) {
               state.dynamic = true
               scan.dirs.add(path.parse(cwd).root)
@@ -1458,7 +1649,8 @@ export const ShellTool = Tool.define(
         const destination = redirect.childForFieldName("destination")
         if (!destination) continue
         const text = destination.text
-        const resolved = yield* argPath(text, cwd, ps, shell, assignments)
+        const vars = varsAt(redirect.startIndex)
+        const resolved = yield* argPath(text, cwd, ps, shell, vars)
         yield* addPath(resolved)
         if (resolved !== undefined || ps) continue
         if (!text.includes("$") && !text.includes("`")) continue
@@ -1468,15 +1660,21 @@ export const ShellTool = Tool.define(
           const exit = yield* parse(text, ps).pipe(Effect.exit)
           if (Exit.isSuccess(exit)) {
             const tree = exit.value
-            for (const node of commands(tree.rootNode)) yield* classify(parts(node), 0, true)
+            for (const node of commands(tree.rootNode)) {
+              const nested = parts(node)
+              if (nested.length === 0 || dynamic(unquote(nested[0].text), ps)) continue
+              yield* classify(nested, 0, true, vars)
+            }
             tree.delete()
           } else {
             scan.dirs.add(path.parse(cwd).root)
           }
           continue
         }
-        // A plain variable target that never resolved to a path is still a real write:
-        // anchor at the root rather than let it pass.
+        // Shell-generated numeric variables (`$$`, `$RANDOM`) cannot introduce an
+        // absolute path, so `out-$$.log` stays a relative target in cwd. Only a variable
+        // the classifier cannot account for anchors at the root.
+        if (!text.replace(RELATIVE_VAR, "0").includes("$")) continue
         scan.dirs.add(path.parse(cwd).root)
       }
 
@@ -1493,7 +1691,7 @@ export const ShellTool = Tool.define(
       // anywhere in the invocation (including through a wrapper or `eval`) suppresses
       // it for all of them, not just commands that happen to parse after it.
       const resolved: { name?: string; info: Effective; conservative?: boolean }[] = []
-      for (const entry of entries) resolved.push(yield* classify(entry.command))
+      for (const entry of entries) resolved.push(yield* classify(entry.command, 0, false, varsAt(entry.node.startIndex)))
 
       for (let index = 0; index < entries.length; index++) {
         const entry = entries[index]
