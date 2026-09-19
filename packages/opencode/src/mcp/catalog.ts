@@ -539,6 +539,49 @@ function resolvePointer(root: unknown, ref: string) {
   return true
 }
 
+// A plain-name `$ref` (`#name`) resolves against the anchors declared in its own schema
+// resource, so an anchor only satisfies a ref sharing its nearest `$id` scope; ajv rejects
+// a ref that reaches an anchor in another resource. Collect the anchors that survive in the
+// emitted document, keyed by resource. Only positions ajv registers anchors from are
+// walked: it ignores an `$anchor` on the top-level schema itself and inside `prefixItems`,
+// while an `$anchor` under `enum`/`const`/a custom keyword is instance data (NEW-V14-07).
+function collectAnchors(root: unknown) {
+  const byResource = new Map<string, Set<string>>()
+  const walk = (value: unknown, kind: SchemaKind, resource: string, atRoot: boolean) => {
+    if (Array.isArray(value)) {
+      value.forEach((item) => walk(item, kind, resource, false))
+      return
+    }
+    if (!isPlainObject(value)) return
+    const nodeResource = kind === "schema" && typeof value.$id === "string" ? value.$id : resource
+    for (const [key, item] of Object.entries(value)) {
+      if (!atRoot && kind === "schema" && (key === "$anchor" || key === "$dynamicAnchor")) {
+        if (typeof item === "string") {
+          const names = byResource.get(nodeResource)
+          if (names) names.add(item)
+          else byResource.set(nodeResource, new Set([item]))
+        }
+        continue
+      }
+      const childKind: SchemaKind =
+        kind === "map"
+          ? "schema"
+          : kind === "instance"
+            ? "instance"
+            : key === "enum" || key === "const" || key === "default" || key === "examples"
+              ? "instance"
+              : SCHEMA_MAP_KEYWORDS.has(key)
+                ? "map"
+                : SCHEMA_VALUE_KEYWORDS.has(key) || SCHEMA_ARRAY_KEYWORDS.has(key)
+                  ? "schema"
+                  : "instance"
+      walk(item, childKind, nodeResource, false)
+    }
+  }
+  walk(root, "schema", "", true)
+  return byResource
+}
+
 // A `$defs` entry can be pruned (depth, node budget, or shared identity) while a `$ref`
 // to it survives, leaving an unresolvable local reference that makes providers reject the
 // whole manifest. Drop such refs, leaving the containing schema unconstrained. Only
@@ -549,12 +592,15 @@ function dropDanglingRefs(
   root: unknown = value,
   kind: SchemaKind = "schema",
   defs: Map<string, Set<string>> = topLevelDefs(root),
+  anchors: Map<string, Set<string>> = collectAnchors(root),
+  resource = "",
 ) {
   if (Array.isArray(value)) {
-    value.forEach((item) => dropDanglingRefs(item, root, kind, defs))
+    value.forEach((item) => dropDanglingRefs(item, root, kind, defs, anchors, resource))
     return
   }
   if (!isPlainObject(value)) return
+  const nodeResource = kind === "schema" && typeof value.$id === "string" ? value.$id : resource
   for (const [key, item] of Object.entries(value)) {
     if (kind === "schema" && key === "$ref") {
       // Only local `#` pointers are resolvable in the emitted document. `urn:`/relative/
@@ -569,6 +615,10 @@ function dropDanglingRefs(
         if (!defs.get(def[1])?.has(def[2])) delete value[key]
         continue
       }
+      // `#name` is a plain-name anchor reference. Keep it only when an anchor with that
+      // name survives in the same `$id` resource; a ref to an anchor that was stripped or
+      // never existed stays dangling and is pruned like any other unresolvable pointer.
+      if (item.length > 1 && item[1] !== "/" && anchors.get(nodeResource)?.has(item.slice(1))) continue
       if (!resolvePointer(root, item)) delete value[key]
       continue
     }
@@ -582,7 +632,7 @@ function dropDanglingRefs(
             : SCHEMA_MAP_KEYWORDS.has(key)
               ? "map"
               : "schema"
-    dropDanglingRefs(item, root, childKind, defs)
+    dropDanglingRefs(item, root, childKind, defs, anchors, nodeResource)
   }
 }
 

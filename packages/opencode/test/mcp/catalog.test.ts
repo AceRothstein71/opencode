@@ -660,4 +660,74 @@ describe("McpCatalog.convertTool bounds untrusted server input", () => {
     expect(props.p.$anchor).toBeUndefined()
     expect(() => new Ajv2020({ strict: false }).compile(schema)).not.toThrow()
   })
+
+  test("retains anchor-form $refs that resolve and prunes the ones that do not", () => {
+    const ajv = new Ajv2020({ strict: false })
+
+    const retained = emitted({
+      type: "object",
+      $defs: { Kind: { $anchor: "Kind", type: "string", enum: ["a", "b"] } },
+      properties: { kind: { $ref: "#Kind" } },
+    })
+    expect((retained.properties as Record<string, Record<string, unknown>>).kind).toEqual({ $ref: "#Kind" })
+    expect(() => ajv.compile(retained)).not.toThrow()
+
+    const dynamicTarget = emitted({
+      type: "object",
+      $defs: { Kind: { $dynamicAnchor: "Kind", type: "string" } },
+      properties: { kind: { $ref: "#Kind" } },
+    })
+    expect((dynamicTarget.properties as Record<string, Record<string, unknown>>).kind).toEqual({ $ref: "#Kind" })
+    expect(() => ajv.compile(dynamicTarget)).not.toThrow()
+
+    const inProperty = emitted({
+      type: "object",
+      properties: { def: { $anchor: "A", type: "string" }, use: { $ref: "#A" } },
+    })
+    expect((inProperty.properties as Record<string, Record<string, unknown>>).use).toEqual({ $ref: "#A" })
+    expect(() => ajv.compile(inProperty)).not.toThrow()
+
+    const pruned = emitted({
+      type: "object",
+      $anchor: "RootA",
+      properties: {
+        missing: { $ref: "#Missing" },
+        ghost: { $ref: "#Ghost" },
+        prefixed: { $ref: "#Pre" },
+        rooted: { $ref: "#RootA" },
+      },
+      enum: [{ $anchor: "Ghost", type: "string" }],
+      prefixItems: [{ $anchor: "Pre", type: "string" }],
+    })
+    const props = pruned.properties as Record<string, Record<string, unknown>>
+    expect(props.missing.$ref).toBeUndefined()
+    expect(props.ghost.$ref).toBeUndefined()
+    expect(props.prefixed.$ref).toBeUndefined()
+    expect(props.rooted.$ref).toBeUndefined()
+    expect(() => ajv.compile(pruned)).not.toThrow()
+  })
+
+  test("scopes anchor-form refs to their $id resource", () => {
+    const schema = emitted({
+      type: "object",
+      $id: "https://example.com/root",
+      properties: {
+        cross: { $id: "https://example.com/inner", $anchor: "Outer", type: "string" },
+        scoped: {
+          $id: "https://example.com/other",
+          type: "object",
+          properties: { def: { $anchor: "Scoped", type: "string" }, use: { $ref: "#Scoped" } },
+        },
+        refOther: { $ref: "#Scoped" },
+        refCross: { $ref: "#Outer" },
+      },
+    })
+    const props = schema.properties as Record<string, Record<string, unknown>>
+
+    expect(props.refOther.$ref).toBeUndefined()
+    expect(props.refCross.$ref).toBeUndefined()
+    const scoped = props.scoped as Record<string, unknown>
+    expect((scoped.properties as Record<string, Record<string, unknown>>).use.$ref).toBe("#Scoped")
+    expect(() => new Ajv2020({ strict: false }).compile(schema)).not.toThrow()
+  })
 })
