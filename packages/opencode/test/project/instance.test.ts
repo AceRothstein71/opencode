@@ -38,6 +38,18 @@ const registerDisposerScoped = (disposer: (directory: string) => Promise<void>) 
     (off) => Effect.sync(off),
   )
 
+// Releases a gated disposer on scope teardown and yields long enough for an in-flight reload body
+// to settle before the layer's own `disposeAll` finalizer closes. Without the yield a base-arm
+// assertion failure leaves the stalled teardown wedging scope close instead of reporting the
+// assertion (the same wedge the fix removes on the fixed arm).
+const releaseGatedDisposer = (release: () => void) =>
+  Effect.addFinalizer(() =>
+    Effect.gen(function* () {
+      release()
+      yield* Effect.sleep("500 millis")
+    }),
+  )
+
 describe("InstanceStore", () => {
   it.live("loads instance context", () =>
     Effect.gen(function* () {
@@ -762,6 +774,196 @@ describe("InstanceStore", () => {
         expect(events).toEqual(["dispose-start", "dispose-end", "boot"])
       }),
     30_000,
+  )
+
+  it.live(
+    "a never-settling reusable disposer does not wedge reload, provide or load (NEW-V14-06)",
+    () =>
+      Effect.gen(function* () {
+        const dir = yield* tmpdirScoped({ git: true })
+        const store = yield* InstanceStore.Service
+        const events: string[] = []
+        let releaseDisposer: () => void = () => {}
+        const gate = new Promise<void>((resolve) => {
+          releaseDisposer = resolve
+        })
+        // Unblock the disposer on scope teardown too, so an assertion failure cannot leave the
+        // stalled teardown wedging the layer's own `disposeAll` finalizer.
+        yield* releaseGatedDisposer(() => releaseDisposer())
+        yield* registerDisposerScoped(async () => {
+          events.push("dispose-start")
+          await gate
+          events.push("dispose-end")
+        })
+        yield* setBootstrap(
+          Effect.sync(() => {
+            events.push("boot")
+          }),
+        )
+
+        const first = yield* store.load({ directory: dir })
+
+        // Plain load -> reload: the previous entry is reusable, so reload runs the stalled
+        // directory-global disposer itself. Pre-fix that await is unbounded and wedges the
+        // directory forever (base 7b7e70a6c1 reproduces reload, then provide and load too).
+        const reloaded = yield* store.reload({ directory: dir }).pipe(Effect.timeoutOption("8 seconds"))
+        expect(Option.isSome(reloaded)).toBe(true)
+        if (Option.isSome(reloaded)) expect(reloaded.value).not.toBe(first)
+
+        // Proof the bound actually fired: the replacement booted while the disposer was still
+        // stalled, and the teardown was started rather than skipped.
+        expect(events).not.toContain("dispose-end")
+        expect(events.filter((event) => event === "boot")).toHaveLength(2)
+
+        // The replacement is live: a still-running disposer must not wedge leases or loads.
+        const alive = yield* store
+          .provide({ directory: dir }, Effect.succeed("alive" as const))
+          .pipe(Effect.timeoutOption("4 seconds"))
+        expect(Option.isSome(alive)).toBe(true)
+
+        const cached = yield* store.load({ directory: dir }).pipe(Effect.timeoutOption("4 seconds"))
+        expect(Option.isSome(cached)).toBe(true)
+        if (Option.isSome(cached) && Option.isSome(reloaded)) expect(cached.value).toBe(reloaded.value)
+
+        // Once the stalled disposer finally settles, the directory recovers fully.
+        releaseDisposer()
+        yield* Effect.gen(function* () {
+          while (!events.includes("dispose-end")) yield* Effect.sleep("25 millis")
+        }).pipe(Effect.timeoutOption("4 seconds"))
+        expect(events).toContain("dispose-end")
+      }),
+    30_000,
+  )
+
+  it.live(
+    "a late-settling reusable disposer still serializes dispose-end before boot (NEW-V14-06)",
+    () =>
+      Effect.gen(function* () {
+        const dir = yield* tmpdirScoped({ git: true })
+        const store = yield* InstanceStore.Service
+        const events: string[] = []
+        yield* registerDisposerScoped(async () => {
+          events.push("dispose-start")
+          await new Promise((resolve) => setTimeout(resolve, 500))
+          events.push("dispose-end")
+        })
+        yield* setBootstrap(
+          Effect.sync(() => {
+            events.push("boot")
+          }),
+        )
+
+        const first = yield* store.load({ directory: dir })
+        const reloaded = yield* store.reload({ directory: dir }).pipe(Effect.timeoutOption("8 seconds"))
+        expect(Option.isSome(reloaded)).toBe(true)
+        if (Option.isSome(reloaded)) expect(reloaded.value).not.toBe(first)
+
+        // A disposer that settles within the bound keeps the reload-scoped ordering guarantee:
+        // the replacement boots only after the old directory-global teardown finished.
+        expect(events).toEqual(["boot", "dispose-start", "dispose-end", "boot"])
+        expect(events.lastIndexOf("dispose-end")).toBeLessThan(events.lastIndexOf("boot"))
+
+        const alive = yield* store
+          .provide({ directory: dir }, Effect.succeed("alive" as const))
+          .pipe(Effect.timeoutOption("4 seconds"))
+        expect(Option.isSome(alive)).toBe(true)
+      }),
+    30_000,
+  )
+
+  it.live(
+    "repeated reloads stay bounded behind a never-settling reusable disposer (NEW-V14-06)",
+    () =>
+      Effect.gen(function* () {
+        const dir = yield* tmpdirScoped({ git: true })
+        const store = yield* InstanceStore.Service
+        const events: string[] = []
+        let releaseDisposer: () => void = () => {}
+        const gate = new Promise<void>((resolve) => {
+          releaseDisposer = resolve
+        })
+        yield* releaseGatedDisposer(() => releaseDisposer())
+        yield* registerDisposerScoped(async () => {
+          events.push("dispose-start")
+          await gate
+          events.push("dispose-end")
+        })
+        yield* setBootstrap(Effect.sync(() => void events.push("boot")))
+
+        yield* store.load({ directory: dir })
+
+        // Every reload boots its own replacement, so the second one takes the reusable path again
+        // and runs the still-stalled disposer; both waits must be bounded.
+        const firstReload = yield* store.reload({ directory: dir }).pipe(Effect.timeoutOption("8 seconds"))
+        expect(Option.isSome(firstReload)).toBe(true)
+        const secondReload = yield* store.reload({ directory: dir }).pipe(Effect.timeoutOption("8 seconds"))
+        expect(Option.isSome(secondReload)).toBe(true)
+        if (Option.isSome(firstReload) && Option.isSome(secondReload)) {
+          expect(secondReload.value).not.toBe(firstReload.value)
+        }
+
+        const alive = yield* store
+          .provide({ directory: dir }, Effect.succeed("alive" as const))
+          .pipe(Effect.timeoutOption("4 seconds"))
+        expect(Option.isSome(alive)).toBe(true)
+
+        releaseDisposer()
+        yield* Effect.gen(function* () {
+          while (!events.includes("dispose-end")) yield* Effect.sleep("25 millis")
+        }).pipe(Effect.timeoutOption("4 seconds"))
+        expect(events).toContain("dispose-end")
+      }),
+    30_000,
+  )
+
+  it.live(
+    "an interrupted drain does not wedge a later reusable reload (NEW-V14-06)",
+    () =>
+      Effect.gen(function* () {
+        const dir = yield* tmpdirScoped({ git: true })
+        const store = yield* InstanceStore.Service
+        const events: string[] = []
+        let releaseDisposer: () => void = () => {}
+        const gate = new Promise<void>((resolve) => {
+          releaseDisposer = resolve
+        })
+        yield* releaseGatedDisposer(() => releaseDisposer())
+        yield* registerDisposerScoped(async () => {
+          events.push("dispose-start")
+          await gate
+          events.push("dispose-end")
+        })
+        yield* setBootstrap(Effect.sync(() => void events.push("boot")))
+
+        const first = yield* store.load({ directory: dir })
+        const disposing = yield* store.dispose(first).pipe(Effect.forkScoped)
+        yield* Effect.sleep("150 millis")
+        yield* Fiber.interrupt(disposing)
+
+        // Reload #1 follows the interrupted drain: it waits through the bounded tracker path.
+        const firstReload = yield* store.reload({ directory: dir }).pipe(Effect.timeoutOption("8 seconds"))
+        expect(Option.isSome(firstReload)).toBe(true)
+
+        // Reload #2 is the ordinary reusable path and must stay bounded even though the same
+        // never-settling disposer is still in flight.
+        const secondReload = yield* store.reload({ directory: dir }).pipe(Effect.timeoutOption("8 seconds"))
+        expect(Option.isSome(secondReload)).toBe(true)
+
+        const alive = yield* store
+          .provide({ directory: dir }, Effect.succeed("alive" as const))
+          .pipe(Effect.timeoutOption("4 seconds"))
+        expect(Option.isSome(alive)).toBe(true)
+
+        const cached = yield* store.load({ directory: dir }).pipe(Effect.timeoutOption("4 seconds"))
+        expect(Option.isSome(cached)).toBe(true)
+
+        releaseDisposer()
+        yield* Effect.gen(function* () {
+          while (!events.includes("dispose-end")) yield* Effect.sleep("25 millis")
+        }).pipe(Effect.timeoutOption("4 seconds"))
+        expect(events).toContain("dispose-end")
+      }),
+    45_000,
   )
 
   it.live(

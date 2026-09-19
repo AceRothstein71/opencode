@@ -188,6 +188,35 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
         }
       })
 
+    // The reusable branch of `reload` tears the (unclaimed) previous instance down itself, so
+    // unlike the interrupted-dispose path there is no `disposeEntry` tracker to observe. Start the
+    // directory-global disposers here, register their completion as a tracker, then wait for that
+    // tracker with the same bound as `awaitTeardowns`. A never-settling disposer must not wedge
+    // `reload`/`provide`/`load` for the directory (NEW-V14-06); past the bound the replacement
+    // boots and the deviation is logged, and the still-in-flight run stays visible to a later
+    // reload (NEW-V12-06) until it settles.
+    const teardownDirectory = (directory: string) =>
+      Effect.gen(function* () {
+        yield* Effect.sync(() => {
+          const tracker: TeardownTracker = { teardown: Deferred.makeUnsafe<void>(), teardownStarted: false }
+          const promise = runDisposers(directory)
+          tracker.teardownStarted = true
+          const pending = teardowns.get(directory) ?? new Set<TeardownTracker>()
+          pending.add(tracker)
+          teardowns.set(directory, pending)
+          const settle = () => {
+            const active = teardowns.get(directory)
+            if (active) {
+              active.delete(tracker)
+              if (active.size === 0) teardowns.delete(directory)
+            }
+            Deferred.doneUnsafe(tracker.teardown, Effect.void)
+          }
+          promise.then(settle, settle)
+        })
+        yield* awaitTeardowns(directory)
+      })
+
     // Release a claimed entry: drop it from the cache (only if it is still the cached one, so a
     // reload that already installed a replacement is not clobbered) and resolve `closed` so a
     // `provide` waiting on the claim can reload. Must be uninterruptible: the whole point is that
@@ -294,7 +323,7 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
             if (reusable) {
               yield* Deferred.await(reusable.deferred).pipe(Effect.ignore)
               yield* awaitLease(reusable)
-              yield* Effect.promise(() => runDisposers(directory))
+              yield* teardownDirectory(directory)
               yield* emitDisposed({ directory, project: input.project?.id })
             } else if (previous) {
               // The previous entry is already claimed by a draining `disposeEntry`. Its late
